@@ -988,20 +988,42 @@ fn main() -> Result<(), String> {
         last_hybrid_stats.write_stage_ms
     );
     println!(
-        "[cozip_pdeflate][timing][hybrid-gpu-stage] gpu_batch_count={} t_batch_call_ms={:.3} t_prepare_ms={:.3} t_profile_gpu_call_ms={:.3} t_finalize_ms={:.3} t_profile_gpu_total_ms={:.3} t_profile_gpu_wait_ms={:.3} t_profile_gpu_upload_ms={:.3} t_profile_gpu_map_copy_ms={:.3} t_table_build_ms={:.3} t_section_encode_ms={:.3} t_header_pack_ms={:.3} t_fallback_cpu_ms={:.3} t_batch_unaccounted_ms={:.3} t_profile_unaccounted_ms={:.3} gpu_profile_total_ms_per_assigned_chunk={:.3}",
+        "[cozip_pdeflate][timing][hybrid-gpu-stage] gpu_batch_count={} t_batch_call_ms={:.3} t_prepare_ms={:.3} t_prepare_table_build_ms={:.3} t_prepare_table_readback_ms={:.3} t_prepare_misc_ms={:.3} prepare_gpu_table_build_chunks={} prepare_gpu_table_readback_chunks={} t_profile_gpu_call_ms={:.3} t_finalize_ms={:.3} t_profile_gpu_total_ms={:.3} t_profile_gpu_wait_ms={:.3} t_profile_gpu_upload_ms={:.3} t_profile_gpu_map_copy_ms={:.3} t_match_total_ms={:.3} t_table_build_ms={:.3} t_section_encode_ms={:.3} t_header_pack_ms={:.3} t_fallback_cpu_ms={:.3} t_sparse_prepare_ms={:.3} t_sparse_total_ms={:.3} t_sparse_table_size_resolve_ms={:.3} t_sparse_prepare_misc_ms={:.3} t_sparse_upload_dispatch_ms={:.3} t_sparse_submit_ms={:.3} t_sparse_lens_wait_ms={:.3} t_sparse_lens_copy_ms={:.3} t_sparse_copy_ms={:.3} t_kernel_pack_inputs_ms={:.3} t_kernel_scratch_acquire_ms={:.3} t_kernel_match_dispatch_ms={:.3} t_kernel_match_submit_ms={:.3} t_kernel_section_dispatch_ms={:.3} t_kernel_section_submit_ms={:.3} t_kernel_section_wait_ms={:.3} t_batch_unaccounted_ms={:.3} t_profile_unaccounted_ms={:.3} gpu_profile_total_ms_per_assigned_chunk={:.3}",
         last_hybrid_stats.gpu_batch_count,
         last_hybrid_stats.legacy_gpu_batch_call_ms,
         last_hybrid_stats.legacy_gpu_prepare_ms,
+        last_hybrid_stats.legacy_gpu_prepare_table_build_ms,
+        last_hybrid_stats.legacy_gpu_prepare_table_readback_ms,
+        last_hybrid_stats.legacy_gpu_prepare_misc_ms,
+        last_hybrid_stats.legacy_gpu_prepare_gpu_table_build_chunks,
+        last_hybrid_stats.legacy_gpu_prepare_gpu_table_readback_chunks,
         last_hybrid_stats.legacy_gpu_profile_call_ms,
         last_hybrid_stats.legacy_gpu_finalize_ms,
         last_hybrid_stats.legacy_gpu_total_ms,
         last_hybrid_stats.legacy_gpu_wait_ms,
         last_hybrid_stats.legacy_gpu_upload_ms,
         last_hybrid_stats.legacy_gpu_map_copy_ms,
+        last_hybrid_stats.legacy_gpu_match_total_ms,
         last_hybrid_stats.legacy_gpu_table_build_ms,
         last_hybrid_stats.legacy_gpu_section_encode_ms,
         last_hybrid_stats.legacy_gpu_header_pack_ms,
         last_hybrid_stats.legacy_gpu_fallback_cpu_ms,
+        last_hybrid_stats.legacy_gpu_sparse_prepare_ms,
+        last_hybrid_stats.legacy_gpu_sparse_total_ms,
+        last_hybrid_stats.legacy_gpu_sparse_table_size_resolve_ms,
+        last_hybrid_stats.legacy_gpu_sparse_prepare_misc_ms,
+        last_hybrid_stats.legacy_gpu_sparse_upload_dispatch_ms,
+        last_hybrid_stats.legacy_gpu_sparse_submit_ms,
+        last_hybrid_stats.legacy_gpu_sparse_lens_wait_ms,
+        last_hybrid_stats.legacy_gpu_sparse_lens_copy_ms,
+        last_hybrid_stats.legacy_gpu_sparse_copy_ms,
+        last_hybrid_stats.legacy_gpu_kernel_pack_inputs_ms,
+        last_hybrid_stats.legacy_gpu_kernel_scratch_acquire_ms,
+        last_hybrid_stats.legacy_gpu_kernel_match_dispatch_ms,
+        last_hybrid_stats.legacy_gpu_kernel_match_submit_ms,
+        last_hybrid_stats.legacy_gpu_kernel_section_dispatch_ms,
+        last_hybrid_stats.legacy_gpu_kernel_section_submit_ms,
+        last_hybrid_stats.legacy_gpu_kernel_section_wait_ms,
         (last_hybrid_stats.legacy_gpu_batch_call_ms
             - (last_hybrid_stats.legacy_gpu_prepare_ms
                 + last_hybrid_stats.legacy_gpu_profile_call_ms
@@ -1014,6 +1036,106 @@ fn main() -> Result<(), String> {
         } else {
             0.0
         }
+    );
+    let k1_pack_inputs_ms = last_hybrid_stats.legacy_gpu_kernel_pack_inputs_ms;
+    let k2_scratch_ms = last_hybrid_stats.legacy_gpu_kernel_scratch_acquire_ms;
+    let k3_match_ms = last_hybrid_stats.legacy_gpu_kernel_match_dispatch_ms
+        + last_hybrid_stats.legacy_gpu_kernel_match_submit_ms;
+    let k4_section_ms = last_hybrid_stats.legacy_gpu_kernel_section_dispatch_ms
+        + last_hybrid_stats.legacy_gpu_kernel_section_submit_ms
+        + last_hybrid_stats.legacy_gpu_kernel_section_wait_ms;
+    let k5_sparse_ms = last_hybrid_stats.legacy_gpu_sparse_total_ms;
+    let call_known_ms = k1_pack_inputs_ms + k2_scratch_ms + k3_match_ms + k4_section_ms + k5_sparse_ms;
+    let call_other_ms = (last_hybrid_stats.legacy_gpu_profile_call_ms - call_known_ms).max(0.0);
+    let profile_call_ms = last_hybrid_stats.legacy_gpu_profile_call_ms.max(1e-9);
+    println!(
+        "[cozip_pdeflate][timing][hybrid-gpu-call-breakdown] k1_pack_inputs_ms={:.3} k2_scratch_ms={:.3} k3_match_stage_ms={:.3} k4_section_stage_ms={:.3} k5_sparse_stage_ms={:.3} call_other_ms={:.3} k1_pct={:.1} k2_pct={:.1} k3_pct={:.1} k4_pct={:.1} k5_pct={:.1} other_pct={:.1}",
+        k1_pack_inputs_ms,
+        k2_scratch_ms,
+        k3_match_ms,
+        k4_section_ms,
+        k5_sparse_ms,
+        call_other_ms,
+        100.0 * k1_pack_inputs_ms / profile_call_ms,
+        100.0 * k2_scratch_ms / profile_call_ms,
+        100.0 * k3_match_ms / profile_call_ms,
+        100.0 * k4_section_ms / profile_call_ms,
+        100.0 * k5_sparse_ms / profile_call_ms,
+        100.0 * call_other_ms / profile_call_ms
+    );
+    let p1_alloc_ms = last_hybrid_stats.legacy_gpu_kernel_pack_alloc_setup_ms;
+    let p2_resolve_ms = last_hybrid_stats.legacy_gpu_kernel_pack_resolve_sizes_ms;
+    let p3_src_copy_ms = last_hybrid_stats.legacy_gpu_kernel_pack_src_copy_ms;
+    let p4_metadata_ms = last_hybrid_stats.legacy_gpu_kernel_pack_metadata_loop_ms;
+    let p5_host_copy_ms = last_hybrid_stats.legacy_gpu_kernel_pack_host_copy_ms;
+    let p6_device_plan_ms = last_hybrid_stats.legacy_gpu_kernel_pack_device_copy_plan_ms;
+    let p7_finalize_ms = last_hybrid_stats.legacy_gpu_kernel_pack_finalize_ms;
+    let pack_known_ms =
+        p1_alloc_ms + p2_resolve_ms + p3_src_copy_ms + p4_metadata_ms + p5_host_copy_ms
+            + p6_device_plan_ms
+            + p7_finalize_ms;
+    let pack_other_ms = (k1_pack_inputs_ms - pack_known_ms).max(0.0);
+    let pack_total_ms = k1_pack_inputs_ms.max(1e-9);
+    println!(
+        "[cozip_pdeflate][timing][hybrid-pack-breakdown] pack_inputs_ms={:.3} alloc_setup_ms={:.3} resolve_sizes_ms={:.3} src_copy_ms={:.3} metadata_loop_ms={:.3} host_copy_ms={:.3} device_copy_plan_ms={:.3} finalize_ms={:.3} other_ms={:.3} alloc_pct={:.1} resolve_pct={:.1} src_copy_pct={:.1} metadata_pct={:.1} host_copy_pct={:.1} device_plan_pct={:.1} finalize_pct={:.1} other_pct={:.1}",
+        k1_pack_inputs_ms,
+        p1_alloc_ms,
+        p2_resolve_ms,
+        p3_src_copy_ms,
+        p4_metadata_ms,
+        p5_host_copy_ms,
+        p6_device_plan_ms,
+        p7_finalize_ms,
+        pack_other_ms,
+        100.0 * p1_alloc_ms / pack_total_ms,
+        100.0 * p2_resolve_ms / pack_total_ms,
+        100.0 * p3_src_copy_ms / pack_total_ms,
+        100.0 * p4_metadata_ms / pack_total_ms,
+        100.0 * p5_host_copy_ms / pack_total_ms,
+        100.0 * p6_device_plan_ms / pack_total_ms,
+        100.0 * p7_finalize_ms / pack_total_ms,
+        100.0 * pack_other_ms / pack_total_ms
+    );
+    let r1_scan_ms = last_hybrid_stats.legacy_gpu_kernel_pack_resolve_scan_ms;
+    let r2_readback_setup_ms = last_hybrid_stats.legacy_gpu_kernel_pack_resolve_readback_setup_ms;
+    let r3_submit_ms = last_hybrid_stats.legacy_gpu_kernel_pack_resolve_submit_ms;
+    let r4_map_wait_ms = last_hybrid_stats.legacy_gpu_kernel_pack_resolve_map_wait_ms;
+    let r5_parse_ms = last_hybrid_stats.legacy_gpu_kernel_pack_resolve_parse_ms;
+    let resolve_known_ms = r1_scan_ms + r2_readback_setup_ms + r3_submit_ms + r4_map_wait_ms + r5_parse_ms;
+    let resolve_other_ms = (p2_resolve_ms - resolve_known_ms).max(0.0);
+    let resolve_total_ms = p2_resolve_ms.max(1e-9);
+    println!(
+        "[cozip_pdeflate][timing][hybrid-pack-resolve-breakdown] resolve_sizes_ms={:.3} scan_ms={:.3} readback_setup_ms={:.3} submit_ms={:.3} map_wait_ms={:.3} parse_ms={:.3} other_ms={:.3} scan_pct={:.1} readback_setup_pct={:.1} submit_pct={:.1} map_wait_pct={:.1} parse_pct={:.1} other_pct={:.1}",
+        p2_resolve_ms,
+        r1_scan_ms,
+        r2_readback_setup_ms,
+        r3_submit_ms,
+        r4_map_wait_ms,
+        r5_parse_ms,
+        resolve_other_ms,
+        100.0 * r1_scan_ms / resolve_total_ms,
+        100.0 * r2_readback_setup_ms / resolve_total_ms,
+        100.0 * r3_submit_ms / resolve_total_ms,
+        100.0 * r4_map_wait_ms / resolve_total_ms,
+        100.0 * r5_parse_ms / resolve_total_ms,
+        100.0 * resolve_other_ms / resolve_total_ms
+    );
+    let c1_table_size_resolve_ms = last_hybrid_stats.legacy_gpu_sparse_table_size_resolve_ms;
+    let c2_dispatch_submit_ms = last_hybrid_stats.legacy_gpu_sparse_upload_dispatch_ms
+        + last_hybrid_stats.legacy_gpu_sparse_submit_ms;
+    let c3_map_wait_ms = last_hybrid_stats.legacy_gpu_sparse_lens_wait_ms;
+    let c4_cpu_copy_ms = last_hybrid_stats.legacy_gpu_sparse_lens_copy_ms
+        + last_hybrid_stats.legacy_gpu_sparse_copy_ms;
+    println!(
+        "[cozip_pdeflate][timing][hybrid-gpu-culprit] c1_table_size_resolve_ms={:.3} c2_dispatch_submit_ms={:.3} c3_map_wait_ms={:.3} c4_cpu_copy_ms={:.3} c1_pct={:.1} c2_pct={:.1} c3_pct={:.1} c4_pct={:.1}",
+        c1_table_size_resolve_ms,
+        c2_dispatch_submit_ms,
+        c3_map_wait_ms,
+        c4_cpu_copy_ms,
+        100.0 * c1_table_size_resolve_ms / profile_call_ms,
+        100.0 * c2_dispatch_submit_ms / profile_call_ms,
+        100.0 * c3_map_wait_ms / profile_call_ms,
+        100.0 * c4_cpu_copy_ms / profile_call_ms
     );
 
     Ok(())

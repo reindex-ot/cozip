@@ -274,7 +274,13 @@ struct GpuBatchCompressProfile {
     gpu_job_chunks: usize,
     gpu_used_chunks: usize,
     prepare_ms: f64,
+    prepare_table_build_ms: f64,
+    prepare_table_readback_ms: f64,
+    prepare_misc_ms: f64,
+    prepare_gpu_table_build_chunks: usize,
+    prepare_gpu_table_readback_chunks: usize,
     gpu_call_ms: f64,
+    gpu_match_total_ms: f64,
     gpu_match_upload_ms: f64,
     gpu_match_wait_ms: f64,
     gpu_match_map_copy_ms: f64,
@@ -289,6 +295,18 @@ struct GpuBatchCompressProfile {
     gpu_section_encode_map_copy_ms: f64,
     gpu_section_encode_total_ms: f64,
     gpu_pack_inputs_ms: f64,
+    gpu_pack_alloc_setup_ms: f64,
+    gpu_pack_resolve_sizes_ms: f64,
+    gpu_pack_resolve_scan_ms: f64,
+    gpu_pack_resolve_readback_setup_ms: f64,
+    gpu_pack_resolve_submit_ms: f64,
+    gpu_pack_resolve_map_wait_ms: f64,
+    gpu_pack_resolve_parse_ms: f64,
+    gpu_pack_src_copy_ms: f64,
+    gpu_pack_metadata_loop_ms: f64,
+    gpu_pack_host_copy_ms: f64,
+    gpu_pack_device_copy_plan_ms: f64,
+    gpu_pack_finalize_ms: f64,
     gpu_scratch_acquire_ms: f64,
     gpu_match_table_copy_ms: f64,
     gpu_match_prepare_dispatch_ms: f64,
@@ -317,6 +335,8 @@ struct GpuBatchCompressProfile {
     gpu_sparse_lens_wait_ms: f64,
     gpu_sparse_lens_copy_ms: f64,
     gpu_sparse_prepare_ms: f64,
+    gpu_sparse_table_size_resolve_ms: f64,
+    gpu_sparse_prepare_misc_ms: f64,
     gpu_sparse_scratch_acquire_ms: f64,
     gpu_sparse_upload_dispatch_ms: f64,
     gpu_sparse_submit_ms: f64,
@@ -359,6 +379,18 @@ struct HybridCompressSchedulerProfile {
     gpu_section_encode_map_copy_ms: f64,
     gpu_section_encode_total_ms: f64,
     gpu_pack_inputs_ms: f64,
+    gpu_pack_alloc_setup_ms: f64,
+    gpu_pack_resolve_sizes_ms: f64,
+    gpu_pack_resolve_scan_ms: f64,
+    gpu_pack_resolve_readback_setup_ms: f64,
+    gpu_pack_resolve_submit_ms: f64,
+    gpu_pack_resolve_map_wait_ms: f64,
+    gpu_pack_resolve_parse_ms: f64,
+    gpu_pack_src_copy_ms: f64,
+    gpu_pack_metadata_loop_ms: f64,
+    gpu_pack_host_copy_ms: f64,
+    gpu_pack_device_copy_plan_ms: f64,
+    gpu_pack_finalize_ms: f64,
     gpu_scratch_acquire_ms: f64,
     gpu_match_table_copy_ms: f64,
     gpu_match_prepare_dispatch_ms: f64,
@@ -387,6 +419,8 @@ struct HybridCompressSchedulerProfile {
     gpu_sparse_lens_wait_ms: f64,
     gpu_sparse_lens_copy_ms: f64,
     gpu_sparse_prepare_ms: f64,
+    gpu_sparse_table_size_resolve_ms: f64,
+    gpu_sparse_prepare_misc_ms: f64,
     gpu_sparse_scratch_acquire_ms: f64,
     gpu_sparse_upload_dispatch_ms: f64,
     gpu_sparse_submit_ms: f64,
@@ -640,7 +674,13 @@ pub struct PDeflateGpuBatchBreakdown {
     pub chunks_total: usize,
     pub gpu_used_chunks: usize,
     pub prepare_ms: f64,
+    pub prepare_table_build_ms: f64,
+    pub prepare_table_readback_ms: f64,
+    pub prepare_misc_ms: f64,
+    pub prepare_gpu_table_build_chunks: usize,
+    pub prepare_gpu_table_readback_chunks: usize,
     pub gpu_call_ms: f64,
+    pub match_total_ms: f64,
     pub finalize_ms: f64,
     pub total_ms: f64,
     pub gpu_upload_ms: f64,
@@ -650,6 +690,34 @@ pub struct PDeflateGpuBatchBreakdown {
     pub table_build_ms: f64,
     pub header_pack_ms: f64,
     pub section_encode_ms: f64,
+    pub sparse_table_size_resolve_ms: f64,
+    pub sparse_prepare_ms: f64,
+    pub sparse_prepare_misc_ms: f64,
+    pub sparse_upload_dispatch_ms: f64,
+    pub sparse_submit_ms: f64,
+    pub sparse_lens_wait_ms: f64,
+    pub sparse_lens_copy_ms: f64,
+    pub sparse_copy_ms: f64,
+    pub sparse_total_ms: f64,
+    pub kernel_pack_inputs_ms: f64,
+    pub kernel_pack_alloc_setup_ms: f64,
+    pub kernel_pack_resolve_sizes_ms: f64,
+    pub kernel_pack_resolve_scan_ms: f64,
+    pub kernel_pack_resolve_readback_setup_ms: f64,
+    pub kernel_pack_resolve_submit_ms: f64,
+    pub kernel_pack_resolve_map_wait_ms: f64,
+    pub kernel_pack_resolve_parse_ms: f64,
+    pub kernel_pack_src_copy_ms: f64,
+    pub kernel_pack_metadata_loop_ms: f64,
+    pub kernel_pack_host_copy_ms: f64,
+    pub kernel_pack_device_copy_plan_ms: f64,
+    pub kernel_pack_finalize_ms: f64,
+    pub kernel_scratch_acquire_ms: f64,
+    pub kernel_match_dispatch_ms: f64,
+    pub kernel_match_submit_ms: f64,
+    pub kernel_section_dispatch_ms: f64,
+    pub kernel_section_submit_ms: f64,
+    pub kernel_section_wait_ms: f64,
 }
 
 pub(crate) fn pdeflate_compress_chunk_payload_cpu(
@@ -704,13 +772,55 @@ pub(crate) fn pdeflate_compress_chunks_payload_gpu_batch_with_breakdown(
             chunks_total: profile.chunks_total,
             gpu_used_chunks: profile.gpu_used_chunks,
             prepare_ms: profile.prepare_ms,
+            prepare_table_build_ms: profile.prepare_table_build_ms,
+            prepare_table_readback_ms: profile.prepare_table_readback_ms,
+            prepare_misc_ms: profile.prepare_misc_ms,
+            prepare_gpu_table_build_chunks: profile.prepare_gpu_table_build_chunks,
+            prepare_gpu_table_readback_chunks: profile.prepare_gpu_table_readback_chunks,
             gpu_call_ms: profile.gpu_call_ms,
+            match_total_ms: profile.gpu_match_total_ms,
             finalize_ms: profile.finalize_ms,
             total_ms: profile.total_ms,
             gpu_upload_ms: profile.gpu_upload_ms,
             gpu_wait_ms: profile.gpu_wait_ms,
             gpu_map_copy_ms: profile.gpu_map_copy_ms,
             gpu_total_ms: 0.0,
+            sparse_table_size_resolve_ms: profile.gpu_sparse_table_size_resolve_ms,
+            sparse_prepare_ms: profile.gpu_sparse_prepare_ms,
+            sparse_prepare_misc_ms: profile.gpu_sparse_prepare_misc_ms,
+            sparse_upload_dispatch_ms: profile.gpu_sparse_upload_dispatch_ms,
+            sparse_submit_ms: profile.gpu_sparse_submit_ms,
+            sparse_lens_wait_ms: profile.gpu_sparse_lens_wait_ms,
+            sparse_lens_copy_ms: profile.gpu_sparse_lens_copy_ms,
+            sparse_copy_ms: profile.gpu_sparse_copy_ms,
+            sparse_total_ms: profile.gpu_sparse_total_ms,
+            kernel_pack_inputs_ms: profile.gpu_pack_inputs_ms,
+            kernel_pack_alloc_setup_ms: profile.gpu_pack_alloc_setup_ms,
+            kernel_pack_resolve_sizes_ms: profile.gpu_pack_resolve_sizes_ms,
+            kernel_pack_resolve_scan_ms: profile.gpu_pack_resolve_scan_ms,
+            kernel_pack_resolve_readback_setup_ms: profile.gpu_pack_resolve_readback_setup_ms,
+            kernel_pack_resolve_submit_ms: profile.gpu_pack_resolve_submit_ms,
+            kernel_pack_resolve_map_wait_ms: profile.gpu_pack_resolve_map_wait_ms,
+            kernel_pack_resolve_parse_ms: profile.gpu_pack_resolve_parse_ms,
+            kernel_pack_src_copy_ms: profile.gpu_pack_src_copy_ms,
+            kernel_pack_metadata_loop_ms: profile.gpu_pack_metadata_loop_ms,
+            kernel_pack_host_copy_ms: profile.gpu_pack_host_copy_ms,
+            kernel_pack_device_copy_plan_ms: profile.gpu_pack_device_copy_plan_ms,
+            kernel_pack_finalize_ms: profile.gpu_pack_finalize_ms,
+            kernel_scratch_acquire_ms: profile.gpu_scratch_acquire_ms,
+            kernel_match_dispatch_ms: profile.gpu_match_table_copy_ms
+                + profile.gpu_match_prepare_dispatch_ms
+                + profile.gpu_match_kernel_dispatch_ms,
+            kernel_match_submit_ms: profile.gpu_match_submit_ms,
+            kernel_section_dispatch_ms: profile.gpu_section_setup_ms
+                + profile.gpu_section_pass_dispatch_ms
+                + profile.gpu_section_copy_dispatch_ms,
+            kernel_section_submit_ms: profile.gpu_section_submit_ms,
+            kernel_section_wait_ms: profile.gpu_section_tokenize_wait_ms
+                + profile.gpu_section_prefix_wait_ms
+                + profile.gpu_section_scatter_wait_ms
+                + profile.gpu_section_pack_wait_ms
+                + profile.gpu_section_meta_wait_ms,
             ..PDeflateGpuBatchBreakdown::default()
         };
         let mut out = vec![None; chunks.len()];
@@ -1399,6 +1509,18 @@ fn accumulate_gpu_kernel_profile(
     src: &gpu::GpuBatchKernelProfile,
 ) {
     dst.pack_inputs_ms += src.pack_inputs_ms;
+    dst.pack_alloc_setup_ms += src.pack_alloc_setup_ms;
+    dst.pack_resolve_sizes_ms += src.pack_resolve_sizes_ms;
+    dst.pack_resolve_scan_ms += src.pack_resolve_scan_ms;
+    dst.pack_resolve_readback_setup_ms += src.pack_resolve_readback_setup_ms;
+    dst.pack_resolve_submit_ms += src.pack_resolve_submit_ms;
+    dst.pack_resolve_map_wait_ms += src.pack_resolve_map_wait_ms;
+    dst.pack_resolve_parse_ms += src.pack_resolve_parse_ms;
+    dst.pack_src_copy_ms += src.pack_src_copy_ms;
+    dst.pack_metadata_loop_ms += src.pack_metadata_loop_ms;
+    dst.pack_host_copy_ms += src.pack_host_copy_ms;
+    dst.pack_device_copy_plan_ms += src.pack_device_copy_plan_ms;
+    dst.pack_finalize_ms += src.pack_finalize_ms;
     dst.scratch_acquire_ms += src.scratch_acquire_ms;
     dst.match_table_copy_ms += src.match_table_copy_ms;
     dst.match_prepare_dispatch_ms += src.match_prepare_dispatch_ms;
@@ -1778,6 +1900,10 @@ fn compress_chunk_gpu_batch(
     let t_total = Instant::now();
     let profile_detail = profile_detail_enabled();
     let t_prepare = Instant::now();
+    let mut prepare_table_build_ms = 0.0_f64;
+    let prepare_table_readback_ms = 0.0_f64;
+    let mut prepare_gpu_table_build_chunks = 0usize;
+    let prepare_gpu_table_readback_chunks = 0usize;
     let mut prepared = Vec::<GpuPreparedChunk<'_>>::with_capacity(indices.len());
     for &chunk_idx in indices {
         let start = chunk_idx
@@ -1785,25 +1911,18 @@ fn compress_chunk_gpu_batch(
             .ok_or(PDeflateError::NumericOverflow)?;
         let end = (start + chunk_size).min(input.len());
         let chunk = &input[start..end];
-        let mut built = build_table_dispatch(
+        let built = build_table_dispatch(
             chunk,
             options,
             should_use_gpu_table_build(options, chunk.len()),
         )?;
-        if built.table_count == 0 && built.table_index.is_empty() {
-            if let Some(table_gpu) = built.gpu_table.as_ref() {
-                let packed_table = gpu::readback_packed_table_device(table_gpu).map_err(|err| {
-                    PDeflateError::Gpu(format!(
-                        "gpu table readback failed during batch prepare: {err}"
-                    ))
-                })?;
-                built.table_count = packed_table.table_count;
-                built.table_index = packed_table.table_index;
-                built.table_data = packed_table.table_data;
-            }
+        prepare_table_build_ms += built.build_ms;
+        if built.gpu_table.is_some() {
+            prepare_gpu_table_build_chunks = prepare_gpu_table_build_chunks.saturating_add(1);
         }
         let max_ref_len = options.max_ref_len.min(MAX_CMD_LEN).min(64);
-        let gpu_eligible = max_ref_len >= options.min_ref_len && built.table_count > 0;
+        let gpu_eligible = max_ref_len >= options.min_ref_len
+            && (built.table_count > 0 || built.gpu_table.is_some());
         prepared.push(GpuPreparedChunk {
             index: chunk_idx,
             chunk,
@@ -1819,6 +1938,8 @@ fn compress_chunk_gpu_batch(
         });
     }
     let prepare_ms = elapsed_ms(t_prepare);
+    let prepare_misc_ms =
+        (prepare_ms - prepare_table_build_ms - prepare_table_readback_ms).max(0.0);
 
     let mut prof_by_chunk = vec![gpu::GpuMatchProfile::default(); prepared.len()];
     let mut packed_matches_by_chunk = std::iter::repeat_with(|| None::<Vec<u32>>)
@@ -1837,6 +1958,7 @@ fn compress_chunk_gpu_batch(
     let mut gpu_match_upload_ms = 0.0_f64;
     let mut gpu_match_wait_ms = 0.0_f64;
     let mut gpu_match_map_copy_ms = 0.0_f64;
+    let mut gpu_match_total_ms = 0.0_f64;
     let mut gpu_section_encode_upload_ms = 0.0_f64;
     let mut gpu_section_encode_wait_ms = 0.0_f64;
     let mut gpu_section_encode_map_copy_ms = 0.0_f64;
@@ -1852,6 +1974,8 @@ fn compress_chunk_gpu_batch(
     let mut gpu_sparse_lens_wait_ms = 0.0_f64;
     let mut gpu_sparse_lens_copy_ms = 0.0_f64;
     let mut gpu_sparse_prepare_ms = 0.0_f64;
+    let mut gpu_sparse_table_size_resolve_ms = 0.0_f64;
+    let mut gpu_sparse_prepare_misc_ms = 0.0_f64;
     let mut gpu_sparse_scratch_acquire_ms = 0.0_f64;
     let mut gpu_sparse_upload_dispatch_ms = 0.0_f64;
     let mut gpu_sparse_submit_ms = 0.0_f64;
@@ -1908,6 +2032,7 @@ fn compress_chunk_gpu_batch(
                     gpu_match_upload_ms += batch.match_profile.upload_ms;
                     gpu_match_wait_ms += batch.match_profile.wait_ms;
                     gpu_match_map_copy_ms += batch.match_profile.map_copy_ms;
+                    gpu_match_total_ms += batch.match_profile.total_ms;
                     gpu_section_encode_upload_ms += batch.section_profile.upload_ms;
                     gpu_section_encode_wait_ms += batch.section_profile.wait_ms;
                     gpu_section_encode_map_copy_ms += batch.section_profile.map_copy_ms;
@@ -2031,8 +2156,8 @@ fn compress_chunk_gpu_batch(
                 })
                 .collect();
 
-            match gpu::read_section_commands_from_device_batch(&pack_inputs) {
-                Ok((host_sections, pack_profile, pack_detail)) => {
+            match gpu::pack_chunk_payload_from_device_sparse_batch(&pack_inputs) {
+                Ok((packed_chunks, pack_profile, pack_detail)) => {
                     let emit_pack_batch_detail = if profile_detail {
                         let seq = PROFILE_DETAIL_GPU_PACK_SEQ.fetch_add(1, Ordering::Relaxed);
                         profile_detail_should_log_stream(seq)
@@ -2041,7 +2166,7 @@ fn compress_chunk_gpu_batch(
                     };
                     if emit_pack_batch_detail {
                         eprintln!(
-                            "[cozip_pdeflate][timing][gpu-pack-batch] chunks={} lens_kib={:.2} out_cmd_mib={:.2} t_lens_submit_ms={:.3} t_lens_submit_done_wait_ms={:.3} t_lens_map_after_done_ms={:.3} lens_poll_calls={} lens_yield_calls={} t_lens_wait_ms={:.3} t_lens_copy_ms={:.3} t_sparse_prepare_ms={:.3} t_sparse_upload_dispatch_ms={:.3} t_sparse_submit_ms={:.3} t_sparse_wait_ms={:.3} t_sparse_copy_ms={:.3} t_sparse_total_ms={:.3}",
+                            "[cozip_pdeflate][timing][gpu-pack-batch] chunks={} lens_kib={:.2} out_cmd_mib={:.2} t_lens_submit_ms={:.3} t_lens_submit_done_wait_ms={:.3} t_lens_map_after_done_ms={:.3} lens_poll_calls={} lens_yield_calls={} t_lens_wait_ms={:.3} t_lens_copy_ms={:.3} t_sparse_prepare_ms={:.3} t_sparse_table_size_resolve_ms={:.3} t_sparse_prepare_misc_ms={:.3} t_sparse_upload_dispatch_ms={:.3} t_sparse_submit_ms={:.3} t_sparse_wait_ms={:.3} t_sparse_copy_ms={:.3} t_sparse_total_ms={:.3}",
                             pack_detail.chunks,
                             (pack_detail.lens_bytes_total as f64) / 1024.0,
                             (pack_detail.out_cmd_bytes_total as f64) / (1024.0 * 1024.0),
@@ -2053,6 +2178,8 @@ fn compress_chunk_gpu_batch(
                             pack_detail.lens_wait_ms,
                             pack_detail.lens_copy_ms,
                             pack_detail.prepare_ms,
+                            pack_detail.table_size_resolve_ms,
+                            pack_detail.prepare_misc_ms,
                             pack_detail.upload_dispatch_ms,
                             pack_detail.submit_ms,
                             pack_detail.wait_ms,
@@ -2060,13 +2187,13 @@ fn compress_chunk_gpu_batch(
                             pack_detail.total_ms
                         );
                     }
-                    if host_sections.len() != pending.len() {
+                    if packed_chunks.len() != pending.len() {
                         if profile_detail {
                             eprintln!(
                                 "[cozip_pdeflate][timing][gpu-batch-fallback] chunks={} gpu_jobs={} reason=sparse_readback_output_count_mismatch out={} jobs={}",
                                 indices.len(),
                                 prep_indices.len(),
-                                host_sections.len(),
+                                packed_chunks.len(),
                                 pending.len()
                             );
                         }
@@ -2089,6 +2216,8 @@ fn compress_chunk_gpu_batch(
                     gpu_sparse_lens_wait_ms += pack_detail.lens_wait_ms;
                     gpu_sparse_lens_copy_ms += pack_detail.lens_copy_ms;
                     gpu_sparse_prepare_ms += pack_detail.prepare_ms;
+                    gpu_sparse_table_size_resolve_ms += pack_detail.table_size_resolve_ms;
+                    gpu_sparse_prepare_misc_ms += pack_detail.prepare_misc_ms;
                     gpu_sparse_scratch_acquire_ms += pack_detail.scratch_acquire_ms;
                     gpu_sparse_upload_dispatch_ms += pack_detail.upload_dispatch_ms;
                     gpu_sparse_submit_ms += pack_detail.submit_ms;
@@ -2120,16 +2249,7 @@ fn compress_chunk_gpu_batch(
                         .iter()
                         .map(|p| prepared[p.prep_idx].chunk.len())
                         .sum();
-                    for (p, host_chunk) in pending.into_iter().zip(host_sections.into_iter()) {
-                        if prepared[p.prep_idx].table_count == 0
-                            || prepared[p.prep_idx].table_index.is_empty()
-                        {
-                            return Err(PDeflateError::Gpu(format!(
-                                "gpu produced section commands without host table metadata (chunks={} gpu_jobs={})",
-                                indices.len(),
-                                prep_indices.len()
-                            )));
-                        }
+                    for (p, packed_chunk) in pending.into_iter().zip(packed_chunks.into_iter()) {
                         let pack_scale = if total_pack_bytes == 0 {
                             0.0
                         } else {
@@ -2150,39 +2270,9 @@ fn compress_chunk_gpu_batch(
                                 + p.section_scaled.total_ms
                                 + pack_scaled.total_ms,
                         };
-                        let t_pack_header = Instant::now();
-                        let mut section_index =
-                            Vec::with_capacity(host_chunk.section_cmd_lens.len().saturating_mul(2));
-                        for &len in &host_chunk.section_cmd_lens {
-                            write_varint_u32(&mut section_index, len);
-                        }
-                        let payload = match pack_chunk_payload_cpu(
-                            prepared[p.prep_idx].chunk.len(),
-                            prepared[p.prep_idx].table_count,
-                            options.section_count,
-                            &prepared[p.prep_idx].table_index,
-                            &prepared[p.prep_idx].table_data,
-                            &section_index,
-                            &host_chunk.section_cmd,
-                        ) {
-                            Ok(payload) => payload,
-                            Err(err) => {
-                                if profile_detail {
-                                    eprintln!(
-                                        "[cozip_pdeflate][timing][gpu-batch-fallback] chunks={} gpu_jobs={} reason=host_pack_failed err={}",
-                                        indices.len(),
-                                        prep_indices.len(),
-                                        err
-                                    );
-                                }
-                                fallback_match_job_indices.push(p.prep_idx);
-                                continue;
-                            }
-                        };
-                        let header_pack_ms = elapsed_ms(t_pack_header);
                         gpu_encoded_chunks[p.prep_idx] = Some(ChunkCompressed {
-                            payload,
-                            table_entries: prepared[p.prep_idx].table_count,
+                            payload: packed_chunk.payload,
+                            table_entries: packed_chunk.table_count,
                             section_count: options.section_count,
                             profile: ChunkEncodeProfile {
                                 table_build_ms: prepared[p.prep_idx].table_build_ms,
@@ -2232,10 +2322,10 @@ fn compress_chunk_gpu_batch(
                                 gpu_wait_ms: gpu_profile.wait_ms,
                                 gpu_map_copy_ms: gpu_profile.map_copy_ms,
                                 gpu_total_ms: gpu_profile.total_ms,
-                                header_pack_ms,
+                                header_pack_ms: 0.0,
                                 total_ms: prepared[p.prep_idx].table_build_ms
                                     + gpu_profile.total_ms
-                                    + header_pack_ms,
+                                    + 0.0,
                             },
                         });
                         gpu_used_chunks = gpu_used_chunks.saturating_add(1);
@@ -2403,11 +2493,16 @@ fn compress_chunk_gpu_batch(
     if emit_gpu_batch_detail {
         let chunks_f = (indices.len() as f64).max(1.0);
         eprintln!(
-            "[cozip_pdeflate][timing][gpu-batch] batch_chunks={} gpu_jobs={} gpu_used={} t_prepare_ms={:.3} t_gpu_call_ms={:.3} t_finalize_ms={:.3} t_pack_inputs_ms={:.3} t_section_setup_ms={:.3} t_section_tok_dispatch_ms={:.3} t_section_pre_dispatch_ms={:.3} t_section_scat_dispatch_ms={:.3} t_section_pack_dispatch_ms={:.3} t_section_meta_dispatch_ms={:.3} t_section_tok_wait_ms={:.3} t_section_pre_wait_ms={:.3} t_section_scat_wait_ms={:.3} t_section_pack_wait_ms={:.3} t_section_meta_wait_ms={:.3} t_sparse_lens_submit_done_wait_ms={:.3} t_sparse_lens_map_after_done_ms={:.3} sparse_lens_poll_calls={} sparse_lens_yield_calls={} t_sparse_lens_wait_ms={:.3} t_sparse_wait_ms={:.3} t_sparse_copy_ms={:.3} t_upload_ms={:.3} t_wait_ms={:.3} t_map_copy_ms={:.3} gpu_call_ms_per_chunk={:.3}",
+            "[cozip_pdeflate][timing][gpu-batch] batch_chunks={} gpu_jobs={} gpu_used={} t_prepare_ms={:.3} t_prepare_table_build_ms={:.3} t_prepare_table_readback_ms={:.3} t_prepare_misc_ms={:.3} prepare_gpu_table_build_chunks={} prepare_gpu_table_readback_chunks={} t_gpu_call_ms={:.3} t_finalize_ms={:.3} t_pack_inputs_ms={:.3} t_section_setup_ms={:.3} t_section_tok_dispatch_ms={:.3} t_section_pre_dispatch_ms={:.3} t_section_scat_dispatch_ms={:.3} t_section_pack_dispatch_ms={:.3} t_section_meta_dispatch_ms={:.3} t_section_tok_wait_ms={:.3} t_section_pre_wait_ms={:.3} t_section_scat_wait_ms={:.3} t_section_pack_wait_ms={:.3} t_section_meta_wait_ms={:.3} t_sparse_lens_submit_done_wait_ms={:.3} t_sparse_lens_map_after_done_ms={:.3} sparse_lens_poll_calls={} sparse_lens_yield_calls={} t_sparse_lens_wait_ms={:.3} t_sparse_wait_ms={:.3} t_sparse_copy_ms={:.3} t_upload_ms={:.3} t_wait_ms={:.3} t_map_copy_ms={:.3} gpu_call_ms_per_chunk={:.3}",
             indices.len(),
             gpu_job_indices.len(),
             gpu_used_chunks,
             prepare_ms,
+            prepare_table_build_ms,
+            prepare_table_readback_ms,
+            prepare_misc_ms,
+            prepare_gpu_table_build_chunks,
+            prepare_gpu_table_readback_chunks,
             gpu_call_ms,
             finalize_ms,
             kernel_profile.pack_inputs_ms,
@@ -2442,7 +2537,13 @@ fn compress_chunk_gpu_batch(
             gpu_job_chunks: gpu_job_indices.len(),
             gpu_used_chunks,
             prepare_ms,
+            prepare_table_build_ms,
+            prepare_table_readback_ms,
+            prepare_misc_ms,
+            prepare_gpu_table_build_chunks,
+            prepare_gpu_table_readback_chunks,
             gpu_call_ms,
+            gpu_match_total_ms,
             gpu_match_upload_ms,
             gpu_match_wait_ms,
             gpu_match_map_copy_ms,
@@ -2461,6 +2562,18 @@ fn compress_chunk_gpu_batch(
             gpu_section_encode_map_copy_ms,
             gpu_section_encode_total_ms,
             gpu_pack_inputs_ms: kernel_profile.pack_inputs_ms,
+            gpu_pack_alloc_setup_ms: kernel_profile.pack_alloc_setup_ms,
+            gpu_pack_resolve_sizes_ms: kernel_profile.pack_resolve_sizes_ms,
+            gpu_pack_resolve_scan_ms: kernel_profile.pack_resolve_scan_ms,
+            gpu_pack_resolve_readback_setup_ms: kernel_profile.pack_resolve_readback_setup_ms,
+            gpu_pack_resolve_submit_ms: kernel_profile.pack_resolve_submit_ms,
+            gpu_pack_resolve_map_wait_ms: kernel_profile.pack_resolve_map_wait_ms,
+            gpu_pack_resolve_parse_ms: kernel_profile.pack_resolve_parse_ms,
+            gpu_pack_src_copy_ms: kernel_profile.pack_src_copy_ms,
+            gpu_pack_metadata_loop_ms: kernel_profile.pack_metadata_loop_ms,
+            gpu_pack_host_copy_ms: kernel_profile.pack_host_copy_ms,
+            gpu_pack_device_copy_plan_ms: kernel_profile.pack_device_copy_plan_ms,
+            gpu_pack_finalize_ms: kernel_profile.pack_finalize_ms,
             gpu_scratch_acquire_ms: kernel_profile.scratch_acquire_ms,
             gpu_match_table_copy_ms: kernel_profile.match_table_copy_ms,
             gpu_match_prepare_dispatch_ms: kernel_profile.match_prepare_dispatch_ms,
@@ -2489,6 +2602,8 @@ fn compress_chunk_gpu_batch(
             gpu_sparse_lens_wait_ms,
             gpu_sparse_lens_copy_ms,
             gpu_sparse_prepare_ms,
+            gpu_sparse_table_size_resolve_ms,
+            gpu_sparse_prepare_misc_ms,
             gpu_sparse_scratch_acquire_ms,
             gpu_sparse_upload_dispatch_ms,
             gpu_sparse_submit_ms,
@@ -2798,6 +2913,29 @@ fn compress_chunks_hybrid(
                                         prof.gpu_section_encode_total_ms +=
                                             batch_prof.gpu_section_encode_total_ms;
                                         prof.gpu_pack_inputs_ms += batch_prof.gpu_pack_inputs_ms;
+                                        prof.gpu_pack_alloc_setup_ms +=
+                                            batch_prof.gpu_pack_alloc_setup_ms;
+                                        prof.gpu_pack_resolve_sizes_ms +=
+                                            batch_prof.gpu_pack_resolve_sizes_ms;
+                                        prof.gpu_pack_resolve_scan_ms +=
+                                            batch_prof.gpu_pack_resolve_scan_ms;
+                                        prof.gpu_pack_resolve_readback_setup_ms +=
+                                            batch_prof.gpu_pack_resolve_readback_setup_ms;
+                                        prof.gpu_pack_resolve_submit_ms +=
+                                            batch_prof.gpu_pack_resolve_submit_ms;
+                                        prof.gpu_pack_resolve_map_wait_ms +=
+                                            batch_prof.gpu_pack_resolve_map_wait_ms;
+                                        prof.gpu_pack_resolve_parse_ms +=
+                                            batch_prof.gpu_pack_resolve_parse_ms;
+                                        prof.gpu_pack_src_copy_ms +=
+                                            batch_prof.gpu_pack_src_copy_ms;
+                                        prof.gpu_pack_metadata_loop_ms +=
+                                            batch_prof.gpu_pack_metadata_loop_ms;
+                                        prof.gpu_pack_host_copy_ms +=
+                                            batch_prof.gpu_pack_host_copy_ms;
+                                        prof.gpu_pack_device_copy_plan_ms +=
+                                            batch_prof.gpu_pack_device_copy_plan_ms;
+                                        prof.gpu_pack_finalize_ms += batch_prof.gpu_pack_finalize_ms;
                                         prof.gpu_scratch_acquire_ms +=
                                             batch_prof.gpu_scratch_acquire_ms;
                                         prof.gpu_match_table_copy_ms +=
@@ -2854,6 +2992,10 @@ fn compress_chunks_hybrid(
                                             batch_prof.gpu_sparse_lens_copy_ms;
                                         prof.gpu_sparse_prepare_ms +=
                                             batch_prof.gpu_sparse_prepare_ms;
+                                        prof.gpu_sparse_table_size_resolve_ms +=
+                                            batch_prof.gpu_sparse_table_size_resolve_ms;
+                                        prof.gpu_sparse_prepare_misc_ms +=
+                                            batch_prof.gpu_sparse_prepare_misc_ms;
                                         prof.gpu_sparse_scratch_acquire_ms +=
                                             batch_prof.gpu_sparse_scratch_acquire_ms;
                                         prof.gpu_sparse_upload_dispatch_ms +=
@@ -3053,7 +3195,7 @@ fn compress_chunks_hybrid(
             let gpu_batch_unaccounted_ms = prof.gpu_batch_total_ms
                 - (prof.gpu_prepare_ms + prof.gpu_call_ms + prof.gpu_finalize_ms);
             eprintln!(
-                "[cozip_pdeflate][timing][hybrid-scheduler-kernel] gpu_batch_total_ms={:.3} kernel_accounted_ms={:.3} gpu_call_unaccounted_ms={:.3} gpu_batch_unaccounted_ms={:.3} match_stage_ms={:.3} section_stage_ms={:.3} sparse_stage_ms={:.3} match_stage_pct={:.1} section_stage_pct={:.1} sparse_stage_pct={:.1} pack_inputs_ms={:.3} scratch_acquire_ms={:.3} match_table_copy_ms={:.3} match_prepare_dispatch_ms={:.3} match_kernel_dispatch_ms={:.3} match_submit_ms={:.3} section_setup_ms={:.3} section_pass_dispatch_ms={:.3} section_tok_dispatch_ms={:.3} section_pre_dispatch_ms={:.3} section_scat_dispatch_ms={:.3} section_pack_dispatch_ms={:.3} section_meta_dispatch_ms={:.3} section_copy_dispatch_ms={:.3} section_submit_ms={:.3} section_tok_wait_ms={:.3} section_pre_wait_ms={:.3} section_scat_wait_ms={:.3} section_pack_wait_ms={:.3} section_meta_wait_ms={:.3} section_wrap_ms={:.3} sparse_lens_submit_ms={:.3} sparse_lens_submit_done_wait_ms={:.3} sparse_lens_map_after_done_ms={:.3} sparse_lens_poll_calls={} sparse_lens_yield_calls={} sparse_lens_wait_ms={:.3} sparse_lens_copy_ms={:.3} sparse_prepare_ms={:.3} sparse_scratch_acquire_ms={:.3} sparse_upload_dispatch_ms={:.3} sparse_submit_ms={:.3} sparse_wait_ms={:.3} sparse_copy_ms={:.3} sparse_total_ms={:.3}",
+                "[cozip_pdeflate][timing][hybrid-scheduler-kernel] gpu_batch_total_ms={:.3} kernel_accounted_ms={:.3} gpu_call_unaccounted_ms={:.3} gpu_batch_unaccounted_ms={:.3} match_stage_ms={:.3} section_stage_ms={:.3} sparse_stage_ms={:.3} match_stage_pct={:.1} section_stage_pct={:.1} sparse_stage_pct={:.1} pack_inputs_ms={:.3} scratch_acquire_ms={:.3} match_table_copy_ms={:.3} match_prepare_dispatch_ms={:.3} match_kernel_dispatch_ms={:.3} match_submit_ms={:.3} section_setup_ms={:.3} section_pass_dispatch_ms={:.3} section_tok_dispatch_ms={:.3} section_pre_dispatch_ms={:.3} section_scat_dispatch_ms={:.3} section_pack_dispatch_ms={:.3} section_meta_dispatch_ms={:.3} section_copy_dispatch_ms={:.3} section_submit_ms={:.3} section_tok_wait_ms={:.3} section_pre_wait_ms={:.3} section_scat_wait_ms={:.3} section_pack_wait_ms={:.3} section_meta_wait_ms={:.3} section_wrap_ms={:.3} sparse_lens_submit_ms={:.3} sparse_lens_submit_done_wait_ms={:.3} sparse_lens_map_after_done_ms={:.3} sparse_lens_poll_calls={} sparse_lens_yield_calls={} sparse_lens_wait_ms={:.3} sparse_lens_copy_ms={:.3} sparse_prepare_ms={:.3} sparse_table_size_resolve_ms={:.3} sparse_prepare_misc_ms={:.3} sparse_scratch_acquire_ms={:.3} sparse_upload_dispatch_ms={:.3} sparse_submit_ms={:.3} sparse_wait_ms={:.3} sparse_copy_ms={:.3} sparse_total_ms={:.3}",
                 prof.gpu_batch_total_ms,
                 kernel_accounted_ms,
                 gpu_call_unaccounted_ms,
@@ -3093,12 +3235,30 @@ fn compress_chunks_hybrid(
                 prof.gpu_sparse_lens_wait_ms,
                 prof.gpu_sparse_lens_copy_ms,
                 prof.gpu_sparse_prepare_ms,
+                prof.gpu_sparse_table_size_resolve_ms,
+                prof.gpu_sparse_prepare_misc_ms,
                 prof.gpu_sparse_scratch_acquire_ms,
                 prof.gpu_sparse_upload_dispatch_ms,
                 prof.gpu_sparse_submit_ms,
                 prof.gpu_sparse_wait_ms,
                 prof.gpu_sparse_copy_ms,
                 prof.gpu_sparse_total_ms
+            );
+            eprintln!(
+                "[cozip_pdeflate][timing][hybrid-kernel-pack-breakdown] pack_inputs_ms={:.3} alloc_setup_ms={:.3} resolve_sizes_ms={:.3} resolve_scan_ms={:.3} resolve_readback_setup_ms={:.3} resolve_submit_ms={:.3} resolve_map_wait_ms={:.3} resolve_parse_ms={:.3} src_copy_ms={:.3} metadata_loop_ms={:.3} host_copy_ms={:.3} device_copy_plan_ms={:.3} finalize_ms={:.3}",
+                prof.gpu_pack_inputs_ms,
+                prof.gpu_pack_alloc_setup_ms,
+                prof.gpu_pack_resolve_sizes_ms,
+                prof.gpu_pack_resolve_scan_ms,
+                prof.gpu_pack_resolve_readback_setup_ms,
+                prof.gpu_pack_resolve_submit_ms,
+                prof.gpu_pack_resolve_map_wait_ms,
+                prof.gpu_pack_resolve_parse_ms,
+                prof.gpu_pack_src_copy_ms,
+                prof.gpu_pack_metadata_loop_ms,
+                prof.gpu_pack_host_copy_ms,
+                prof.gpu_pack_device_copy_plan_ms,
+                prof.gpu_pack_finalize_ms
             );
         }
     }

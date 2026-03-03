@@ -401,11 +401,45 @@ struct EncodeWorkStats {
     legacy_gpu_batch_call_ms: f64,
     legacy_gpu_fallback_cpu_ms: f64,
     legacy_gpu_prepare_ms: f64,
+    legacy_gpu_prepare_table_build_ms: f64,
+    legacy_gpu_prepare_table_readback_ms: f64,
+    legacy_gpu_prepare_misc_ms: f64,
+    legacy_gpu_prepare_gpu_table_build_chunks: usize,
+    legacy_gpu_prepare_gpu_table_readback_chunks: usize,
     legacy_gpu_profile_call_ms: f64,
     legacy_gpu_finalize_ms: f64,
+    legacy_gpu_match_total_ms: f64,
     legacy_gpu_table_build_ms: f64,
     legacy_gpu_header_pack_ms: f64,
     legacy_gpu_section_encode_ms: f64,
+    legacy_gpu_sparse_table_size_resolve_ms: f64,
+    legacy_gpu_sparse_prepare_ms: f64,
+    legacy_gpu_sparse_prepare_misc_ms: f64,
+    legacy_gpu_sparse_upload_dispatch_ms: f64,
+    legacy_gpu_sparse_submit_ms: f64,
+    legacy_gpu_sparse_lens_wait_ms: f64,
+    legacy_gpu_sparse_lens_copy_ms: f64,
+    legacy_gpu_sparse_copy_ms: f64,
+    legacy_gpu_sparse_total_ms: f64,
+    legacy_gpu_kernel_pack_inputs_ms: f64,
+    legacy_gpu_kernel_pack_alloc_setup_ms: f64,
+    legacy_gpu_kernel_pack_resolve_sizes_ms: f64,
+    legacy_gpu_kernel_pack_resolve_scan_ms: f64,
+    legacy_gpu_kernel_pack_resolve_readback_setup_ms: f64,
+    legacy_gpu_kernel_pack_resolve_submit_ms: f64,
+    legacy_gpu_kernel_pack_resolve_map_wait_ms: f64,
+    legacy_gpu_kernel_pack_resolve_parse_ms: f64,
+    legacy_gpu_kernel_pack_src_copy_ms: f64,
+    legacy_gpu_kernel_pack_metadata_loop_ms: f64,
+    legacy_gpu_kernel_pack_host_copy_ms: f64,
+    legacy_gpu_kernel_pack_device_copy_plan_ms: f64,
+    legacy_gpu_kernel_pack_finalize_ms: f64,
+    legacy_gpu_kernel_scratch_acquire_ms: f64,
+    legacy_gpu_kernel_match_dispatch_ms: f64,
+    legacy_gpu_kernel_match_submit_ms: f64,
+    legacy_gpu_kernel_section_dispatch_ms: f64,
+    legacy_gpu_kernel_section_submit_ms: f64,
+    legacy_gpu_kernel_section_wait_ms: f64,
 }
 
 #[derive(Debug, Default)]
@@ -438,11 +472,45 @@ struct WorkerCounters {
     legacy_gpu_batch_call_ns: std::sync::atomic::AtomicU64,
     legacy_gpu_fallback_cpu_ns: std::sync::atomic::AtomicU64,
     legacy_gpu_prepare_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_prepare_table_build_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_prepare_table_readback_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_prepare_misc_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_prepare_gpu_table_build_chunks: AtomicUsize,
+    legacy_gpu_prepare_gpu_table_readback_chunks: AtomicUsize,
     legacy_gpu_profile_call_ns: std::sync::atomic::AtomicU64,
     legacy_gpu_finalize_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_match_total_ns: std::sync::atomic::AtomicU64,
     legacy_gpu_table_build_ns: std::sync::atomic::AtomicU64,
     legacy_gpu_header_pack_ns: std::sync::atomic::AtomicU64,
     legacy_gpu_section_encode_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_sparse_table_size_resolve_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_sparse_prepare_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_sparse_prepare_misc_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_sparse_upload_dispatch_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_sparse_submit_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_sparse_lens_wait_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_sparse_lens_copy_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_sparse_copy_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_sparse_total_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_kernel_pack_inputs_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_kernel_pack_alloc_setup_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_kernel_pack_resolve_sizes_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_kernel_pack_resolve_scan_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_kernel_pack_resolve_readback_setup_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_kernel_pack_resolve_submit_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_kernel_pack_resolve_map_wait_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_kernel_pack_resolve_parse_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_kernel_pack_src_copy_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_kernel_pack_metadata_loop_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_kernel_pack_host_copy_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_kernel_pack_device_copy_plan_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_kernel_pack_finalize_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_kernel_scratch_acquire_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_kernel_match_dispatch_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_kernel_match_submit_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_kernel_section_dispatch_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_kernel_section_submit_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_kernel_section_wait_ns: std::sync::atomic::AtomicU64,
 }
 
 impl WorkerCounters {
@@ -495,10 +563,30 @@ impl WorkerCounters {
                 / 1_000_000.0,
             legacy_gpu_prepare_ms: self.legacy_gpu_prepare_ns.load(Ordering::Relaxed) as f64
                 / 1_000_000.0,
+            legacy_gpu_prepare_table_build_ms: self
+                .legacy_gpu_prepare_table_build_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_prepare_table_readback_ms: self
+                .legacy_gpu_prepare_table_readback_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_prepare_misc_ms: self.legacy_gpu_prepare_misc_ns.load(Ordering::Relaxed)
+                as f64
+                / 1_000_000.0,
+            legacy_gpu_prepare_gpu_table_build_chunks: self
+                .legacy_gpu_prepare_gpu_table_build_chunks
+                .load(Ordering::Relaxed),
+            legacy_gpu_prepare_gpu_table_readback_chunks: self
+                .legacy_gpu_prepare_gpu_table_readback_chunks
+                .load(Ordering::Relaxed),
             legacy_gpu_profile_call_ms: self.legacy_gpu_profile_call_ns.load(Ordering::Relaxed)
                 as f64
                 / 1_000_000.0,
             legacy_gpu_finalize_ms: self.legacy_gpu_finalize_ns.load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_match_total_ms: self.legacy_gpu_match_total_ns.load(Ordering::Relaxed)
+                as f64
                 / 1_000_000.0,
             legacy_gpu_table_build_ms: self.legacy_gpu_table_build_ns.load(Ordering::Relaxed)
                 as f64
@@ -508,6 +596,115 @@ impl WorkerCounters {
                 / 1_000_000.0,
             legacy_gpu_section_encode_ms: self.legacy_gpu_section_encode_ns.load(Ordering::Relaxed)
                 as f64
+                / 1_000_000.0,
+            legacy_gpu_sparse_table_size_resolve_ms: self
+                .legacy_gpu_sparse_table_size_resolve_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_sparse_prepare_ms: self
+                .legacy_gpu_sparse_prepare_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_sparse_prepare_misc_ms: self
+                .legacy_gpu_sparse_prepare_misc_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_sparse_upload_dispatch_ms: self
+                .legacy_gpu_sparse_upload_dispatch_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_sparse_submit_ms: self.legacy_gpu_sparse_submit_ns.load(Ordering::Relaxed)
+                as f64
+                / 1_000_000.0,
+            legacy_gpu_sparse_lens_wait_ms: self
+                .legacy_gpu_sparse_lens_wait_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_sparse_lens_copy_ms: self
+                .legacy_gpu_sparse_lens_copy_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_sparse_copy_ms: self.legacy_gpu_sparse_copy_ns.load(Ordering::Relaxed)
+                as f64
+                / 1_000_000.0,
+            legacy_gpu_sparse_total_ms: self.legacy_gpu_sparse_total_ns.load(Ordering::Relaxed)
+                as f64
+                / 1_000_000.0,
+            legacy_gpu_kernel_pack_inputs_ms: self
+                .legacy_gpu_kernel_pack_inputs_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_kernel_pack_alloc_setup_ms: self
+                .legacy_gpu_kernel_pack_alloc_setup_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_kernel_pack_resolve_sizes_ms: self
+                .legacy_gpu_kernel_pack_resolve_sizes_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_kernel_pack_resolve_scan_ms: self
+                .legacy_gpu_kernel_pack_resolve_scan_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_kernel_pack_resolve_readback_setup_ms: self
+                .legacy_gpu_kernel_pack_resolve_readback_setup_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_kernel_pack_resolve_submit_ms: self
+                .legacy_gpu_kernel_pack_resolve_submit_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_kernel_pack_resolve_map_wait_ms: self
+                .legacy_gpu_kernel_pack_resolve_map_wait_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_kernel_pack_resolve_parse_ms: self
+                .legacy_gpu_kernel_pack_resolve_parse_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_kernel_pack_src_copy_ms: self
+                .legacy_gpu_kernel_pack_src_copy_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_kernel_pack_metadata_loop_ms: self
+                .legacy_gpu_kernel_pack_metadata_loop_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_kernel_pack_host_copy_ms: self
+                .legacy_gpu_kernel_pack_host_copy_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_kernel_pack_device_copy_plan_ms: self
+                .legacy_gpu_kernel_pack_device_copy_plan_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_kernel_pack_finalize_ms: self
+                .legacy_gpu_kernel_pack_finalize_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_kernel_scratch_acquire_ms: self
+                .legacy_gpu_kernel_scratch_acquire_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_kernel_match_dispatch_ms: self
+                .legacy_gpu_kernel_match_dispatch_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_kernel_match_submit_ms: self
+                .legacy_gpu_kernel_match_submit_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_kernel_section_dispatch_ms: self
+                .legacy_gpu_kernel_section_dispatch_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_kernel_section_submit_ms: self
+                .legacy_gpu_kernel_section_submit_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_kernel_section_wait_ms: self
+                .legacy_gpu_kernel_section_wait_ns
+                .load(Ordering::Relaxed) as f64
                 / 1_000_000.0,
         }
     }
@@ -662,11 +859,45 @@ pub struct DeflateCpuStreamStats {
     pub legacy_gpu_batch_call_ms: f64,
     pub legacy_gpu_fallback_cpu_ms: f64,
     pub legacy_gpu_prepare_ms: f64,
+    pub legacy_gpu_prepare_table_build_ms: f64,
+    pub legacy_gpu_prepare_table_readback_ms: f64,
+    pub legacy_gpu_prepare_misc_ms: f64,
+    pub legacy_gpu_prepare_gpu_table_build_chunks: usize,
+    pub legacy_gpu_prepare_gpu_table_readback_chunks: usize,
     pub legacy_gpu_profile_call_ms: f64,
     pub legacy_gpu_finalize_ms: f64,
+    pub legacy_gpu_match_total_ms: f64,
     pub legacy_gpu_table_build_ms: f64,
     pub legacy_gpu_header_pack_ms: f64,
     pub legacy_gpu_section_encode_ms: f64,
+    pub legacy_gpu_sparse_table_size_resolve_ms: f64,
+    pub legacy_gpu_sparse_prepare_ms: f64,
+    pub legacy_gpu_sparse_prepare_misc_ms: f64,
+    pub legacy_gpu_sparse_upload_dispatch_ms: f64,
+    pub legacy_gpu_sparse_submit_ms: f64,
+    pub legacy_gpu_sparse_lens_wait_ms: f64,
+    pub legacy_gpu_sparse_lens_copy_ms: f64,
+    pub legacy_gpu_sparse_copy_ms: f64,
+    pub legacy_gpu_sparse_total_ms: f64,
+    pub legacy_gpu_kernel_pack_inputs_ms: f64,
+    pub legacy_gpu_kernel_pack_alloc_setup_ms: f64,
+    pub legacy_gpu_kernel_pack_resolve_sizes_ms: f64,
+    pub legacy_gpu_kernel_pack_resolve_scan_ms: f64,
+    pub legacy_gpu_kernel_pack_resolve_readback_setup_ms: f64,
+    pub legacy_gpu_kernel_pack_resolve_submit_ms: f64,
+    pub legacy_gpu_kernel_pack_resolve_map_wait_ms: f64,
+    pub legacy_gpu_kernel_pack_resolve_parse_ms: f64,
+    pub legacy_gpu_kernel_pack_src_copy_ms: f64,
+    pub legacy_gpu_kernel_pack_metadata_loop_ms: f64,
+    pub legacy_gpu_kernel_pack_host_copy_ms: f64,
+    pub legacy_gpu_kernel_pack_device_copy_plan_ms: f64,
+    pub legacy_gpu_kernel_pack_finalize_ms: f64,
+    pub legacy_gpu_kernel_scratch_acquire_ms: f64,
+    pub legacy_gpu_kernel_match_dispatch_ms: f64,
+    pub legacy_gpu_kernel_match_submit_ms: f64,
+    pub legacy_gpu_kernel_section_dispatch_ms: f64,
+    pub legacy_gpu_kernel_section_submit_ms: f64,
+    pub legacy_gpu_kernel_section_wait_ms: f64,
 }
 
 const CZDI_MAGIC: [u8; 4] = *b"CZDI";
@@ -1204,11 +1435,28 @@ fn deflate_decompress_stream_hybrid_indexed_with_context<R: Read, W: Write>(
     stats.legacy_gpu_batch_call_ms = counter_snapshot.legacy_gpu_batch_call_ms;
     stats.legacy_gpu_fallback_cpu_ms = counter_snapshot.legacy_gpu_fallback_cpu_ms;
     stats.legacy_gpu_prepare_ms = counter_snapshot.legacy_gpu_prepare_ms;
+    stats.legacy_gpu_prepare_table_build_ms = counter_snapshot.legacy_gpu_prepare_table_build_ms;
+    stats.legacy_gpu_prepare_table_readback_ms =
+        counter_snapshot.legacy_gpu_prepare_table_readback_ms;
+    stats.legacy_gpu_prepare_misc_ms = counter_snapshot.legacy_gpu_prepare_misc_ms;
+    stats.legacy_gpu_prepare_gpu_table_build_chunks =
+        counter_snapshot.legacy_gpu_prepare_gpu_table_build_chunks;
+    stats.legacy_gpu_prepare_gpu_table_readback_chunks =
+        counter_snapshot.legacy_gpu_prepare_gpu_table_readback_chunks;
     stats.legacy_gpu_profile_call_ms = counter_snapshot.legacy_gpu_profile_call_ms;
     stats.legacy_gpu_finalize_ms = counter_snapshot.legacy_gpu_finalize_ms;
     stats.legacy_gpu_table_build_ms = counter_snapshot.legacy_gpu_table_build_ms;
     stats.legacy_gpu_header_pack_ms = counter_snapshot.legacy_gpu_header_pack_ms;
     stats.legacy_gpu_section_encode_ms = counter_snapshot.legacy_gpu_section_encode_ms;
+    stats.legacy_gpu_sparse_table_size_resolve_ms =
+        counter_snapshot.legacy_gpu_sparse_table_size_resolve_ms;
+    stats.legacy_gpu_sparse_prepare_misc_ms = counter_snapshot.legacy_gpu_sparse_prepare_misc_ms;
+    stats.legacy_gpu_sparse_upload_dispatch_ms =
+        counter_snapshot.legacy_gpu_sparse_upload_dispatch_ms;
+    stats.legacy_gpu_sparse_submit_ms = counter_snapshot.legacy_gpu_sparse_submit_ms;
+    stats.legacy_gpu_sparse_lens_wait_ms = counter_snapshot.legacy_gpu_sparse_lens_wait_ms;
+    stats.legacy_gpu_sparse_lens_copy_ms = counter_snapshot.legacy_gpu_sparse_lens_copy_ms;
+    stats.legacy_gpu_sparse_copy_ms = counter_snapshot.legacy_gpu_sparse_copy_ms;
     Ok(stats)
 }
 
@@ -3033,11 +3281,55 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<
     stats.legacy_gpu_batch_call_ms += counters.legacy_gpu_batch_call_ms;
     stats.legacy_gpu_fallback_cpu_ms += counters.legacy_gpu_fallback_cpu_ms;
     stats.legacy_gpu_prepare_ms += counters.legacy_gpu_prepare_ms;
+    stats.legacy_gpu_prepare_table_build_ms += counters.legacy_gpu_prepare_table_build_ms;
+    stats.legacy_gpu_prepare_table_readback_ms += counters.legacy_gpu_prepare_table_readback_ms;
+    stats.legacy_gpu_prepare_misc_ms += counters.legacy_gpu_prepare_misc_ms;
+    stats.legacy_gpu_prepare_gpu_table_build_chunks +=
+        counters.legacy_gpu_prepare_gpu_table_build_chunks;
+    stats.legacy_gpu_prepare_gpu_table_readback_chunks +=
+        counters.legacy_gpu_prepare_gpu_table_readback_chunks;
     stats.legacy_gpu_profile_call_ms += counters.legacy_gpu_profile_call_ms;
     stats.legacy_gpu_finalize_ms += counters.legacy_gpu_finalize_ms;
+    stats.legacy_gpu_match_total_ms += counters.legacy_gpu_match_total_ms;
     stats.legacy_gpu_table_build_ms += counters.legacy_gpu_table_build_ms;
     stats.legacy_gpu_header_pack_ms += counters.legacy_gpu_header_pack_ms;
     stats.legacy_gpu_section_encode_ms += counters.legacy_gpu_section_encode_ms;
+    stats.legacy_gpu_sparse_table_size_resolve_ms +=
+        counters.legacy_gpu_sparse_table_size_resolve_ms;
+    stats.legacy_gpu_sparse_prepare_ms += counters.legacy_gpu_sparse_prepare_ms;
+    stats.legacy_gpu_sparse_prepare_misc_ms += counters.legacy_gpu_sparse_prepare_misc_ms;
+    stats.legacy_gpu_sparse_upload_dispatch_ms += counters.legacy_gpu_sparse_upload_dispatch_ms;
+    stats.legacy_gpu_sparse_submit_ms += counters.legacy_gpu_sparse_submit_ms;
+    stats.legacy_gpu_sparse_lens_wait_ms += counters.legacy_gpu_sparse_lens_wait_ms;
+    stats.legacy_gpu_sparse_lens_copy_ms += counters.legacy_gpu_sparse_lens_copy_ms;
+    stats.legacy_gpu_sparse_copy_ms += counters.legacy_gpu_sparse_copy_ms;
+    stats.legacy_gpu_sparse_total_ms += counters.legacy_gpu_sparse_total_ms;
+    stats.legacy_gpu_kernel_pack_inputs_ms += counters.legacy_gpu_kernel_pack_inputs_ms;
+    stats.legacy_gpu_kernel_pack_alloc_setup_ms += counters.legacy_gpu_kernel_pack_alloc_setup_ms;
+    stats.legacy_gpu_kernel_pack_resolve_sizes_ms +=
+        counters.legacy_gpu_kernel_pack_resolve_sizes_ms;
+    stats.legacy_gpu_kernel_pack_resolve_scan_ms += counters.legacy_gpu_kernel_pack_resolve_scan_ms;
+    stats.legacy_gpu_kernel_pack_resolve_readback_setup_ms +=
+        counters.legacy_gpu_kernel_pack_resolve_readback_setup_ms;
+    stats.legacy_gpu_kernel_pack_resolve_submit_ms +=
+        counters.legacy_gpu_kernel_pack_resolve_submit_ms;
+    stats.legacy_gpu_kernel_pack_resolve_map_wait_ms +=
+        counters.legacy_gpu_kernel_pack_resolve_map_wait_ms;
+    stats.legacy_gpu_kernel_pack_resolve_parse_ms +=
+        counters.legacy_gpu_kernel_pack_resolve_parse_ms;
+    stats.legacy_gpu_kernel_pack_src_copy_ms += counters.legacy_gpu_kernel_pack_src_copy_ms;
+    stats.legacy_gpu_kernel_pack_metadata_loop_ms +=
+        counters.legacy_gpu_kernel_pack_metadata_loop_ms;
+    stats.legacy_gpu_kernel_pack_host_copy_ms += counters.legacy_gpu_kernel_pack_host_copy_ms;
+    stats.legacy_gpu_kernel_pack_device_copy_plan_ms +=
+        counters.legacy_gpu_kernel_pack_device_copy_plan_ms;
+    stats.legacy_gpu_kernel_pack_finalize_ms += counters.legacy_gpu_kernel_pack_finalize_ms;
+    stats.legacy_gpu_kernel_scratch_acquire_ms += counters.legacy_gpu_kernel_scratch_acquire_ms;
+    stats.legacy_gpu_kernel_match_dispatch_ms += counters.legacy_gpu_kernel_match_dispatch_ms;
+    stats.legacy_gpu_kernel_match_submit_ms += counters.legacy_gpu_kernel_match_submit_ms;
+    stats.legacy_gpu_kernel_section_dispatch_ms += counters.legacy_gpu_kernel_section_dispatch_ms;
+    stats.legacy_gpu_kernel_section_submit_ms += counters.legacy_gpu_kernel_section_submit_ms;
+    stats.legacy_gpu_kernel_section_wait_ms += counters.legacy_gpu_kernel_section_wait_ms;
 
     bit_writer.finish()?;
     // input_crc32 is set from the async stream producer thread.
@@ -3359,11 +3651,55 @@ fn pdeflate_compress_stream_hybrid_payload_with_context<R: Read + Send, W: Write
     stats.legacy_gpu_batch_call_ms += counters.legacy_gpu_batch_call_ms;
     stats.legacy_gpu_fallback_cpu_ms += counters.legacy_gpu_fallback_cpu_ms;
     stats.legacy_gpu_prepare_ms += counters.legacy_gpu_prepare_ms;
+    stats.legacy_gpu_prepare_table_build_ms += counters.legacy_gpu_prepare_table_build_ms;
+    stats.legacy_gpu_prepare_table_readback_ms += counters.legacy_gpu_prepare_table_readback_ms;
+    stats.legacy_gpu_prepare_misc_ms += counters.legacy_gpu_prepare_misc_ms;
+    stats.legacy_gpu_prepare_gpu_table_build_chunks +=
+        counters.legacy_gpu_prepare_gpu_table_build_chunks;
+    stats.legacy_gpu_prepare_gpu_table_readback_chunks +=
+        counters.legacy_gpu_prepare_gpu_table_readback_chunks;
     stats.legacy_gpu_profile_call_ms += counters.legacy_gpu_profile_call_ms;
     stats.legacy_gpu_finalize_ms += counters.legacy_gpu_finalize_ms;
+    stats.legacy_gpu_match_total_ms += counters.legacy_gpu_match_total_ms;
     stats.legacy_gpu_table_build_ms += counters.legacy_gpu_table_build_ms;
     stats.legacy_gpu_header_pack_ms += counters.legacy_gpu_header_pack_ms;
     stats.legacy_gpu_section_encode_ms += counters.legacy_gpu_section_encode_ms;
+    stats.legacy_gpu_sparse_table_size_resolve_ms +=
+        counters.legacy_gpu_sparse_table_size_resolve_ms;
+    stats.legacy_gpu_sparse_prepare_ms += counters.legacy_gpu_sparse_prepare_ms;
+    stats.legacy_gpu_sparse_prepare_misc_ms += counters.legacy_gpu_sparse_prepare_misc_ms;
+    stats.legacy_gpu_sparse_upload_dispatch_ms += counters.legacy_gpu_sparse_upload_dispatch_ms;
+    stats.legacy_gpu_sparse_submit_ms += counters.legacy_gpu_sparse_submit_ms;
+    stats.legacy_gpu_sparse_lens_wait_ms += counters.legacy_gpu_sparse_lens_wait_ms;
+    stats.legacy_gpu_sparse_lens_copy_ms += counters.legacy_gpu_sparse_lens_copy_ms;
+    stats.legacy_gpu_sparse_copy_ms += counters.legacy_gpu_sparse_copy_ms;
+    stats.legacy_gpu_sparse_total_ms += counters.legacy_gpu_sparse_total_ms;
+    stats.legacy_gpu_kernel_pack_inputs_ms += counters.legacy_gpu_kernel_pack_inputs_ms;
+    stats.legacy_gpu_kernel_pack_alloc_setup_ms += counters.legacy_gpu_kernel_pack_alloc_setup_ms;
+    stats.legacy_gpu_kernel_pack_resolve_sizes_ms +=
+        counters.legacy_gpu_kernel_pack_resolve_sizes_ms;
+    stats.legacy_gpu_kernel_pack_resolve_scan_ms += counters.legacy_gpu_kernel_pack_resolve_scan_ms;
+    stats.legacy_gpu_kernel_pack_resolve_readback_setup_ms +=
+        counters.legacy_gpu_kernel_pack_resolve_readback_setup_ms;
+    stats.legacy_gpu_kernel_pack_resolve_submit_ms +=
+        counters.legacy_gpu_kernel_pack_resolve_submit_ms;
+    stats.legacy_gpu_kernel_pack_resolve_map_wait_ms +=
+        counters.legacy_gpu_kernel_pack_resolve_map_wait_ms;
+    stats.legacy_gpu_kernel_pack_resolve_parse_ms +=
+        counters.legacy_gpu_kernel_pack_resolve_parse_ms;
+    stats.legacy_gpu_kernel_pack_src_copy_ms += counters.legacy_gpu_kernel_pack_src_copy_ms;
+    stats.legacy_gpu_kernel_pack_metadata_loop_ms +=
+        counters.legacy_gpu_kernel_pack_metadata_loop_ms;
+    stats.legacy_gpu_kernel_pack_host_copy_ms += counters.legacy_gpu_kernel_pack_host_copy_ms;
+    stats.legacy_gpu_kernel_pack_device_copy_plan_ms +=
+        counters.legacy_gpu_kernel_pack_device_copy_plan_ms;
+    stats.legacy_gpu_kernel_pack_finalize_ms += counters.legacy_gpu_kernel_pack_finalize_ms;
+    stats.legacy_gpu_kernel_scratch_acquire_ms += counters.legacy_gpu_kernel_scratch_acquire_ms;
+    stats.legacy_gpu_kernel_match_dispatch_ms += counters.legacy_gpu_kernel_match_dispatch_ms;
+    stats.legacy_gpu_kernel_match_submit_ms += counters.legacy_gpu_kernel_match_submit_ms;
+    stats.legacy_gpu_kernel_section_dispatch_ms += counters.legacy_gpu_kernel_section_dispatch_ms;
+    stats.legacy_gpu_kernel_section_submit_ms += counters.legacy_gpu_kernel_section_submit_ms;
+    stats.legacy_gpu_kernel_section_wait_ms += counters.legacy_gpu_kernel_section_wait_ms;
 
     let input_len =
         usize::try_from(stats.input_bytes).map_err(|_| CozipDeflateError::DataTooLarge)?;
@@ -3664,12 +4000,37 @@ fn compress_gpu_stream_worker_pdeflate_payload(
                 (breakdown.prepare_ms * 1_000_000.0) as u64,
                 Ordering::Relaxed,
             );
+            counters.legacy_gpu_prepare_table_build_ns.fetch_add(
+                (breakdown.prepare_table_build_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_prepare_table_readback_ns.fetch_add(
+                (breakdown.prepare_table_readback_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_prepare_misc_ns.fetch_add(
+                (breakdown.prepare_misc_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters
+                .legacy_gpu_prepare_gpu_table_build_chunks
+                .fetch_add(breakdown.prepare_gpu_table_build_chunks, Ordering::Relaxed);
+            counters
+                .legacy_gpu_prepare_gpu_table_readback_chunks
+                .fetch_add(
+                    breakdown.prepare_gpu_table_readback_chunks,
+                    Ordering::Relaxed,
+                );
             counters.legacy_gpu_profile_call_ns.fetch_add(
                 (breakdown.gpu_call_ms * 1_000_000.0) as u64,
                 Ordering::Relaxed,
             );
             counters.legacy_gpu_finalize_ns.fetch_add(
                 (breakdown.finalize_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_match_total_ns.fetch_add(
+                (breakdown.match_total_ms * 1_000_000.0) as u64,
                 Ordering::Relaxed,
             );
             counters.legacy_gpu_table_build_ns.fetch_add(
@@ -3682,6 +4043,122 @@ fn compress_gpu_stream_worker_pdeflate_payload(
             );
             counters.legacy_gpu_section_encode_ns.fetch_add(
                 (breakdown.section_encode_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_sparse_table_size_resolve_ns.fetch_add(
+                (breakdown.sparse_table_size_resolve_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_sparse_prepare_ns.fetch_add(
+                (breakdown.sparse_prepare_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_sparse_prepare_misc_ns.fetch_add(
+                (breakdown.sparse_prepare_misc_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_sparse_upload_dispatch_ns.fetch_add(
+                (breakdown.sparse_upload_dispatch_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_sparse_submit_ns.fetch_add(
+                (breakdown.sparse_submit_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_sparse_lens_wait_ns.fetch_add(
+                (breakdown.sparse_lens_wait_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_sparse_lens_copy_ns.fetch_add(
+                (breakdown.sparse_lens_copy_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_sparse_copy_ns.fetch_add(
+                (breakdown.sparse_copy_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_sparse_total_ns.fetch_add(
+                (breakdown.sparse_total_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_kernel_pack_inputs_ns.fetch_add(
+                (breakdown.kernel_pack_inputs_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_kernel_pack_alloc_setup_ns.fetch_add(
+                (breakdown.kernel_pack_alloc_setup_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_kernel_pack_resolve_sizes_ns.fetch_add(
+                (breakdown.kernel_pack_resolve_sizes_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_kernel_pack_resolve_scan_ns.fetch_add(
+                (breakdown.kernel_pack_resolve_scan_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters
+                .legacy_gpu_kernel_pack_resolve_readback_setup_ns
+                .fetch_add(
+                    (breakdown.kernel_pack_resolve_readback_setup_ms * 1_000_000.0) as u64,
+                    Ordering::Relaxed,
+                );
+            counters.legacy_gpu_kernel_pack_resolve_submit_ns.fetch_add(
+                (breakdown.kernel_pack_resolve_submit_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_kernel_pack_resolve_map_wait_ns.fetch_add(
+                (breakdown.kernel_pack_resolve_map_wait_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_kernel_pack_resolve_parse_ns.fetch_add(
+                (breakdown.kernel_pack_resolve_parse_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_kernel_pack_src_copy_ns.fetch_add(
+                (breakdown.kernel_pack_src_copy_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_kernel_pack_metadata_loop_ns.fetch_add(
+                (breakdown.kernel_pack_metadata_loop_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_kernel_pack_host_copy_ns.fetch_add(
+                (breakdown.kernel_pack_host_copy_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters
+                .legacy_gpu_kernel_pack_device_copy_plan_ns
+                .fetch_add(
+                    (breakdown.kernel_pack_device_copy_plan_ms * 1_000_000.0) as u64,
+                    Ordering::Relaxed,
+                );
+            counters.legacy_gpu_kernel_pack_finalize_ns.fetch_add(
+                (breakdown.kernel_pack_finalize_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_kernel_scratch_acquire_ns.fetch_add(
+                (breakdown.kernel_scratch_acquire_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_kernel_match_dispatch_ns.fetch_add(
+                (breakdown.kernel_match_dispatch_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_kernel_match_submit_ns.fetch_add(
+                (breakdown.kernel_match_submit_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_kernel_section_dispatch_ns.fetch_add(
+                (breakdown.kernel_section_dispatch_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_kernel_section_submit_ns.fetch_add(
+                (breakdown.kernel_section_submit_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_kernel_section_wait_ns.fetch_add(
+                (breakdown.kernel_section_wait_ms * 1_000_000.0) as u64,
                 Ordering::Relaxed,
             );
         }

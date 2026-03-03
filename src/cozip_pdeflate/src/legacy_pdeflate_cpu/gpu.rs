@@ -1,4 +1,5 @@
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -9,6 +10,8 @@ const PREFIX2_TABLE_SIZE: usize = 1 << 16;
 const PACK_CHUNK_HEADER_SIZE: usize = 32;
 const PACK_CHUNK_MAGIC: [u8; 4] = *b"PDF0";
 const PACK_CHUNK_VERSION: u16 = 0;
+const BUILD_TABLE_STAGE_COUNT: usize = 7;
+const BUILD_TABLE_STAGE_QUERY_COUNT: u32 = (BUILD_TABLE_STAGE_COUNT as u32) * 2;
 
 const MATCH_SHADER: &str = r#"
 @group(0) @binding(0) var<storage, read> src_words: array<u32>;
@@ -1583,6 +1586,18 @@ pub(crate) struct GpuMatchProfile {
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct GpuBatchKernelProfile {
     pub(crate) pack_inputs_ms: f64,
+    pub(crate) pack_alloc_setup_ms: f64,
+    pub(crate) pack_resolve_sizes_ms: f64,
+    pub(crate) pack_resolve_scan_ms: f64,
+    pub(crate) pack_resolve_readback_setup_ms: f64,
+    pub(crate) pack_resolve_submit_ms: f64,
+    pub(crate) pack_resolve_map_wait_ms: f64,
+    pub(crate) pack_resolve_parse_ms: f64,
+    pub(crate) pack_src_copy_ms: f64,
+    pub(crate) pack_metadata_loop_ms: f64,
+    pub(crate) pack_host_copy_ms: f64,
+    pub(crate) pack_device_copy_plan_ms: f64,
+    pub(crate) pack_finalize_ms: f64,
     pub(crate) scratch_acquire_ms: f64,
     pub(crate) match_table_copy_ms: f64,
     pub(crate) match_prepare_dispatch_ms: f64,
@@ -1617,6 +1632,34 @@ pub(crate) struct GpuBatchKernelProfile {
     pub(crate) sparse_wait_ms: f64,
     pub(crate) sparse_copy_ms: f64,
     pub(crate) sparse_total_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ResolvePackedTableSizesBatchProfile {
+    unresolved_count: usize,
+    scan_ms: f64,
+    readback_setup_ms: f64,
+    submit_ms: f64,
+    map_wait_ms: f64,
+    parse_ms: f64,
+    total_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PackMatchBatchInputsProfile {
+    total_ms: f64,
+    alloc_setup_ms: f64,
+    resolve_sizes_ms: f64,
+    resolve_scan_ms: f64,
+    resolve_readback_setup_ms: f64,
+    resolve_submit_ms: f64,
+    resolve_map_wait_ms: f64,
+    resolve_parse_ms: f64,
+    src_copy_ms: f64,
+    metadata_loop_ms: f64,
+    host_copy_ms: f64,
+    device_copy_plan_ms: f64,
+    finalize_ms: f64,
 }
 
 pub(crate) struct GpuMatchInput<'a> {
@@ -1727,6 +1770,8 @@ pub(crate) struct GpuSparsePackBatchProfile {
     pub(crate) lens_wait_ms: f64,
     pub(crate) lens_copy_ms: f64,
     pub(crate) prepare_ms: f64,
+    pub(crate) table_size_resolve_ms: f64,
+    pub(crate) prepare_misc_ms: f64,
     pub(crate) scratch_acquire_ms: f64,
     pub(crate) upload_dispatch_ms: f64,
     pub(crate) submit_ms: f64,
@@ -1782,6 +1827,7 @@ pub(crate) struct GpuPackedTableDevice {
 struct GpuMatchRuntime {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    supports_timestamp_query: bool,
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
     pack_chunk_bind_group_layout: wgpu::BindGroupLayout,
@@ -1935,6 +1981,8 @@ const GPU_SECTION_CMD_CAP_PAD: usize = 64;
 
 static GPU_RUNTIME: OnceLock<Result<GpuMatchRuntime, String>> = OnceLock::new();
 static GPU_SUBMIT_STREAM_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+static BUILD_TABLE_STAGE_PROBE_SEQ: AtomicUsize = AtomicUsize::new(0);
+static BUILD_TABLE_STAGE_PROBE_UNSUPPORTED_LOGGED: OnceLock<()> = OnceLock::new();
 
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
@@ -1958,6 +2006,21 @@ fn sparse_probe_enabled() -> bool {
 fn queue_probe_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag_enabled("COZIP_PDEFLATE_PROFILE_QUEUE_PROBE"))
+}
+
+fn table_stage_probe_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("COZIP_PDEFLATE_PROFILE_TABLE_STAGE_PROBE") {
+        Ok(v) => {
+            let s = v.trim();
+            !(s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => env_flag_enabled("COZIP_PDEFLATE_PROFILE"),
+    })
+}
+
+fn table_stage_probe_should_log(seq: usize) -> bool {
+    seq < 8 || seq % 64 == 0
 }
 
 fn wait_for_queue_done(queue: &wgpu::Queue, device: &wgpu::Device) -> (f64, u64) {
@@ -2794,10 +2857,15 @@ fn init_runtime() -> Result<GpuMatchRuntime, String> {
     .ok_or_else(|| "adapter not found".to_string())?;
 
     let required_limits = adapter.limits();
+    let adapter_features = adapter.features();
+    let mut required_features = wgpu::Features::empty();
+    if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY) {
+        required_features |= wgpu::Features::TIMESTAMP_QUERY;
+    }
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: Some("cozip-pdeflate-gpu-device"),
-            required_features: wgpu::Features::empty(),
+            required_features,
             required_limits,
         },
         None,
@@ -4335,6 +4403,7 @@ fn init_runtime() -> Result<GpuMatchRuntime, String> {
     Ok(GpuMatchRuntime {
         device,
         queue,
+        supports_timestamp_query: required_features.contains(wgpu::Features::TIMESTAMP_QUERY),
         bind_group_layout,
         pipeline,
         pack_chunk_bind_group_layout,
@@ -4933,10 +5002,13 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
     let lens_copy_ms;
 
     let t_prepare = Instant::now();
+    let mut table_size_resolve_ms = 0.0_f64;
     let mut prepared = Vec::<SparsePackPrepared>::with_capacity(inputs.len());
     for input in inputs {
+        let t_resolve = Instant::now();
         let (table_count, table_index_len, table_data_len) =
             resolve_packed_table_sizes(input.table)?;
+        table_size_resolve_ms += elapsed_ms(t_resolve);
         let table_index_offset = PACK_CHUNK_HEADER_SIZE;
         let table_data_offset = table_index_offset
             .checked_add(table_index_len)
@@ -4981,6 +5053,7 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
         });
     }
     let prepare_ms = elapsed_ms(t_prepare);
+    let prepare_misc_ms = (prepare_ms - table_size_resolve_ms).max(0.0);
 
     let t_scratch_acquire = Instant::now();
     let mut acquired_scratch = Vec::<GpuSparsePackScratch>::with_capacity(prepared.len());
@@ -5410,6 +5483,8 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
             lens_wait_ms,
             lens_copy_ms,
             prepare_ms,
+            table_size_resolve_ms,
+            prepare_misc_ms,
             scratch_acquire_ms,
             upload_dispatch_ms,
             submit_ms,
@@ -5844,6 +5919,8 @@ pub(crate) fn read_section_commands_from_device_batch(
             lens_wait_ms,
             lens_copy_ms,
             prepare_ms,
+            table_size_resolve_ms: 0.0,
+            prepare_misc_ms: prepare_ms,
             scratch_acquire_ms: 0.0,
             upload_dispatch_ms,
             submit_ms,
@@ -6058,6 +6135,39 @@ pub(crate) fn build_table_gpu_device(
     let finalize_params_bytes = u64::try_from(finalize_params.len())
         .map_err(|_| PDeflateError::NumericOverflow)?
         .saturating_mul(4);
+    let stage_probe_enabled = table_stage_probe_enabled() && r.supports_timestamp_query;
+    if table_stage_probe_enabled() && !r.supports_timestamp_query {
+        let _ = BUILD_TABLE_STAGE_PROBE_UNSUPPORTED_LOGGED.get_or_init(|| {
+            eprintln!(
+                "[cozip_pdeflate][timing][gpu-table-stage-probe] status=disabled reason=timestamp_query_not_supported"
+            );
+        });
+    }
+    let mut stage_gpu_ms = [0.0_f64; BUILD_TABLE_STAGE_COUNT];
+    let mut stage_probe_error: Option<String> = None;
+    let mut stage_probe_query_set = None;
+    let mut stage_probe_resolve_buffer = None;
+    let mut stage_probe_readback_buffer = None;
+    if stage_probe_enabled {
+        let ts_bytes = u64::from(BUILD_TABLE_STAGE_QUERY_COUNT).saturating_mul(8);
+        stage_probe_query_set = Some(r.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("cozip-pdeflate-bt-stage-ts-qs"),
+            ty: wgpu::QueryType::Timestamp,
+            count: BUILD_TABLE_STAGE_QUERY_COUNT,
+        }));
+        stage_probe_resolve_buffer = Some(r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-bt-stage-ts-resolve"),
+            size: ts_bytes.max(8),
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        }));
+        stage_probe_readback_buffer = Some(r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-bt-stage-ts-readback"),
+            size: ts_bytes.max(8),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+    }
 
     let src_buffer = storage_upload_buffer(&r.device, "cozip-pdeflate-bt-src", src_words_bytes);
     let freq_params_buffer = storage_upload_buffer(
@@ -6333,6 +6443,9 @@ pub(crate) fn build_table_gpu_device(
         .div_ceil(256)
         .max(1);
     let t_freq = Instant::now();
+    if let Some(query_set) = stage_probe_query_set.as_ref() {
+        encoder.write_timestamp(query_set, 0);
+    }
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("cozip-pdeflate-bt-freq-pass"),
@@ -6342,6 +6455,9 @@ pub(crate) fn build_table_gpu_device(
         pass.set_bind_group(0, &freq_bind_group, &[]);
         pass.dispatch_workgroups(freq_groups, 1, 1);
     }
+    if let Some(query_set) = stage_probe_query_set.as_ref() {
+        encoder.write_timestamp(query_set, 1);
+    }
     let freq_kernel_ms = elapsed_ms(t_freq);
 
     let cand_groups = u32::try_from(sample_count)
@@ -6349,6 +6465,9 @@ pub(crate) fn build_table_gpu_device(
         .div_ceil(128)
         .max(1);
     let t_cand = Instant::now();
+    if let Some(query_set) = stage_probe_query_set.as_ref() {
+        encoder.write_timestamp(query_set, 2);
+    }
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("cozip-pdeflate-bt-candidate-pass"),
@@ -6358,10 +6477,16 @@ pub(crate) fn build_table_gpu_device(
         pass.set_bind_group(0, &cand_bind_group, &[]);
         pass.dispatch_workgroups(cand_groups, 1, 1);
     }
+    if let Some(query_set) = stage_probe_query_set.as_ref() {
+        encoder.write_timestamp(query_set, 3);
+    }
     let mut candidate_kernel_ms = elapsed_ms(t_cand);
 
     encoder.clear_buffer(&bucket_count_buffer, 0, None);
     let t_bucket_count = Instant::now();
+    if let Some(query_set) = stage_probe_query_set.as_ref() {
+        encoder.write_timestamp(query_set, 4);
+    }
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("cozip-pdeflate-bt-bucket-count-pass"),
@@ -6370,6 +6495,9 @@ pub(crate) fn build_table_gpu_device(
         pass.set_pipeline(&r.build_table_bucket_count_pipeline);
         pass.set_bind_group(0, &bucket_count_bind_group, &[]);
         pass.dispatch_workgroups(cand_groups, 1, 1);
+    }
+    if let Some(query_set) = stage_probe_query_set.as_ref() {
+        encoder.write_timestamp(query_set, 5);
     }
     candidate_kernel_ms += elapsed_ms(t_bucket_count);
     r.queue.submit(Some(encoder.finish()));
@@ -6386,6 +6514,9 @@ pub(crate) fn build_table_gpu_device(
     encoder2.clear_buffer(&table_data_buffer, 0, None);
     encoder2.clear_buffer(&table_index_buffer, 0, None);
     let t_bucket_prefix = Instant::now();
+    if let Some(query_set) = stage_probe_query_set.as_ref() {
+        encoder2.write_timestamp(query_set, 6);
+    }
     {
         let mut pass = encoder2.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("cozip-pdeflate-bt-bucket-prefix-pass"),
@@ -6395,8 +6526,14 @@ pub(crate) fn build_table_gpu_device(
         pass.set_bind_group(0, &bucket_prefix_bind_group, &[]);
         pass.dispatch_workgroups(1, 1, 1);
     }
+    if let Some(query_set) = stage_probe_query_set.as_ref() {
+        encoder2.write_timestamp(query_set, 7);
+    }
     candidate_kernel_ms += elapsed_ms(t_bucket_prefix);
     let t_bucket_scatter = Instant::now();
+    if let Some(query_set) = stage_probe_query_set.as_ref() {
+        encoder2.write_timestamp(query_set, 8);
+    }
     {
         let mut pass = encoder2.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("cozip-pdeflate-bt-bucket-scatter-pass"),
@@ -6406,8 +6543,14 @@ pub(crate) fn build_table_gpu_device(
         pass.set_bind_group(0, &bucket_scatter_bind_group, &[]);
         pass.dispatch_workgroups(cand_groups, 1, 1);
     }
+    if let Some(query_set) = stage_probe_query_set.as_ref() {
+        encoder2.write_timestamp(query_set, 9);
+    }
     candidate_kernel_ms += elapsed_ms(t_bucket_scatter);
     let t_finalize_kernel = Instant::now();
+    if let Some(query_set) = stage_probe_query_set.as_ref() {
+        encoder2.write_timestamp(query_set, 10);
+    }
     {
         let mut pass = encoder2.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("cozip-pdeflate-bt-finalize-pass"),
@@ -6416,6 +6559,12 @@ pub(crate) fn build_table_gpu_device(
         pass.set_pipeline(&r.build_table_finalize_pipeline);
         pass.set_bind_group(0, &finalize_bind_group, &[]);
         pass.dispatch_workgroups(1, 1, 1);
+    }
+    if let Some(query_set) = stage_probe_query_set.as_ref() {
+        encoder2.write_timestamp(query_set, 11);
+    }
+    if let Some(query_set) = stage_probe_query_set.as_ref() {
+        encoder2.write_timestamp(query_set, 12);
     }
     {
         let mut pass = encoder2.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -6426,8 +6575,98 @@ pub(crate) fn build_table_gpu_device(
         pass.set_bind_group(0, &pack_index_bind_group, &[]);
         pass.dispatch_workgroups(1, 1, 1);
     }
+    if let Some(query_set) = stage_probe_query_set.as_ref() {
+        encoder2.write_timestamp(query_set, 13);
+    }
     let sort_ms = elapsed_ms(t_finalize_kernel);
     r.queue.submit(Some(encoder2.finish()));
+    if let (Some(query_set), Some(resolve_buffer), Some(readback_buffer)) = (
+        stage_probe_query_set.take(),
+        stage_probe_resolve_buffer.take(),
+        stage_probe_readback_buffer.take(),
+    ) {
+        let ts_bytes = u64::from(BUILD_TABLE_STAGE_QUERY_COUNT).saturating_mul(8);
+        let mut ts_encoder = r
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("cozip-pdeflate-bt-stage-ts-resolve-encoder"),
+            });
+        ts_encoder.resolve_query_set(
+            &query_set,
+            0..BUILD_TABLE_STAGE_QUERY_COUNT,
+            &resolve_buffer,
+            0,
+        );
+        ts_encoder.copy_buffer_to_buffer(
+            &resolve_buffer,
+            0,
+            &readback_buffer,
+            0,
+            ts_bytes.max(8),
+        );
+        let submission = r.queue.submit(Some(ts_encoder.finish()));
+        let t_probe_readback = Instant::now();
+        let slice = readback_buffer.slice(..ts_bytes.max(8));
+        let (tx, rx) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        r.device.poll(wgpu::Maintain::wait_for(submission));
+        match rx.recv() {
+            Ok(Ok(())) => {
+                let mapped = slice.get_mapped_range();
+                let ticks: &[u64] = bytemuck::cast_slice(&mapped);
+                let period_ms = (r.queue.get_timestamp_period() as f64) / 1_000_000.0;
+                for stage_idx in 0..BUILD_TABLE_STAGE_COUNT {
+                    let begin_idx = stage_idx.saturating_mul(2);
+                    let end_idx = begin_idx.saturating_add(1);
+                    if end_idx < ticks.len() {
+                        let begin = ticks[begin_idx];
+                        let end = ticks[end_idx];
+                        if end >= begin {
+                            stage_gpu_ms[stage_idx] = (end - begin) as f64 * period_ms;
+                        }
+                    }
+                }
+                drop(mapped);
+                readback_buffer.unmap();
+            }
+            Ok(Err(e)) => {
+                stage_probe_error = Some(format!("map failed: {e}"));
+            }
+            Err(_) => {
+                stage_probe_error = Some("map channel closed".to_string());
+            }
+        }
+        let stage_probe_readback_ms = elapsed_ms(t_probe_readback);
+        let seq = BUILD_TABLE_STAGE_PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+        if table_stage_probe_should_log(seq) {
+            if let Some(err) = stage_probe_error.as_ref() {
+                eprintln!(
+                    "[cozip_pdeflate][timing][gpu-table-stage-probe] seq={} sample_count={} map_status=error err=\"{}\"",
+                    seq,
+                    sample_count,
+                    err
+                );
+            } else {
+                let total_stage_ms: f64 = stage_gpu_ms.iter().sum();
+                eprintln!(
+                    "[cozip_pdeflate][timing][gpu-table-stage-probe] seq={} sample_count={} freq_ms={:.3} candidate_ms={:.3} bucket_count_ms={:.3} bucket_prefix_ms={:.3} bucket_scatter_ms={:.3} finalize_ms={:.3} pack_index_ms={:.3} stage_sum_ms={:.3} ts_readback_ms={:.3}",
+                    seq,
+                    sample_count,
+                    stage_gpu_ms[0],
+                    stage_gpu_ms[1],
+                    stage_gpu_ms[2],
+                    stage_gpu_ms[3],
+                    stage_gpu_ms[4],
+                    stage_gpu_ms[5],
+                    stage_gpu_ms[6],
+                    total_stage_ms,
+                    stage_probe_readback_ms
+                );
+            }
+        }
+    }
     Ok((
         GpuPackedTableDevice {
             table_index_buffer,
@@ -6476,9 +6715,12 @@ fn resolve_packed_table_sizes(
 
 fn resolve_packed_table_sizes_batch(
     packed_tables: &[&GpuPackedTableDevice],
-) -> Result<Vec<(usize, usize, usize)>, PDeflateError> {
+) -> Result<(Vec<(usize, usize, usize)>, ResolvePackedTableSizesBatchProfile), PDeflateError> {
+    let t_total = Instant::now();
+    let mut profile = ResolvePackedTableSizesBatchProfile::default();
     let mut out = vec![(0usize, 0usize, 0usize); packed_tables.len()];
     let mut unresolved = Vec::<(usize, &GpuPackedTableDevice)>::new();
+    let t_scan = Instant::now();
     for (idx, packed) in packed_tables.iter().copied().enumerate() {
         if packed.sizes_known {
             out[idx] = (
@@ -6490,11 +6732,15 @@ fn resolve_packed_table_sizes_batch(
             unresolved.push((idx, packed));
         }
     }
+    profile.scan_ms = elapsed_ms(t_scan);
+    profile.unresolved_count = unresolved.len();
     if unresolved.is_empty() {
-        return Ok(out);
+        profile.total_ms = elapsed_ms(t_total);
+        return Ok((out, profile));
     }
 
     let r = runtime()?;
+    let t_setup = Instant::now();
     let readback_bytes = u64::try_from(unresolved.len())
         .map_err(|_| PDeflateError::NumericOverflow)?
         .saturating_mul(8);
@@ -6532,8 +6778,12 @@ fn resolve_packed_table_sizes_batch(
             4,
         );
     }
+    profile.readback_setup_ms = elapsed_ms(t_setup);
+    let t_submit = Instant::now();
     let submission = r.queue.submit(Some(encoder.finish()));
+    profile.submit_ms = elapsed_ms(t_submit);
 
+    let t_map_wait = Instant::now();
     let slice = readback.slice(..readback_bytes.max(8));
     let (tx, rx) = mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |res| {
@@ -6545,6 +6795,8 @@ fn resolve_packed_table_sizes_batch(
             PDeflateError::Gpu("gpu build-table batch size map channel closed".to_string())
         })?
         .map_err(|e| PDeflateError::Gpu(format!("gpu build-table batch size map failed: {e}")))?;
+    profile.map_wait_ms = elapsed_ms(t_map_wait);
+    let t_parse = Instant::now();
     let mapped = slice.get_mapped_range();
     let words: &[u32] = bytemuck::cast_slice(&mapped);
     for (slot, (idx, packed)) in unresolved.iter().enumerate() {
@@ -6559,7 +6811,9 @@ fn resolve_packed_table_sizes_batch(
     }
     drop(mapped);
     readback.unmap();
-    Ok(out)
+    profile.parse_ms = elapsed_ms(t_parse);
+    profile.total_ms = elapsed_ms(t_total);
+    Ok((out, profile))
 }
 
 pub(crate) fn readback_packed_table_device(
@@ -6733,7 +6987,8 @@ enum PackedTableUploadKind<'a> {
 
 fn pack_match_batch_inputs<'a>(
     inputs: &'a [GpuMatchInput<'a>],
-) -> Result<PackedBatchInputs<'a>, PDeflateError> {
+) -> Result<(PackedBatchInputs<'a>, PackMatchBatchInputsProfile), PDeflateError> {
+    let t_total = Instant::now();
     if inputs.is_empty() {
         return Err(PDeflateError::InvalidOptions(
             "gpu match batch inputs must be non-empty",
@@ -6747,6 +7002,7 @@ fn pack_match_batch_inputs<'a>(
             "gpu match params must be non-zero",
         ));
     }
+    let t_alloc_setup = Instant::now();
     let total_src_bytes: usize = inputs.iter().map(|input| input.src.len()).sum();
     let mut src_words = vec![0u32; total_src_bytes.div_ceil(4)];
     let mut chunk_starts = Vec::<u32>::with_capacity(inputs.len() + 1);
@@ -6761,28 +7017,42 @@ fn pack_match_batch_inputs<'a>(
         ByteWordPacker::with_capacity_bytes(inputs.iter().map(|i| i.src.len() / 2).sum());
     let mut chunk_lens = Vec::<usize>::with_capacity(inputs.len());
     let mut global_table_base = 0usize;
+    let alloc_setup_ms = elapsed_ms(t_alloc_setup);
+    let t_resolve = Instant::now();
     let unresolved_tables: Vec<&GpuPackedTableDevice> = inputs
         .iter()
         .filter_map(|input| input.table_gpu)
         .filter(|table_gpu| !table_gpu.sizes_known && table_gpu.max_entries > 0)
         .collect();
-    let unresolved_sizes = if unresolved_tables.is_empty() {
-        Vec::new()
+    let (unresolved_sizes, resolve_profile) = if unresolved_tables.is_empty() {
+        (
+            Vec::new(),
+            ResolvePackedTableSizesBatchProfile {
+                total_ms: 0.0,
+                ..ResolvePackedTableSizesBatchProfile::default()
+            },
+        )
     } else {
         resolve_packed_table_sizes_batch(&unresolved_tables)?
     };
+    let resolve_sizes_ms = elapsed_ms(t_resolve);
     let mut unresolved_cursor = 0usize;
     chunk_starts.push(0);
     let mut src_len = 0usize;
+    let mut src_copy_ms = 0.0_f64;
+    let mut metadata_loop_ms = 0.0_f64;
     {
         let src_words_bytes = bytemuck::cast_slice_mut::<u32, u8>(&mut src_words);
         for input in inputs {
+            let t_src_copy = Instant::now();
             let next_src_len = src_len
                 .checked_add(input.src.len())
                 .ok_or(PDeflateError::NumericOverflow)?;
             src_words_bytes[src_len..next_src_len].copy_from_slice(input.src);
             src_len = next_src_len;
             chunk_starts.push(u32::try_from(src_len).map_err(|_| PDeflateError::NumericOverflow)?);
+            src_copy_ms += elapsed_ms(t_src_copy);
+            let t_meta = Instant::now();
             if input.max_ref_len != max_ref_len
                 || input.min_ref_len != min_ref_len
                 || input.section_count != section_count
@@ -6893,8 +7163,11 @@ fn pack_match_batch_inputs<'a>(
             global_table_base = global_table_base
                 .checked_add(local_count)
                 .ok_or(PDeflateError::NumericOverflow)?;
+            metadata_loop_ms += elapsed_ms(t_meta);
         }
     }
+    let mut host_copy_ms = 0.0_f64;
+    let mut device_copy_plan_ms = 0.0_f64;
     let mut table_device_copies = Vec::<PackedTableDeviceCopy<'a>>::new();
     for upload in table_uploads.into_iter() {
         match upload.kind {
@@ -6902,6 +7175,7 @@ fn pack_match_batch_inputs<'a>(
                 index_bytes,
                 data_bytes,
             } => {
+                let t_host_copy = Instant::now();
                 if upload.index_len != 0 {
                     let off = usize::try_from(upload.index_offset)
                         .map_err(|_| PDeflateError::NumericOverflow)?;
@@ -6912,11 +7186,13 @@ fn pack_match_batch_inputs<'a>(
                         .map_err(|_| PDeflateError::NumericOverflow)?;
                     table_data_packer.write_bytes_at(off, data_bytes)?;
                 }
+                host_copy_ms += elapsed_ms(t_host_copy);
             }
             PackedTableUploadKind::HostOwned {
                 index_bytes,
                 data_bytes,
             } => {
+                let t_host_copy = Instant::now();
                 if upload.index_len != 0 {
                     let off = usize::try_from(upload.index_offset)
                         .map_err(|_| PDeflateError::NumericOverflow)?;
@@ -6927,11 +7203,13 @@ fn pack_match_batch_inputs<'a>(
                         .map_err(|_| PDeflateError::NumericOverflow)?;
                     table_data_packer.write_bytes_at(off, &data_bytes)?;
                 }
+                host_copy_ms += elapsed_ms(t_host_copy);
             }
             PackedTableUploadKind::Device {
                 index_buffer,
                 data_buffer,
             } => {
+                let t_device_plan = Instant::now();
                 table_device_copies.push(PackedTableDeviceCopy {
                     index_src: index_buffer,
                     data_src: data_buffer,
@@ -6940,21 +7218,29 @@ fn pack_match_batch_inputs<'a>(
                     index_len: upload.index_len,
                     data_len: upload.data_len,
                 });
+                device_copy_plan_ms += elapsed_ms(t_device_plan);
             }
         }
     }
 
-    Ok(PackedBatchInputs {
+    let t_finalize = Instant::now();
+    let table_index_words_len = table_index_packer.len_bytes().div_ceil(4);
+    let table_data_words_len = table_data_packer.len_bytes().div_ceil(4);
+    let table_index_words = table_index_packer.into_words();
+    let table_data_words = table_data_packer.into_words();
+    let finalize_ms = elapsed_ms(t_finalize);
+
+    let packed = PackedBatchInputs {
         src_words,
         chunk_starts,
         table_chunk_bases,
         table_chunk_counts,
         table_chunk_index_offsets,
         table_chunk_data_offsets,
-        table_index_words_len: table_index_packer.len_bytes().div_ceil(4),
-        table_data_words_len: table_data_packer.len_bytes().div_ceil(4),
-        table_index_words: table_index_packer.into_words(),
-        table_data_words: table_data_packer.into_words(),
+        table_index_words_len,
+        table_data_words_len,
+        table_index_words,
+        table_data_words,
         table_device_copies,
         chunk_lens,
         total_src_len: total_src_bytes,
@@ -6962,7 +7248,23 @@ fn pack_match_batch_inputs<'a>(
         max_ref_len,
         min_ref_len,
         section_count,
-    })
+    };
+    let profile = PackMatchBatchInputsProfile {
+        total_ms: elapsed_ms(t_total),
+        alloc_setup_ms,
+        resolve_sizes_ms,
+        resolve_scan_ms: resolve_profile.scan_ms,
+        resolve_readback_setup_ms: resolve_profile.readback_setup_ms,
+        resolve_submit_ms: resolve_profile.submit_ms,
+        resolve_map_wait_ms: resolve_profile.map_wait_ms,
+        resolve_parse_ms: resolve_profile.parse_ms,
+        src_copy_ms,
+        metadata_loop_ms,
+        host_copy_ms,
+        device_copy_plan_ms,
+        finalize_ms,
+    };
+    Ok((packed, profile))
 }
 
 fn encode_table_device_copies(
@@ -7010,7 +7312,7 @@ pub(crate) fn compute_matches_batch(
     }
     let t_total = Instant::now();
     let r = runtime()?;
-    let packed = pack_match_batch_inputs(inputs)?;
+    let (packed, _pack_profile) = pack_match_batch_inputs(inputs)?;
     let groups_total = (u32::try_from(packed.total_src_len)
         .map_err(|_| PDeflateError::NumericOverflow)?)
     .div_ceil(WORKGROUP_SIZE)
@@ -7239,9 +7541,8 @@ pub(crate) fn compute_matches_and_encode_sections_batch(
 
     let r = runtime()?;
     let t_total = Instant::now();
-    let t_pack = Instant::now();
-    let packed = pack_match_batch_inputs(inputs)?;
-    let pack_inputs_ms = elapsed_ms(t_pack);
+    let (packed, pack_profile) = pack_match_batch_inputs(inputs)?;
+    let pack_inputs_ms = pack_profile.total_ms;
     if packed.section_count != section_count {
         return Err(PDeflateError::InvalidOptions(
             "gpu section_count mismatch between input and call",
@@ -7923,6 +8224,18 @@ pub(crate) fn compute_matches_and_encode_sections_batch(
             },
             kernel_profile: GpuBatchKernelProfile {
                 pack_inputs_ms,
+                pack_alloc_setup_ms: pack_profile.alloc_setup_ms,
+                pack_resolve_sizes_ms: pack_profile.resolve_sizes_ms,
+                pack_resolve_scan_ms: pack_profile.resolve_scan_ms,
+                pack_resolve_readback_setup_ms: pack_profile.resolve_readback_setup_ms,
+                pack_resolve_submit_ms: pack_profile.resolve_submit_ms,
+                pack_resolve_map_wait_ms: pack_profile.resolve_map_wait_ms,
+                pack_resolve_parse_ms: pack_profile.resolve_parse_ms,
+                pack_src_copy_ms: pack_profile.src_copy_ms,
+                pack_metadata_loop_ms: pack_profile.metadata_loop_ms,
+                pack_host_copy_ms: pack_profile.host_copy_ms,
+                pack_device_copy_plan_ms: pack_profile.device_copy_plan_ms,
+                pack_finalize_ms: pack_profile.finalize_ms,
                 scratch_acquire_ms,
                 match_table_copy_ms,
                 match_prepare_dispatch_ms,
