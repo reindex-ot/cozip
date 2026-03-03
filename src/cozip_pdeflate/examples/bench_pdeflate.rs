@@ -1,8 +1,8 @@
 use std::time::Instant;
 
 use cozip_pdeflate::{
-    PDeflateOptions, pdeflate_compress_with_stats, pdeflate_decompress_with_stats,
-    pdeflate_gpu_init,
+    PDeflateHybridSchedulerPolicy, PDeflateOptions, pdeflate_compress_with_stats,
+    pdeflate_decompress_with_stats, pdeflate_gpu_init,
 };
 
 #[derive(Debug, Clone)]
@@ -16,8 +16,12 @@ struct BenchConfig {
     gpu_compress: bool,
     compare_hybrid: bool,
     gpu_workers: usize,
+    gpu_slot_count: usize,
     gpu_submit_chunks: usize,
+    gpu_pipelined_submit_chunks: usize,
     gpu_min_chunk_kib: usize,
+    scheduler_policy: PDeflateHybridSchedulerPolicy,
+    gpu_tail_stop_ratio: f32,
 }
 
 impl Default for BenchConfig {
@@ -32,8 +36,12 @@ impl Default for BenchConfig {
             gpu_compress: false,
             compare_hybrid: false,
             gpu_workers: 1,
+            gpu_slot_count: 16,
             gpu_submit_chunks: 4,
+            gpu_pipelined_submit_chunks: 4,
             gpu_min_chunk_kib: 64,
+            scheduler_policy: PDeflateHybridSchedulerPolicy::GlobalQueue,
+            gpu_tail_stop_ratio: 1.0,
         }
     }
 }
@@ -137,6 +145,22 @@ fn parse_args() -> Result<BenchConfig, String> {
                     .parse::<usize>()
                     .map_err(|e| format!("invalid --gpu-submit-chunks: {e}"))?;
             }
+            "--gpu-slot-count" => {
+                i += 1;
+                cfg.gpu_slot_count = args
+                    .get(i)
+                    .ok_or("--gpu-slot-count requires value")?
+                    .parse::<usize>()
+                    .map_err(|e| format!("invalid --gpu-slot-count: {e}"))?;
+            }
+            "--gpu-pipelined-submit-chunks" => {
+                i += 1;
+                cfg.gpu_pipelined_submit_chunks = args
+                    .get(i)
+                    .ok_or("--gpu-pipelined-submit-chunks requires value")?
+                    .parse::<usize>()
+                    .map_err(|e| format!("invalid --gpu-pipelined-submit-chunks: {e}"))?;
+            }
             "--gpu-min-chunk-kib" => {
                 i += 1;
                 cfg.gpu_min_chunk_kib = args
@@ -144,6 +168,23 @@ fn parse_args() -> Result<BenchConfig, String> {
                     .ok_or("--gpu-min-chunk-kib requires value")?
                     .parse::<usize>()
                     .map_err(|e| format!("invalid --gpu-min-chunk-kib: {e}"))?;
+            }
+            "--scheduler" => {
+                i += 1;
+                let v = args.get(i).ok_or("--scheduler requires value")?;
+                cfg.scheduler_policy = match v.as_str() {
+                    "global" => PDeflateHybridSchedulerPolicy::GlobalQueue,
+                    "gpu-led" => PDeflateHybridSchedulerPolicy::GpuLedSplitQueue,
+                    _ => return Err(format!("invalid --scheduler: {v}")),
+                };
+            }
+            "--gpu-tail-stop-ratio" => {
+                i += 1;
+                cfg.gpu_tail_stop_ratio = args
+                    .get(i)
+                    .ok_or("--gpu-tail-stop-ratio requires value")?
+                    .parse::<f32>()
+                    .map_err(|e| format!("invalid --gpu-tail-stop-ratio: {e}"))?;
             }
             "--verify" => {
                 cfg.verify_bytes = true;
@@ -186,8 +227,17 @@ fn parse_args() -> Result<BenchConfig, String> {
     if cfg.gpu_submit_chunks == 0 {
         return Err("--gpu-submit-chunks must be > 0".to_string());
     }
+    if cfg.gpu_slot_count == 0 {
+        return Err("--gpu-slot-count must be > 0".to_string());
+    }
+    if cfg.gpu_pipelined_submit_chunks == 0 {
+        return Err("--gpu-pipelined-submit-chunks must be > 0".to_string());
+    }
     if cfg.gpu_min_chunk_kib == 0 {
         return Err("--gpu-min-chunk-kib must be > 0".to_string());
+    }
+    if !(0.0..=1.0).contains(&cfg.gpu_tail_stop_ratio) {
+        return Err("--gpu-tail-stop-ratio must be in range 0.0..=1.0".to_string());
     }
 
     Ok(cfg)
@@ -207,8 +257,12 @@ options:\n\
   --compare-hybrid       compare CPU_ONLY vs CPU+GPU\n\
   --compare-hybrid-enabled <B> compare mode (0/1)\n\
   --gpu-workers <N>      GPU worker count (default: 2)\n\
-  --gpu-submit-chunks <N> GPU batch chunk limit (default: 4)\n\
+  --gpu-slot-count <N>   GPU claim batch upper bound (default: 16)\n\
+  --gpu-submit-chunks <N> legacy GPU batch chunk limit (default: 4)\n\
+  --gpu-pipelined-submit-chunks <N> GPU submit group size (default: 4)\n\
   --gpu-min-chunk-kib <N> GPU eligible chunk threshold in KiB (default: 64)\n\
+  --scheduler <S>        scheduler policy: global | gpu-led (default: global)\n\
+  --gpu-tail-stop-ratio <R> stop new GPU dequeues at tail ratio (0.0..=1.0, default: 1.0)\n\
   --verify               enable strict decoded-bytes check (default)\n\
   --no-verify            disable decoded-bytes check\n\
   --verify-bytes <B>     strict decoded-bytes check (0/1, default: 1)\n\
@@ -317,15 +371,19 @@ fn main() -> Result<(), String> {
         section_count: cfg.sections,
         gpu_compress_enabled: cfg.gpu_compress,
         gpu_workers: cfg.gpu_workers,
+        gpu_slot_count: cfg.gpu_slot_count,
         gpu_submit_chunks: cfg.gpu_submit_chunks,
+        gpu_pipelined_submit_chunks: cfg.gpu_pipelined_submit_chunks,
         gpu_min_chunk_size: cfg.gpu_min_chunk_kib * 1024,
+        gpu_tail_stop_ratio: cfg.gpu_tail_stop_ratio,
+        hybrid_scheduler_policy: cfg.scheduler_policy,
         ..PDeflateOptions::default()
     };
     let mut cpu_opts = hybrid_opts.clone();
     cpu_opts.gpu_compress_enabled = false;
 
     println!(
-        "cozip_pdeflate benchmark\nsize_mib={} runs={} warmups={} chunk_mib={} sections={} gpu_compress={} gpu_workers={} gpu_submit_chunks={} gpu_min_chunk_kib={} compare_hybrid={} verify_bytes={}",
+        "cozip_pdeflate benchmark\nsize_mib={} runs={} warmups={} chunk_mib={} sections={} gpu_compress={} gpu_workers={} gpu_slot_count={} gpu_submit_chunks={} gpu_pipelined_submit_chunks={} gpu_min_chunk_kib={} scheduler={:?} gpu_tail_stop_ratio={:.2} compare_hybrid={} verify_bytes={}",
         cfg.size_mib,
         cfg.runs,
         cfg.warmups,
@@ -333,8 +391,12 @@ fn main() -> Result<(), String> {
         cfg.sections,
         cfg.gpu_compress,
         cfg.gpu_workers,
+        cfg.gpu_slot_count,
         cfg.gpu_submit_chunks,
+        cfg.gpu_pipelined_submit_chunks,
         cfg.gpu_min_chunk_kib,
+        cfg.scheduler_policy,
+        cfg.gpu_tail_stop_ratio,
         cfg.compare_hybrid,
         cfg.verify_bytes
     );

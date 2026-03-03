@@ -679,15 +679,22 @@ fn section_start(sec: u32, section_count: u32, total_len: u32) -> u32 {
     return (sec * total_len) / section_count;
 }
 
-fn is_valid_match(word: u32, remaining: u32, min_ref_len: u32, max_ref_len: u32) -> bool {
+fn match_len_or_zero(word: u32, remaining: u32, min_ref_len: u32, max_ref_len: u32) -> u32 {
     if (word == 0u) {
-        return false;
+        return 0u;
     }
     let mlen = word & 0xffffu;
     if mlen < min_ref_len || mlen > max_ref_len {
-        return false;
+        return 0u;
     }
-    return mlen <= remaining;
+    if (mlen > remaining) {
+        return 0u;
+    }
+    return mlen;
+}
+
+fn is_valid_match(word: u32, remaining: u32, min_ref_len: u32, max_ref_len: u32) -> bool {
+    return match_len_or_zero(word, remaining, min_ref_len, max_ref_len) != 0u;
 }
 
 fn emit_byte(base: u32, cursor: u32, cap: u32, value: u32) -> u32 {
@@ -802,6 +809,364 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
     }
 
     out_lens[sec] = cursor;
+}
+"#;
+
+const SECTION_TOKENIZE_SHADER: &str = r#"
+@group(0) @binding(0) var<storage, read> src_words: array<u32>;
+@group(0) @binding(1) var<storage, read> match_words: array<u32>;
+@group(0) @binding(2) var<storage, read> token_offsets: array<u32>;
+@group(0) @binding(3) var<storage, read> token_caps: array<u32>;
+@group(0) @binding(4) var<storage, read> params: array<u32>;
+@group(0) @binding(5) var<storage, read_write> token_counts: array<u32>;
+@group(0) @binding(6) var<storage, read_write> token_meta: array<u32>;
+@group(0) @binding(7) var<storage, read_write> token_pos: array<u32>;
+
+fn section_start(sec: u32, section_count: u32, total_len: u32) -> u32 {
+    return (sec * total_len) / section_count;
+}
+
+fn match_len_or_zero(word: u32, remaining: u32, min_ref_len: u32, max_ref_len: u32) -> u32 {
+    if (word == 0u) {
+        return 0u;
+    }
+    let mlen = word & 0xffffu;
+    if mlen < min_ref_len || mlen > max_ref_len {
+        return 0u;
+    }
+    if (mlen > remaining) {
+        return 0u;
+    }
+    return mlen;
+}
+
+fn probe_stride(lit_len: u32) -> u32 {
+    if (lit_len < 8u) {
+        return 1u;
+    }
+    if (lit_len < 32u) {
+        return 8u;
+    }
+    if (lit_len < 128u) {
+        return 32u;
+    }
+    if (lit_len < 512u) {
+        return 64u;
+    }
+    // Similar to zlib's "reduce search effort once we have a good lead":
+    // lower probe density for long literal runs.
+    return 128u;
+}
+
+fn next_probe_step(lit_len: u32) -> u32 {
+    let stride = probe_stride(lit_len);
+    if (stride == 1u) {
+        return 1u;
+    }
+    let rem = lit_len & (stride - 1u);
+    if (rem == 0u) {
+        return stride;
+    }
+    return stride - rem;
+}
+
+fn push_token(sec: u32, idx: u32, token_word: u32, pos: u32) {
+    let base = token_offsets[sec];
+    let out = base + idx;
+    token_meta[out] = token_word;
+    token_pos[out] = pos;
+}
+
+@compute
+@workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let sec = gid3.x;
+    let total_len = params[0];
+    let section_count = params[1];
+    let min_ref_len = params[2];
+    let max_ref_len = params[3];
+    let max_cmd_len = params[4];
+    let src_base = params[5];
+    if (sec >= section_count) {
+        return;
+    }
+    let s0 = section_start(sec, section_count, total_len);
+    let s1 = section_start(sec + 1u, section_count, total_len);
+    let cap = token_caps[sec];
+    var tok: u32 = 0u;
+    var pos: u32 = s0;
+
+    loop {
+        if (pos >= s1) {
+            break;
+        }
+        if (tok >= cap) {
+            token_counts[sec] = 0xffffffffu;
+            return;
+        }
+        let word = match_words[src_base + pos];
+        let remaining = s1 - pos;
+        let mlen = match_len_or_zero(word, remaining, min_ref_len, max_ref_len);
+        if (mlen != 0u) {
+            let tag = (word >> 16u) & 0x0fffu;
+            push_token(sec, tok, (tag << 16u) | mlen, pos);
+            tok = tok + 1u;
+            pos = pos + mlen;
+            continue;
+        }
+
+        let lit_start = pos;
+        pos = pos + 1u;
+        var lit_len = 1u;
+        loop {
+            if (pos >= s1 || lit_len >= max_cmd_len) {
+                break;
+            }
+            // If remaining bytes are below min_ref_len, no further matches can
+            // be emitted. Consume the tail as a single literal span.
+            let sec_rem = s1 - pos;
+            if (sec_rem < min_ref_len) {
+                let cmd_rem = max_cmd_len - lit_len;
+                var tail = sec_rem;
+                if (tail > cmd_rem) {
+                    tail = cmd_rem;
+                }
+                pos = pos + tail;
+                lit_len = lit_len + tail;
+                break;
+            }
+
+            // Like CPU lazy lookahead: reduce probe frequency as literal span
+            // grows to cap tokenize-stage work.
+            let stride = probe_stride(lit_len);
+            let should_probe = stride == 1u || ((lit_len & (stride - 1u)) == 0u);
+            if (!should_probe) {
+                // Skip directly to the next probe boundary instead of
+                // advancing byte-by-byte on non-probe regions.
+                var step = next_probe_step(lit_len);
+                let cmd_rem = max_cmd_len - lit_len;
+                if (step > cmd_rem) {
+                    step = cmd_rem;
+                }
+                if (step > sec_rem) {
+                    step = sec_rem;
+                }
+                pos = pos + step;
+                lit_len = lit_len + step;
+                continue;
+            }
+
+            let p2 = match_words[src_base + pos];
+            let rem2 = sec_rem;
+            if (match_len_or_zero(p2, rem2, min_ref_len, max_ref_len) != 0u) {
+                break;
+            }
+            // No hit at this probe point: jump straight to next probe point.
+            var step = stride;
+            let cmd_rem = max_cmd_len - lit_len;
+            if (step > cmd_rem) {
+                step = cmd_rem;
+            }
+            if (step > sec_rem) {
+                step = sec_rem;
+            }
+            if (step == 0u) {
+                break;
+            }
+            pos = pos + step;
+            lit_len = lit_len + step;
+        }
+        push_token(sec, tok, (0x0fffu << 16u) | lit_len, lit_start);
+        tok = tok + 1u;
+    }
+
+    token_counts[sec] = tok;
+}
+"#;
+
+const SECTION_TOKEN_PREFIX_SHADER: &str = r#"
+@group(0) @binding(0) var<storage, read> token_offsets: array<u32>;
+@group(0) @binding(1) var<storage, read> token_caps: array<u32>;
+@group(0) @binding(2) var<storage, read> params: array<u32>;
+@group(0) @binding(3) var<storage, read> token_counts: array<u32>;
+@group(0) @binding(4) var<storage, read> token_meta: array<u32>;
+@group(0) @binding(5) var<storage, read_write> token_cmd_offsets: array<u32>;
+@group(0) @binding(6) var<storage, read_write> out_lens: array<u32>;
+@group(0) @binding(7) var<storage, read> section_caps: array<u32>;
+
+fn cmd_size_bytes(token_word: u32) -> u32 {
+    let tag = (token_word >> 16u) & 0x0fffu;
+    let len = token_word & 0xffffu;
+    var size = 2u;
+    if (len > 14u) {
+        size = 3u;
+    }
+    if (tag == 0x0fffu) {
+        size = size + len;
+    }
+    return size;
+}
+
+@compute
+@workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let sec = gid3.x;
+    let section_count = params[1];
+    if (sec >= section_count) {
+        return;
+    }
+    let count = token_counts[sec];
+    if (count == 0xffffffffu) {
+        out_lens[sec] = 0xffffffffu;
+        return;
+    }
+    if (count > token_caps[sec]) {
+        out_lens[sec] = 0xffffffffu;
+        return;
+    }
+
+    let base = token_offsets[sec];
+    let cap = section_caps[sec];
+    var cursor: u32 = 0u;
+    var i: u32 = 0u;
+    loop {
+        if (i >= count) {
+            break;
+        }
+        let idx = base + i;
+        token_cmd_offsets[idx] = cursor;
+        cursor = cursor + cmd_size_bytes(token_meta[idx]);
+        if (cursor > cap) {
+            out_lens[sec] = 0xffffffffu;
+            return;
+        }
+        i = i + 1u;
+    }
+    out_lens[sec] = cursor;
+}
+"#;
+
+const SECTION_TOKEN_SCATTER_SHADER: &str = r#"
+@group(0) @binding(0) var<storage, read> src_words: array<u32>;
+@group(0) @binding(1) var<storage, read> token_offsets: array<u32>;
+@group(0) @binding(2) var<storage, read> token_counts: array<u32>;
+@group(0) @binding(3) var<storage, read> token_meta: array<u32>;
+@group(0) @binding(4) var<storage, read> token_pos: array<u32>;
+@group(0) @binding(5) var<storage, read> token_cmd_offsets: array<u32>;
+@group(0) @binding(6) var<storage, read> section_offsets: array<u32>;
+@group(0) @binding(7) var<storage, read> section_caps: array<u32>;
+@group(0) @binding(8) var<storage, read> params: array<u32>;
+@group(0) @binding(9) var<storage, read_write> out_cmd_bytes: array<u32>;
+
+fn load_src(idx: u32) -> u32 {
+    let w = src_words[idx >> 2u];
+    let shift = (idx & 3u) * 8u;
+    return (w >> shift) & 0xffu;
+}
+
+fn write_cmd_byte(idx: u32, value: u32) {
+    out_cmd_bytes[idx] = value & 0xffu;
+}
+
+@compute
+@workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let tok = gid3.x;
+    let sec = gid3.y;
+    let section_count = params[1];
+    let src_base = params[5];
+    if (sec >= section_count) {
+        return;
+    }
+    let count = token_counts[sec];
+    if (count == 0xffffffffu || tok >= count) {
+        return;
+    }
+
+    let base = token_offsets[sec];
+    let tidx = base + tok;
+    let token_word = token_meta[tidx];
+    let tag = (token_word >> 16u) & 0x0fffu;
+    let len = token_word & 0xffffu;
+    var header_len: u32 = 2u;
+    if (len > 14u) {
+        header_len = 3u;
+    }
+    let payload_len = select(0u, len, tag == 0x0fffu);
+    let cmd_len = header_len + payload_len;
+
+    let sec_cap = section_caps[sec];
+    let local_off = token_cmd_offsets[tidx];
+    if (local_off + cmd_len > sec_cap) {
+        return;
+    }
+
+    let dst = section_offsets[sec] + local_off;
+    var len4 = len;
+    if (len4 > 14u) {
+        len4 = 15u;
+    }
+    let header = (len4 << 12u) | tag;
+    write_cmd_byte(dst, header & 0xffu);
+    write_cmd_byte(dst + 1u, (header >> 8u) & 0xffu);
+    if (header_len == 3u) {
+        write_cmd_byte(dst + 2u, len - 15u);
+    }
+    if (tag == 0x0fffu) {
+        let lit_base = token_pos[tidx];
+        var i: u32 = 0u;
+        loop {
+            if (i >= len) {
+                break;
+            }
+            write_cmd_byte(dst + header_len + i, load_src(src_base + lit_base + i));
+            i = i + 1u;
+        }
+    }
+}
+"#;
+
+const SECTION_CMD_PACK_SHADER: &str = r#"
+@group(0) @binding(0) var<storage, read> out_cmd_bytes: array<u32>;
+@group(0) @binding(1) var<storage, read> section_offsets: array<u32>;
+@group(0) @binding(2) var<storage, read> out_lens: array<u32>;
+@group(0) @binding(3) var<storage, read> params: array<u32>;
+@group(0) @binding(4) var<storage, read_write> out_cmd_words: array<u32>;
+
+fn read_cmd_byte(idx: u32) -> u32 {
+    return out_cmd_bytes[idx] & 0xffu;
+}
+
+@compute
+@workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let word = gid3.x;
+    let sec = gid3.y;
+    let section_count = params[1];
+    if (sec >= section_count) {
+        return;
+    }
+    let len = out_lens[sec];
+    if (len == 0xffffffffu) {
+        return;
+    }
+    let sec_words = (len + 3u) >> 2u;
+    if (word >= sec_words) {
+        return;
+    }
+
+    let sec_off = section_offsets[sec];
+    let local_byte = word << 2u;
+    let abs_byte = sec_off + local_byte;
+
+    let b0 = select(0u, read_cmd_byte(abs_byte), local_byte < len);
+    let b1 = select(0u, read_cmd_byte(abs_byte + 1u), (local_byte + 1u) < len);
+    let b2 = select(0u, read_cmd_byte(abs_byte + 2u), (local_byte + 2u) < len);
+    let b3 = select(0u, read_cmd_byte(abs_byte + 3u), (local_byte + 3u) < len);
+    let out_word = b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+
+    let dst_word = (sec_off >> 2u) + word;
+    out_cmd_words[dst_word] = out_word;
 }
 "#;
 
@@ -986,9 +1351,20 @@ const PACK_CHUNK_SPARSE_SECTION_SHADER: &str = r#"
 @group(0) @binding(7) var<storage, read> section_offsets_words: array<u32>;
 @group(0) @binding(8) var<storage, read> section_cmd_sparse_words: array<u32>;
 @group(0) @binding(9) var<storage, read_write> out_words: array<u32>;
+@group(0) @binding(10) var<storage, read_write> sparse_stats_words: array<atomic<u32>, 8>;
 
 fn low8(v: u32, s: u32) -> u32 {
     return (v >> s) & 0xffu;
+}
+
+fn sparse_probe_enabled() -> bool {
+    return params[12] != 0u;
+}
+
+fn sparse_stat_add(idx: u32, value: u32) {
+    if (sparse_probe_enabled()) {
+        atomicAdd(&sparse_stats_words[idx], value);
+    }
 }
 
 fn load_header_byte(idx: u32, section_cmd_off: u32) -> u32 {
@@ -1064,11 +1440,13 @@ fn load_section_cmd_sparse_byte(idx: u32) -> u32 {
 
 fn load_section_cmd_compact_byte(local: u32, section_count: u32) -> u32 {
     if (section_count == 0u) {
+        sparse_stat_add(7u, 1u);
         return 0u;
     }
     var lo = 0u;
     var hi = section_count;
     loop {
+        sparse_stat_add(5u, 1u);
         if (lo >= hi) {
             break;
         }
@@ -1085,8 +1463,10 @@ fn load_section_cmd_compact_byte(local: u32, section_count: u32) -> u32 {
         }
         let rel = local - start;
         let src = section_offsets_words[mid] + rel;
+        sparse_stat_add(6u, 1u);
         return load_section_cmd_sparse_byte(src);
     }
+    sparse_stat_add(7u, 1u);
     return 0u;
 }
 
@@ -1112,18 +1492,23 @@ fn read_output_byte(pos: u32) -> u32 {
     }
 
     if (pos < header_len) {
+        sparse_stat_add(0u, 1u);
         return load_header_byte(pos, section_cmd_off);
     }
     if (pos >= table_index_off && pos < table_index_off + table_index_len) {
+        sparse_stat_add(1u, 1u);
         return load_table_index_byte(pos - table_index_off);
     }
     if (pos >= table_data_off && pos < table_data_off + table_data_len) {
+        sparse_stat_add(2u, 1u);
         return load_table_data_byte(pos - table_data_off);
     }
     if (pos >= section_index_off && pos < section_index_off + section_index_len) {
+        sparse_stat_add(3u, 1u);
         return load_section_index_byte(pos - section_index_off);
     }
     if (pos >= section_cmd_off && pos < section_cmd_off + section_cmd_len) {
+        sparse_stat_add(4u, 1u);
         return load_section_cmd_compact_byte(pos - section_cmd_off, section_count);
     }
     return 0u;
@@ -1205,8 +1590,18 @@ pub(crate) struct GpuBatchKernelProfile {
     pub(crate) match_submit_ms: f64,
     pub(crate) section_setup_ms: f64,
     pub(crate) section_pass_dispatch_ms: f64,
+    pub(crate) section_tokenize_dispatch_ms: f64,
+    pub(crate) section_prefix_dispatch_ms: f64,
+    pub(crate) section_scatter_dispatch_ms: f64,
+    pub(crate) section_pack_dispatch_ms: f64,
+    pub(crate) section_meta_dispatch_ms: f64,
     pub(crate) section_copy_dispatch_ms: f64,
     pub(crate) section_submit_ms: f64,
+    pub(crate) section_tokenize_wait_ms: f64,
+    pub(crate) section_prefix_wait_ms: f64,
+    pub(crate) section_scatter_wait_ms: f64,
+    pub(crate) section_pack_wait_ms: f64,
+    pub(crate) section_meta_wait_ms: f64,
     pub(crate) section_wrap_ms: f64,
     pub(crate) sparse_lens_submit_ms: f64,
     pub(crate) sparse_lens_submit_done_wait_ms: f64,
@@ -1398,8 +1793,17 @@ struct GpuMatchRuntime {
     pack_sparse_prepare_pipeline: wgpu::ComputePipeline,
     pack_sparse_bind_group_layout: wgpu::BindGroupLayout,
     pack_sparse_pipeline: wgpu::ComputePipeline,
+    pack_sparse_stats_zero_buffer: wgpu::Buffer,
     section_encode_bind_group_layout: wgpu::BindGroupLayout,
     section_encode_pipeline: wgpu::ComputePipeline,
+    section_tokenize_bind_group_layout: wgpu::BindGroupLayout,
+    section_tokenize_pipeline: wgpu::ComputePipeline,
+    section_prefix_bind_group_layout: wgpu::BindGroupLayout,
+    section_prefix_pipeline: wgpu::ComputePipeline,
+    section_scatter_bind_group_layout: wgpu::BindGroupLayout,
+    section_scatter_pipeline: wgpu::ComputePipeline,
+    section_cmd_pack_bind_group_layout: wgpu::BindGroupLayout,
+    section_cmd_pack_pipeline: wgpu::ComputePipeline,
     section_meta_bind_group_layout: wgpu::BindGroupLayout,
     section_meta_pipeline: wgpu::ComputePipeline,
     build_table_freq_bind_group_layout: wgpu::BindGroupLayout,
@@ -1461,17 +1865,29 @@ struct GpuBatchScratch {
 struct GpuSectionEncodeSlot {
     section_count_cap: usize,
     cmd_cap_bytes: u64,
+    token_cap_count: u64,
     section_index_cap_bytes: u64,
     section_offsets_buffer: Arc<wgpu::Buffer>,
     section_caps_buffer: Arc<wgpu::Buffer>,
+    section_token_offsets_buffer: Arc<wgpu::Buffer>,
+    section_token_caps_buffer: Arc<wgpu::Buffer>,
     section_params_buffer: Arc<wgpu::Buffer>,
     out_lens_buffer: Arc<wgpu::Buffer>,
+    section_token_counts_buffer: Arc<wgpu::Buffer>,
+    section_token_meta_buffer: Arc<wgpu::Buffer>,
+    section_token_pos_buffer: Arc<wgpu::Buffer>,
+    section_token_cmd_offsets_buffer: Arc<wgpu::Buffer>,
+    out_cmd_byte_buffer: Arc<wgpu::Buffer>,
     section_prefix_buffer: Arc<wgpu::Buffer>,
     section_index_buffer: Arc<wgpu::Buffer>,
     section_meta_buffer: Arc<wgpu::Buffer>,
     out_cmd_buffer: Arc<wgpu::Buffer>,
     readback_meta_buffer: Arc<wgpu::Buffer>,
     bind_group: wgpu::BindGroup,
+    tokenize_bind_group: wgpu::BindGroup,
+    prefix_bind_group: wgpu::BindGroup,
+    scatter_bind_group: wgpu::BindGroup,
+    pack_bind_group: wgpu::BindGroup,
     meta_bind_group: wgpu::BindGroup,
 }
 
@@ -1524,6 +1940,45 @@ fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
+fn env_flag_enabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let s = v.trim();
+            !(s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => false,
+    }
+}
+
+fn sparse_probe_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag_enabled("COZIP_PDEFLATE_PROFILE_SPARSE_PROBE"))
+}
+
+fn queue_probe_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag_enabled("COZIP_PDEFLATE_PROFILE_QUEUE_PROBE"))
+}
+
+fn wait_for_queue_done(queue: &wgpu::Queue, device: &wgpu::Device) -> (f64, u64) {
+    let t_wait = Instant::now();
+    let (done_tx, done_rx) = mpsc::channel();
+    queue.on_submitted_work_done(move || {
+        let _ = done_tx.send(());
+    });
+    let mut poll_calls = 0u64;
+    let mut done = false;
+    while !done {
+        device.poll(wgpu::Maintain::Wait);
+        poll_calls = poll_calls.saturating_add(1);
+        match done_rx.try_recv() {
+            Ok(_) | Err(mpsc::TryRecvError::Disconnected) => done = true,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+    (elapsed_ms(t_wait), poll_calls)
+}
+
 fn round_capacity_bytes(required: u64) -> u64 {
     let req = required.max(4);
     req.checked_next_power_of_two().unwrap_or(req)
@@ -1540,6 +1995,11 @@ fn estimate_section_cmd_cap_bytes(sec_len: usize) -> Result<usize, PDeflateError
         .checked_mul(GPU_SECTION_CMD_CAP_MULTIPLIER)
         .and_then(|v| v.checked_add(GPU_SECTION_CMD_CAP_PAD))
         .ok_or(PDeflateError::NumericOverflow)
+}
+
+#[inline]
+fn estimate_token_cap_count(cmd_cap_bytes: u64) -> u64 {
+    (cmd_cap_bytes / 2).max(1)
 }
 
 struct ByteWordPacker {
@@ -1891,6 +2351,19 @@ impl GpuSectionEncodeSlot {
         let section_index_cap_bytes = u64::try_from(section_count.saturating_mul(5))
             .map_err(|_| PDeflateError::NumericOverflow)?;
         let out_cmd_bytes = cmd_cap_bytes.max(4);
+        let token_cap_count = estimate_token_cap_count(out_cmd_bytes);
+        let token_buf_bytes = token_cap_count.saturating_mul(4).max(4);
+        let out_cmd_byte_buf_bytes = out_cmd_bytes
+            .checked_mul(4)
+            .ok_or(PDeflateError::NumericOverflow)?
+            .max(4);
+        if token_buf_bytes > runtime.max_storage_binding_size
+            || out_cmd_byte_buf_bytes > runtime.max_storage_binding_size
+        {
+            return Err(PDeflateError::Gpu(
+                "gpu section encode staging buffer too large".to_string(),
+            ));
+        }
         let section_offsets_buffer = Arc::new(storage_upload_buffer(
             &runtime.device,
             "cozip-pdeflate-se-offs",
@@ -1899,6 +2372,16 @@ impl GpuSectionEncodeSlot {
         let section_caps_buffer = Arc::new(storage_upload_buffer(
             &runtime.device,
             "cozip-pdeflate-se-caps",
+            section_caps_bytes.max(4),
+        ));
+        let section_token_offsets_buffer = Arc::new(storage_upload_buffer(
+            &runtime.device,
+            "cozip-pdeflate-se-token-offs",
+            section_offsets_bytes.max(4),
+        ));
+        let section_token_caps_buffer = Arc::new(storage_upload_buffer(
+            &runtime.device,
+            "cozip-pdeflate-se-token-caps",
             section_caps_bytes.max(4),
         ));
         let section_params_buffer = Arc::new(storage_upload_buffer(
@@ -1930,6 +2413,40 @@ impl GpuSectionEncodeSlot {
             label: Some("cozip-pdeflate-se-meta"),
             size: 16,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        }));
+        let section_token_counts_buffer =
+            Arc::new(runtime.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cozip-pdeflate-se-token-counts"),
+                size: out_lens_bytes.max(4),
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }));
+        let section_token_meta_buffer =
+            Arc::new(runtime.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cozip-pdeflate-se-token-meta"),
+                size: token_buf_bytes,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }));
+        let section_token_pos_buffer =
+            Arc::new(runtime.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cozip-pdeflate-se-token-pos"),
+                size: token_buf_bytes,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }));
+        let section_token_cmd_offsets_buffer =
+            Arc::new(runtime.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cozip-pdeflate-se-token-cmd-offs"),
+                size: token_buf_bytes,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }));
+        let out_cmd_byte_buffer = Arc::new(runtime.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-se-out-cmd-byte"),
+            size: out_cmd_byte_buf_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         }));
         let out_cmd_buffer = Arc::new(runtime.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1981,6 +2498,162 @@ impl GpuSectionEncodeSlot {
                     },
                 ],
             });
+        let tokenize_bind_group = runtime
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("cozip-pdeflate-se-tokenize-bg"),
+                layout: &runtime.section_tokenize_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: match_scratch.src_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: match_scratch.out_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: section_token_offsets_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: section_token_caps_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: section_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: section_token_counts_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: section_token_meta_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: section_token_pos_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+        let prefix_bind_group = runtime
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("cozip-pdeflate-se-prefix-bg"),
+                layout: &runtime.section_prefix_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: section_token_offsets_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: section_token_caps_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: section_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: section_token_counts_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: section_token_meta_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: section_token_cmd_offsets_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: out_lens_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: section_caps_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+        let scatter_bind_group = runtime
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("cozip-pdeflate-se-scatter-bg"),
+                layout: &runtime.section_scatter_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: match_scratch.src_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: section_token_offsets_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: section_token_counts_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: section_token_meta_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: section_token_pos_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: section_token_cmd_offsets_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: section_offsets_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: section_caps_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: section_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: out_cmd_byte_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+        let pack_bind_group = runtime
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("cozip-pdeflate-se-pack-bg"),
+                layout: &runtime.section_cmd_pack_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: out_cmd_byte_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: section_offsets_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: out_lens_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: section_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: out_cmd_buffer.as_entire_binding(),
+                    },
+                ],
+            });
         let meta_bind_group = runtime
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2012,17 +2685,29 @@ impl GpuSectionEncodeSlot {
         Ok(Self {
             section_count_cap: section_count,
             cmd_cap_bytes: out_cmd_bytes,
+            token_cap_count,
             section_index_cap_bytes: section_index_cap_bytes.max(4),
             section_offsets_buffer,
             section_caps_buffer,
+            section_token_offsets_buffer,
+            section_token_caps_buffer,
             section_params_buffer,
             out_lens_buffer,
+            section_token_counts_buffer,
+            section_token_meta_buffer,
+            section_token_pos_buffer,
+            section_token_cmd_offsets_buffer,
+            out_cmd_byte_buffer,
             section_prefix_buffer,
             section_index_buffer,
             section_meta_buffer,
             out_cmd_buffer,
             readback_meta_buffer,
             bind_group,
+            tokenize_bind_group,
+            prefix_bind_group,
+            scatter_bind_group,
+            pack_bind_group,
             meta_bind_group,
         })
     }
@@ -2473,6 +3158,16 @@ fn init_runtime() -> Result<GpuMatchRuntime, String> {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
     let pack_sparse_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -2581,6 +3276,404 @@ fn init_runtime() -> Result<GpuMatchRuntime, String> {
             label: Some("cozip-pdeflate-section-encode-pipeline"),
             layout: Some(&section_encode_layout),
             module: &section_encode_shader,
+            entry_point: "main",
+        });
+    let section_tokenize_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cozip-pdeflate-section-tokenize-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+    let section_tokenize_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("cozip-pdeflate-section-tokenize-shader"),
+        source: wgpu::ShaderSource::Wgsl(SECTION_TOKENIZE_SHADER.into()),
+    });
+    let section_tokenize_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("cozip-pdeflate-section-tokenize-pl"),
+        bind_group_layouts: &[&section_tokenize_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+    let section_tokenize_pipeline =
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("cozip-pdeflate-section-tokenize-pipeline"),
+            layout: Some(&section_tokenize_layout),
+            module: &section_tokenize_shader,
+            entry_point: "main",
+        });
+    let section_prefix_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cozip-pdeflate-section-prefix-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+    let section_prefix_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("cozip-pdeflate-section-prefix-shader"),
+        source: wgpu::ShaderSource::Wgsl(SECTION_TOKEN_PREFIX_SHADER.into()),
+    });
+    let section_prefix_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("cozip-pdeflate-section-prefix-pl"),
+        bind_group_layouts: &[&section_prefix_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+    let section_prefix_pipeline =
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("cozip-pdeflate-section-prefix-pipeline"),
+            layout: Some(&section_prefix_layout),
+            module: &section_prefix_shader,
+            entry_point: "main",
+        });
+    let section_scatter_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cozip-pdeflate-section-scatter-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+    let section_scatter_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("cozip-pdeflate-section-scatter-shader"),
+        source: wgpu::ShaderSource::Wgsl(SECTION_TOKEN_SCATTER_SHADER.into()),
+    });
+    let section_scatter_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("cozip-pdeflate-section-scatter-pl"),
+        bind_group_layouts: &[&section_scatter_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+    let section_scatter_pipeline =
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("cozip-pdeflate-section-scatter-pipeline"),
+            layout: Some(&section_scatter_layout),
+            module: &section_scatter_shader,
+            entry_point: "main",
+        });
+    let section_cmd_pack_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cozip-pdeflate-section-cmd-pack-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+    let section_cmd_pack_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("cozip-pdeflate-section-cmd-pack-shader"),
+        source: wgpu::ShaderSource::Wgsl(SECTION_CMD_PACK_SHADER.into()),
+    });
+    let section_cmd_pack_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("cozip-pdeflate-section-cmd-pack-pl"),
+        bind_group_layouts: &[&section_cmd_pack_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+    let section_cmd_pack_pipeline =
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("cozip-pdeflate-section-cmd-pack-pipeline"),
+            layout: Some(&section_cmd_pack_layout),
+            module: &section_cmd_pack_shader,
             entry_point: "main",
         });
     let section_meta_bind_group_layout =
@@ -3212,6 +4305,14 @@ fn init_runtime() -> Result<GpuMatchRuntime, String> {
             module: &match_prepare_table_shader,
             entry_point: "main",
         });
+    let pack_sparse_stats_zero_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cozip-pdeflate-pack-sparse-stats-zero"),
+        size: 32,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
     let max_storage_binding_size = u64::from(device.limits().max_storage_buffer_binding_size);
 
     Ok(GpuMatchRuntime {
@@ -3225,8 +4326,17 @@ fn init_runtime() -> Result<GpuMatchRuntime, String> {
         pack_sparse_prepare_pipeline,
         pack_sparse_bind_group_layout,
         pack_sparse_pipeline,
+        pack_sparse_stats_zero_buffer,
         section_encode_bind_group_layout,
         section_encode_pipeline,
+        section_tokenize_bind_group_layout,
+        section_tokenize_pipeline,
+        section_prefix_bind_group_layout,
+        section_prefix_pipeline,
+        section_scatter_bind_group_layout,
+        section_scatter_pipeline,
+        section_cmd_pack_bind_group_layout,
+        section_cmd_pack_pipeline,
         section_meta_bind_group_layout,
         section_meta_pipeline,
         build_table_freq_bind_group_layout,
@@ -3746,7 +4856,7 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
             .map_err(|_| PDeflateError::Gpu("gpu sparse pack pool mutex poisoned".to_string()))?;
         for (_input, prep) in inputs.iter().zip(prepared.iter()) {
             let caps = GpuSparsePackScratchCaps {
-                params_bytes: 48,
+                params_bytes: 52,
                 out_bytes: prep.total_bytes_cap,
             };
             if let Some(pos) = pool.iter().position(|s| s.fits(caps)) {
@@ -3757,6 +4867,33 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
         }
     }
     let scratch_acquire_ms = elapsed_ms(t_scratch_acquire);
+
+    let sparse_probe = sparse_probe_enabled();
+    let sparse_stats_buffer = if sparse_probe {
+        let buf = r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-pack-sparse-stats"),
+            size: 32,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let zeros = [0u8; 32];
+        r.queue.write_buffer(&buf, 0, &zeros);
+        Some(buf)
+    } else {
+        None
+    };
+    let sparse_stats_readback_buffer = if sparse_probe {
+        Some(r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-pack-sparse-stats-readback"),
+            size: 32,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }))
+    } else {
+        None
+    };
 
     let t_upload = Instant::now();
     let mut encoder = r
@@ -3789,6 +4926,7 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
             u32::try_from(section_cmd_cap_len).map_err(|_| PDeflateError::NumericOverflow)?,
             u32::try_from(prep.total_len_cap).map_err(|_| PDeflateError::NumericOverflow)?,
             total_words_cap,
+            if sparse_probe { 1 } else { 0 },
         ];
 
         let prepare_bind_group = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3854,6 +4992,13 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
                     binding: 9,
                     resource: scratch.out_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: sparse_stats_buffer
+                        .as_ref()
+                        .unwrap_or(&r.pack_sparse_stats_zero_buffer)
+                        .as_entire_binding(),
+                },
             ],
         });
 
@@ -3897,6 +5042,12 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
             scratch,
         });
     }
+    if let (Some(stats_buffer), Some(stats_readback)) = (
+        sparse_stats_buffer.as_ref(),
+        sparse_stats_readback_buffer.as_ref(),
+    ) {
+        encoder.copy_buffer_to_buffer(stats_buffer, 0, stats_readback, 0, 32);
+    }
     let t_submit = Instant::now();
     r.queue.submit(Some(encoder.finish()));
     let submit_ms = elapsed_ms(t_submit);
@@ -3911,6 +5062,19 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
     let mut size_receivers = Vec::with_capacity(dispatch_jobs.len());
     let mut out_slices = Vec::with_capacity(dispatch_jobs.len());
     let mut out_receivers = Vec::with_capacity(dispatch_jobs.len());
+    let mut sparse_stats_slice = None;
+    let mut sparse_stats_receiver = None;
+    let mut sparse_stats_pending = false;
+    if let Some(stats_readback) = sparse_stats_readback_buffer.as_ref() {
+        let stats_slice = stats_readback.slice(..32);
+        let (stats_tx, stats_rx) = mpsc::channel();
+        stats_slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = stats_tx.send(res);
+        });
+        sparse_stats_slice = Some(stats_slice);
+        sparse_stats_receiver = Some(stats_rx);
+        sparse_stats_pending = true;
+    }
     for dispatch in &dispatch_jobs {
         let size_slice = dispatch.scratch.params_readback_buffer.slice(..48);
         let (tx, rx) = mpsc::channel();
@@ -3935,7 +5099,7 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
     let mut remaining_sizes = size_receivers.len();
     let mut pending_out = vec![true; out_receivers.len()];
     let mut remaining_out = out_receivers.len();
-    while remaining_sizes > 0 || remaining_out > 0 {
+    while remaining_sizes > 0 || remaining_out > 0 || sparse_stats_pending {
         r.device.poll(wgpu::Maintain::Wait);
         lens_poll_calls = lens_poll_calls.saturating_add(1);
         for (i, rx) in size_receivers.iter().enumerate() {
@@ -3976,9 +5140,40 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
                 }
             }
         }
+        if sparse_stats_pending {
+            if let Some(rx) = sparse_stats_receiver.as_ref() {
+                match rx.try_recv() {
+                    Ok(res) => {
+                        res.map_err(|e| {
+                            PDeflateError::Gpu(format!("gpu sparse stats map failed: {e}"))
+                        })?;
+                        sparse_stats_pending = false;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err(PDeflateError::Gpu(
+                            "gpu sparse stats map channel closed".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
     }
     lens_wait_ms = elapsed_ms(t_lens_wait);
     let lens_map_after_done_ms = 0.0_f64;
+
+    let mut sparse_probe_counters = [0u64; 8];
+    if let Some(stats_slice) = sparse_stats_slice {
+        let mapped = stats_slice.get_mapped_range();
+        let words: &[u32] = bytemuck::cast_slice(&mapped);
+        for (i, dst) in sparse_probe_counters.iter_mut().enumerate() {
+            *dst = u64::from(*words.get(i).unwrap_or(&0));
+        }
+        drop(mapped);
+        if let Some(stats_readback) = sparse_stats_readback_buffer.as_ref() {
+            stats_readback.unmap();
+        }
+    }
 
     let t_lens_copy = Instant::now();
     let mut payload_lens = Vec::<usize>::with_capacity(dispatch_jobs.len());
@@ -4028,6 +5223,42 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
     }
     let sparse_copy_ms = elapsed_ms(t_copy);
     map_copy_ms += lens_copy_ms + sparse_copy_ms;
+
+    if sparse_probe {
+        let total_classified = sparse_probe_counters[0]
+            .saturating_add(sparse_probe_counters[1])
+            .saturating_add(sparse_probe_counters[2])
+            .saturating_add(sparse_probe_counters[3])
+            .saturating_add(sparse_probe_counters[4]);
+        let section_bytes = sparse_probe_counters[4];
+        let search_steps = sparse_probe_counters[5];
+        let search_hits = sparse_probe_counters[6];
+        let search_misses = sparse_probe_counters[7];
+        let search_steps_per_section_byte = if section_bytes > 0 {
+            (search_steps as f64) / (section_bytes as f64)
+        } else {
+            0.0
+        };
+        let section_byte_pct = if total_classified > 0 {
+            100.0 * (section_bytes as f64) / (total_classified as f64)
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[cozip_pdeflate][timing][gpu-sparse-probe] chunks={} bytes_header={} bytes_table_index={} bytes_table_data={} bytes_section_index={} bytes_section_cmd={} section_byte_pct={:.1} search_steps={} search_hits={} search_misses={} search_steps_per_section_byte={:.3}",
+            inputs.len(),
+            sparse_probe_counters[0],
+            sparse_probe_counters[1],
+            sparse_probe_counters[2],
+            sparse_probe_counters[3],
+            section_bytes,
+            section_byte_pct,
+            search_steps,
+            search_hits,
+            search_misses,
+            search_steps_per_section_byte,
+        );
+    }
 
     {
         let mut pool = r
@@ -4102,17 +5333,8 @@ pub(crate) fn read_section_commands_from_device_batch(
         out_lens_bytes: u64,
         out_cmd_bytes: u64,
     }
-    struct LensReadbackJob {
+    struct ReadbackJob {
         lens_buffer: wgpu::Buffer,
-    }
-    struct LensHostChunk {
-        section_cmd_lens: Vec<u32>,
-        copy_offsets: Vec<usize>,
-        total_cmd_len: usize,
-        total_copy_bytes: u64,
-    }
-    struct CmdReadbackJob {
-        cmd_buffer: wgpu::Buffer,
     }
 
     let r = runtime()?;
@@ -4161,8 +5383,47 @@ pub(crate) fn read_section_commands_from_device_batch(
     }
     let prepare_ms = elapsed_ms(t_prepare);
 
+    let queue_probe = queue_probe_enabled();
+    let mut pre_lens_queue_drain_ms = 0.0_f64;
+    let mut pre_lens_queue_drain_poll_calls = 0u64;
+    if queue_probe {
+        let t_pre_drain = Instant::now();
+        let (done_tx_pre, done_rx_pre) = mpsc::channel();
+        r.queue.on_submitted_work_done(move || {
+            let _ = done_tx_pre.send(());
+        });
+        let mut done = false;
+        while !done {
+            r.device.poll(wgpu::Maintain::Wait);
+            pre_lens_queue_drain_poll_calls = pre_lens_queue_drain_poll_calls.saturating_add(1);
+            match done_rx_pre.try_recv() {
+                Ok(_) | Err(mpsc::TryRecvError::Disconnected) => done = true,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        pre_lens_queue_drain_ms = elapsed_ms(t_pre_drain);
+    }
+
+    struct LensHostChunk {
+        section_cmd_lens: Vec<u32>,
+        copy_offsets: Vec<usize>,
+        total_cmd_len: usize,
+        total_copy_bytes: u64,
+    }
+    struct StagedCmdReadbackJob {
+        prep_idx: usize,
+        lens: LensHostChunk,
+        cmd_buffer: wgpu::Buffer,
+    }
+    struct PendingCmdReadbackJob {
+        prep_idx: usize,
+        lens: LensHostChunk,
+        cmd_buffer: wgpu::Buffer,
+        rx: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    }
+
     let t_lens_upload = Instant::now();
-    let mut lens_readbacks = Vec::<LensReadbackJob>::with_capacity(inputs.len());
+    let mut readbacks = Vec::<ReadbackJob>::with_capacity(inputs.len());
     let mut lens_encoder = r
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -4182,7 +5443,7 @@ pub(crate) fn read_section_commands_from_device_batch(
             0,
             prep.out_lens_bytes,
         );
-        lens_readbacks.push(LensReadbackJob { lens_buffer });
+        readbacks.push(ReadbackJob { lens_buffer });
     }
     let t_lens_submit = Instant::now();
     r.queue.submit(Some(lens_encoder.finish()));
@@ -4190,13 +5451,8 @@ pub(crate) fn read_section_commands_from_device_batch(
     let lens_upload_dispatch_ms = (elapsed_ms(t_lens_upload) - lens_submit_ms).max(0.0);
 
     let t_lens_wait = Instant::now();
-    let (done_tx_lens, done_rx_lens) = mpsc::channel();
-    r.queue.on_submitted_work_done(move || {
-        let _ = done_tx_lens.send(());
-    });
-
-    let mut lens_rxs = Vec::with_capacity(lens_readbacks.len());
-    for (rb, prep) in lens_readbacks.iter().zip(prepared.iter()) {
+    let mut lens_rxs = Vec::with_capacity(readbacks.len());
+    for (rb, prep) in readbacks.iter().zip(prepared.iter()) {
         let lens_slice = rb.lens_buffer.slice(..prep.out_lens_bytes);
         let (tx_lens, rx_lens) = mpsc::channel();
         lens_slice.map_async(wgpu::MapMode::Read, move |res| {
@@ -4204,240 +5460,297 @@ pub(crate) fn read_section_commands_from_device_batch(
         });
         lens_rxs.push(rx_lens);
     }
-
-    let mut lens_submit_done_wait_ms = 0.0_f64;
-    let mut lens_submit_done_seen = false;
-    let mut lens_poll_calls = 0u64;
-    let lens_yield_calls = 0u64;
     let mut pending_lens = vec![true; lens_rxs.len()];
     let mut remaining_lens = lens_rxs.len();
-    while remaining_lens > 0 || !lens_submit_done_seen {
-        r.device.poll(wgpu::Maintain::Wait);
-        lens_poll_calls = lens_poll_calls.saturating_add(1);
-        if !lens_submit_done_seen {
-            match done_rx_lens.try_recv() {
-                Ok(_) => {
-                    lens_submit_done_seen = true;
-                    lens_submit_done_wait_ms = elapsed_ms(t_lens_wait);
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    lens_submit_done_seen = true;
-                    lens_submit_done_wait_ms = elapsed_ms(t_lens_wait);
-                }
-            }
-        }
-        for (i, rx) in lens_rxs.iter().enumerate() {
-            if pending_lens[i] {
-                match rx.try_recv() {
-                    Ok(res) => {
-                        res.map_err(|e| {
-                            PDeflateError::Gpu(format!("gpu sparse lens readback map failed: {e}"))
-                        })?;
-                        pending_lens[i] = false;
-                        remaining_lens = remaining_lens.saturating_sub(1);
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        return Err(PDeflateError::Gpu(
-                            "gpu sparse lens readback channel closed".to_string(),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    let lens_wait_ms = elapsed_ms(t_lens_wait);
-    let lens_map_after_done_ms = (lens_wait_ms - lens_submit_done_wait_ms).max(0.0);
 
-    let t_lens_copy = Instant::now();
-    let mut lens_host = Vec::<LensHostChunk>::with_capacity(inputs.len());
-    let mut copied_cmd_bytes_total = 0u64;
-    for (idx, (input, prep)) in inputs.iter().zip(prepared.iter()).enumerate() {
-        let lens_slice = lens_readbacks[idx].lens_buffer.slice(..prep.out_lens_bytes);
-        let lens_mapped = lens_slice.get_mapped_range();
-        let lens_words: &[u32] = bytemuck::cast_slice(&lens_mapped);
-        if lens_words.len() < input.section_count {
-            return Err(PDeflateError::Gpu(
-                "gpu sparse lens readback truncated".to_string(),
-            ));
-        }
-        let mut section_cmd_lens = vec![0u32; input.section_count];
-        section_cmd_lens.copy_from_slice(&lens_words[..input.section_count]);
-
-        let mut total_cmd_len = 0usize;
-        let mut copy_offsets = Vec::with_capacity(input.section_count);
-        let mut copy_cursor = 0usize;
-        for &len_u32 in &section_cmd_lens {
-            if len_u32 == 0xffff_ffff {
-                return Err(PDeflateError::Gpu(
-                    "gpu sparse lens overflow while rebuilding host section commands".to_string(),
-                ));
-            }
-            let len = usize::try_from(len_u32).map_err(|_| PDeflateError::NumericOverflow)?;
-            total_cmd_len = total_cmd_len
-                .checked_add(len)
-                .ok_or(PDeflateError::NumericOverflow)?;
-            copy_offsets.push(copy_cursor);
-            if len > 0 {
-                copy_cursor = copy_cursor
-                    .checked_add(align_up4(len))
-                    .ok_or(PDeflateError::NumericOverflow)?;
-            }
-        }
-        let total_copy_bytes =
-            u64::try_from(copy_cursor.max(4)).map_err(|_| PDeflateError::NumericOverflow)?;
-        if total_copy_bytes > prep.out_cmd_bytes {
-            return Err(PDeflateError::Gpu(
-                "gpu sparse cmd compact copy size exceeds cap".to_string(),
-            ));
-        }
-        copied_cmd_bytes_total = copied_cmd_bytes_total.saturating_add(total_copy_bytes);
-        drop(lens_mapped);
-        lens_readbacks[idx].lens_buffer.unmap();
-        lens_host.push(LensHostChunk {
-            section_cmd_lens,
-            copy_offsets,
-            total_cmd_len,
-            total_copy_bytes,
-        });
-    }
-    let lens_copy_ms = elapsed_ms(t_lens_copy);
-
-    let t_cmd_upload = Instant::now();
-    let mut cmd_readbacks = Vec::<CmdReadbackJob>::with_capacity(inputs.len());
     let mut cmd_encoder = r
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("cozip-pdeflate-sparse-cmd-readback-encoder"),
         });
-    for ((input, prep), lens) in inputs.iter().zip(prepared.iter()).zip(lens_host.iter()) {
-        let cmd_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cozip-pdeflate-sparse-readback-cmd-compact"),
-            size: lens.total_copy_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        for sec in 0..input.section_count {
-            let len = usize::try_from(lens.section_cmd_lens[sec])
-                .map_err(|_| PDeflateError::NumericOverflow)?;
-            if len == 0 {
+    let mut staged_cmd = Vec::<StagedCmdReadbackJob>::new();
+    let mut pending_cmd = Vec::<PendingCmdReadbackJob>::new();
+    let mut cmd_submit_ms = 0.0_f64;
+    let mut cmd_upload_dispatch_ms = 0.0_f64;
+    let mut cmd_submit_count = 0usize;
+    let mut cmd_wait_start: Option<Instant> = None;
+
+    let mut lens_submit_done_wait_ms = 0.0_f64;
+    let mut first_ready_seen = false;
+    let mut lens_poll_calls = 0u64;
+    let mut cmd_poll_calls = 0u64;
+    let lens_yield_calls = 0u64;
+
+    let mut lens_copy_ms = 0.0_f64;
+    let mut cmd_copy_ms = 0.0_f64;
+    let mut copied_cmd_bytes_total = 0u64;
+    let mut out_by_idx: Vec<Option<GpuSparseSectionHostOutput>> =
+        std::iter::repeat_with(|| None).take(inputs.len()).collect();
+    let mut completed_cmd_outputs = 0usize;
+
+    const CMD_SUBMIT_GROUP: usize = 8;
+
+    while remaining_lens > 0 || !staged_cmd.is_empty() || !pending_cmd.is_empty() {
+        let mut progressed = false;
+        r.device.poll(wgpu::Maintain::Poll);
+        lens_poll_calls = lens_poll_calls.saturating_add(1);
+        if !pending_cmd.is_empty() {
+            cmd_poll_calls = cmd_poll_calls.saturating_add(1);
+        }
+
+        for (i, rx) in lens_rxs.iter().enumerate() {
+            if !pending_lens[i] {
                 continue;
             }
-            let src_off = u64::try_from(prep.section_offsets[sec])
-                .map_err(|_| PDeflateError::NumericOverflow)?;
-            let dst_off = u64::try_from(lens.copy_offsets[sec])
-                .map_err(|_| PDeflateError::NumericOverflow)?;
-            let copy_bytes =
-                u64::try_from(align_up4(len)).map_err(|_| PDeflateError::NumericOverflow)?;
-            if src_off.saturating_add(copy_bytes) > prep.out_cmd_bytes
-                || dst_off.saturating_add(copy_bytes) > lens.total_copy_bytes
-            {
-                return Err(PDeflateError::Gpu(
-                    "gpu sparse cmd compact copy range out of bounds".to_string(),
-                ));
-            }
-            cmd_encoder.copy_buffer_to_buffer(
-                &input.section.out_cmd_buffer,
-                src_off,
-                &cmd_buffer,
-                dst_off,
-                copy_bytes,
-            );
-        }
-        cmd_readbacks.push(CmdReadbackJob { cmd_buffer });
-    }
-    let t_cmd_submit = Instant::now();
-    r.queue.submit(Some(cmd_encoder.finish()));
-    let cmd_submit_ms = elapsed_ms(t_cmd_submit);
-    let cmd_upload_dispatch_ms = (elapsed_ms(t_cmd_upload) - cmd_submit_ms).max(0.0);
-
-    let t_cmd_wait = Instant::now();
-    let (done_tx_cmd, done_rx_cmd) = mpsc::channel();
-    r.queue.on_submitted_work_done(move || {
-        let _ = done_tx_cmd.send(());
-    });
-    let mut cmd_rxs = Vec::with_capacity(cmd_readbacks.len());
-    for (rb, lens) in cmd_readbacks.iter().zip(lens_host.iter()) {
-        let cmd_slice = rb.cmd_buffer.slice(..lens.total_copy_bytes);
-        let (tx_cmd, rx_cmd) = mpsc::channel();
-        cmd_slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx_cmd.send(res);
-        });
-        cmd_rxs.push(rx_cmd);
-    }
-    let mut cmd_done_seen = false;
-    let mut cmd_poll_calls = 0u64;
-    let mut cmd_pending = vec![true; cmd_rxs.len()];
-    let mut cmd_remaining = cmd_rxs.len();
-    while cmd_remaining > 0 || !cmd_done_seen {
-        r.device.poll(wgpu::Maintain::Wait);
-        cmd_poll_calls = cmd_poll_calls.saturating_add(1);
-        if !cmd_done_seen {
-            match done_rx_cmd.try_recv() {
-                Ok(_) | Err(mpsc::TryRecvError::Disconnected) => cmd_done_seen = true,
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
-        for (i, rx) in cmd_rxs.iter().enumerate() {
-            if cmd_pending[i] {
-                match rx.try_recv() {
-                    Ok(res) => {
-                        res.map_err(|e| {
-                            PDeflateError::Gpu(format!("gpu sparse compact cmd map failed: {e}"))
-                        })?;
-                        cmd_pending[i] = false;
-                        cmd_remaining = cmd_remaining.saturating_sub(1);
+            match rx.try_recv() {
+                Ok(res) => {
+                    res.map_err(|e| {
+                        PDeflateError::Gpu(format!("gpu sparse lens readback map failed: {e}"))
+                    })?;
+                    if !first_ready_seen {
+                        first_ready_seen = true;
+                        lens_submit_done_wait_ms = elapsed_ms(t_lens_wait);
                     }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                    Err(mpsc::TryRecvError::Disconnected) => {
+                    pending_lens[i] = false;
+                    remaining_lens = remaining_lens.saturating_sub(1);
+                    progressed = true;
+
+                    let t_lens_copy_one = Instant::now();
+                    let input = &inputs[i];
+                    let prep = &prepared[i];
+                    let lens_slice = readbacks[i].lens_buffer.slice(..prep.out_lens_bytes);
+                    let lens_mapped = lens_slice.get_mapped_range();
+                    let lens_words: &[u32] = bytemuck::cast_slice(&lens_mapped);
+                    if lens_words.len() < input.section_count {
                         return Err(PDeflateError::Gpu(
-                            "gpu sparse compact cmd readback channel closed".to_string(),
+                            "gpu sparse lens readback truncated".to_string(),
                         ));
                     }
+                    let mut section_cmd_lens = vec![0u32; input.section_count];
+                    section_cmd_lens.copy_from_slice(&lens_words[..input.section_count]);
+
+                    let mut total_cmd_len = 0usize;
+                    let mut copy_offsets = Vec::with_capacity(input.section_count);
+                    let mut copy_cursor = 0usize;
+                    for &len_u32 in &section_cmd_lens {
+                        if len_u32 == 0xffff_ffff {
+                            return Err(PDeflateError::Gpu(
+                                "gpu sparse lens overflow while rebuilding host section commands"
+                                    .to_string(),
+                            ));
+                        }
+                        let len =
+                            usize::try_from(len_u32).map_err(|_| PDeflateError::NumericOverflow)?;
+                        total_cmd_len = total_cmd_len
+                            .checked_add(len)
+                            .ok_or(PDeflateError::NumericOverflow)?;
+                        copy_offsets.push(copy_cursor);
+                        if len > 0 {
+                            copy_cursor = copy_cursor
+                                .checked_add(align_up4(len))
+                                .ok_or(PDeflateError::NumericOverflow)?;
+                        }
+                    }
+                    let total_copy_bytes =
+                        u64::try_from(copy_cursor.max(4)).map_err(|_| PDeflateError::NumericOverflow)?;
+                    if total_copy_bytes > prep.out_cmd_bytes {
+                        return Err(PDeflateError::Gpu(
+                            "gpu sparse cmd compact copy size exceeds cap".to_string(),
+                        ));
+                    }
+                    drop(lens_mapped);
+                    readbacks[i].lens_buffer.unmap();
+                    lens_copy_ms += elapsed_ms(t_lens_copy_one);
+
+                    let t_cmd_stage = Instant::now();
+                    let cmd_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("cozip-pdeflate-sparse-readback-cmd-compact"),
+                        size: total_copy_bytes,
+                        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    for sec in 0..input.section_count {
+                        let len = usize::try_from(section_cmd_lens[sec])
+                            .map_err(|_| PDeflateError::NumericOverflow)?;
+                        if len == 0 {
+                            continue;
+                        }
+                        let src_off = u64::try_from(prep.section_offsets[sec])
+                            .map_err(|_| PDeflateError::NumericOverflow)?;
+                        let dst_off = u64::try_from(copy_offsets[sec])
+                            .map_err(|_| PDeflateError::NumericOverflow)?;
+                        let copy_bytes =
+                            u64::try_from(align_up4(len)).map_err(|_| PDeflateError::NumericOverflow)?;
+                        if src_off.saturating_add(copy_bytes) > prep.out_cmd_bytes
+                            || dst_off.saturating_add(copy_bytes) > total_copy_bytes
+                        {
+                            return Err(PDeflateError::Gpu(
+                                "gpu sparse cmd compact copy range out of bounds".to_string(),
+                            ));
+                        }
+                        cmd_encoder.copy_buffer_to_buffer(
+                            &input.section.out_cmd_buffer,
+                            src_off,
+                            &cmd_buffer,
+                            dst_off,
+                            copy_bytes,
+                        );
+                    }
+                    staged_cmd.push(StagedCmdReadbackJob {
+                        prep_idx: i,
+                        lens: LensHostChunk {
+                            section_cmd_lens,
+                            copy_offsets,
+                            total_cmd_len,
+                            total_copy_bytes,
+                        },
+                        cmd_buffer,
+                    });
+                    cmd_upload_dispatch_ms += elapsed_ms(t_cmd_stage);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(PDeflateError::Gpu(
+                        "gpu sparse lens readback channel closed".to_string(),
+                    ));
                 }
             }
         }
-    }
-    let cmd_wait_ms = elapsed_ms(t_cmd_wait);
 
-    let t_cmd_copy = Instant::now();
-    let mut out = Vec::<GpuSparseSectionHostOutput>::with_capacity(inputs.len());
-    for (idx, lens) in lens_host.iter().enumerate() {
-        let cmd_slice = cmd_readbacks[idx].cmd_buffer.slice(..lens.total_copy_bytes);
-        let cmd_mapped = cmd_slice.get_mapped_range();
-        let compact_bytes: &[u8] = &cmd_mapped;
-        let mut section_cmd = Vec::with_capacity(lens.total_cmd_len);
-        for sec in 0..lens.section_cmd_lens.len() {
-            let len = usize::try_from(lens.section_cmd_lens[sec])
-                .map_err(|_| PDeflateError::NumericOverflow)?;
-            if len == 0 {
+        let should_submit_cmd = (!staged_cmd.is_empty() && staged_cmd.len() >= CMD_SUBMIT_GROUP)
+            || (remaining_lens == 0 && !staged_cmd.is_empty());
+        if should_submit_cmd {
+            let t_submit = Instant::now();
+            r.queue.submit(Some(cmd_encoder.finish()));
+            cmd_submit_ms += elapsed_ms(t_submit);
+            cmd_submit_count = cmd_submit_count.saturating_add(1);
+            if cmd_wait_start.is_none() {
+                cmd_wait_start = Some(Instant::now());
+            }
+            for staged in staged_cmd.drain(..) {
+                let cmd_slice = staged.cmd_buffer.slice(..staged.lens.total_copy_bytes);
+                let (tx_cmd, rx_cmd) = mpsc::channel();
+                cmd_slice.map_async(wgpu::MapMode::Read, move |res| {
+                    let _ = tx_cmd.send(res);
+                });
+                pending_cmd.push(PendingCmdReadbackJob {
+                    prep_idx: staged.prep_idx,
+                    lens: staged.lens,
+                    cmd_buffer: staged.cmd_buffer,
+                    rx: rx_cmd,
+                });
+            }
+            cmd_encoder = r
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("cozip-pdeflate-sparse-cmd-readback-encoder"),
+                });
+            progressed = true;
+        }
+
+        let mut pending_idx = 0usize;
+        while pending_idx < pending_cmd.len() {
+            let ready = match pending_cmd[pending_idx].rx.try_recv() {
+                Ok(res) => {
+                    res.map_err(|e| {
+                        PDeflateError::Gpu(format!("gpu sparse compact cmd map failed: {e}"))
+                    })?;
+                    true
+                }
+                Err(mpsc::TryRecvError::Empty) => false,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(PDeflateError::Gpu(
+                        "gpu sparse compact cmd readback channel closed".to_string(),
+                    ));
+                }
+            };
+            if !ready {
+                pending_idx += 1;
                 continue;
             }
-            let off = lens.copy_offsets[sec];
-            let end = off.checked_add(len).ok_or(PDeflateError::NumericOverflow)?;
-            if end > compact_bytes.len() {
-                return Err(PDeflateError::Gpu(format!(
-                    "gpu sparse compact cmd readback truncated on section {}",
-                    sec
-                )));
+
+            progressed = true;
+            let done = pending_cmd.swap_remove(pending_idx);
+            let t_cmd_copy_one = Instant::now();
+            let cmd_slice = done.cmd_buffer.slice(..done.lens.total_copy_bytes);
+            let cmd_mapped = cmd_slice.get_mapped_range();
+            let compact_bytes: &[u8] = &cmd_mapped;
+            let mut section_cmd = Vec::with_capacity(done.lens.total_cmd_len);
+            for sec in 0..done.lens.section_cmd_lens.len() {
+                let len = usize::try_from(done.lens.section_cmd_lens[sec])
+                    .map_err(|_| PDeflateError::NumericOverflow)?;
+                if len == 0 {
+                    continue;
+                }
+                let off = done.lens.copy_offsets[sec];
+                let end = off.checked_add(len).ok_or(PDeflateError::NumericOverflow)?;
+                if end > compact_bytes.len() {
+                    return Err(PDeflateError::Gpu(format!(
+                        "gpu sparse compact cmd readback truncated on section {}",
+                        sec
+                    )));
+                }
+                section_cmd.extend_from_slice(&compact_bytes[off..end]);
             }
-            section_cmd.extend_from_slice(&compact_bytes[off..end]);
+            copied_cmd_bytes_total = copied_cmd_bytes_total.saturating_add(done.lens.total_copy_bytes);
+            drop(cmd_mapped);
+            done.cmd_buffer.unmap();
+            out_by_idx[done.prep_idx] = Some(GpuSparseSectionHostOutput {
+                section_cmd_lens: done.lens.section_cmd_lens,
+                section_cmd,
+            });
+            completed_cmd_outputs = completed_cmd_outputs.saturating_add(1);
+            cmd_copy_ms += elapsed_ms(t_cmd_copy_one);
         }
-        drop(cmd_mapped);
-        cmd_readbacks[idx].cmd_buffer.unmap();
-        out.push(GpuSparseSectionHostOutput {
-            section_cmd_lens: lens.section_cmd_lens.clone(),
-            section_cmd,
-        });
+
+        if !progressed && (remaining_lens > 0 || !staged_cmd.is_empty() || !pending_cmd.is_empty())
+        {
+            r.device.poll(wgpu::Maintain::Wait);
+            lens_poll_calls = lens_poll_calls.saturating_add(1);
+            if !pending_cmd.is_empty() {
+                cmd_poll_calls = cmd_poll_calls.saturating_add(1);
+            }
+        }
     }
-    let cmd_copy_ms = elapsed_ms(t_cmd_copy);
+
+    if completed_cmd_outputs != inputs.len() {
+        return Err(PDeflateError::Gpu(
+            "gpu sparse cmd readback output count mismatch".to_string(),
+        ));
+    }
+    let mut out = Vec::<GpuSparseSectionHostOutput>::with_capacity(inputs.len());
+    for item in out_by_idx {
+        out.push(item.ok_or(PDeflateError::Gpu(
+            "gpu sparse cmd readback missing chunk output".to_string(),
+        ))?);
+    }
+
+    let lens_wait_ms = elapsed_ms(t_lens_wait);
+    if !first_ready_seen {
+        lens_submit_done_wait_ms = lens_wait_ms;
+    }
+    let lens_map_after_done_ms = (lens_wait_ms - lens_submit_done_wait_ms).max(0.0);
+    let cmd_wait_ms = cmd_wait_start.map(elapsed_ms).unwrap_or(0.0);
 
     let upload_dispatch_ms = lens_upload_dispatch_ms + cmd_upload_dispatch_ms;
     let submit_ms = lens_submit_ms + cmd_submit_ms;
     let wait_ms = lens_wait_ms + cmd_wait_ms;
     let map_copy_ms = lens_copy_ms + cmd_copy_ms;
     let total_ms = elapsed_ms(t_total);
+    if queue_probe {
+        eprintln!(
+            "[cozip_pdeflate][timing][gpu-readback-probe] chunks={} pre_lens_queue_drain_ms={:.3} pre_lens_queue_drain_polls={} lens_submit_done_wait_ms={:.3} lens_wait_ms={:.3} cmd_wait_ms={:.3} lens_map_after_done_ms={:.3} lens_poll_calls={} cmd_poll_calls={}",
+            inputs.len(),
+            pre_lens_queue_drain_ms,
+            pre_lens_queue_drain_poll_calls,
+            lens_submit_done_wait_ms,
+            lens_wait_ms,
+            cmd_wait_ms,
+            lens_map_after_done_ms,
+            lens_poll_calls,
+            cmd_poll_calls
+        );
+    }
     Ok((
         out,
         GpuMatchProfile {
@@ -5331,7 +6644,11 @@ struct PackedTableUpload<'a> {
 }
 
 enum PackedTableUploadKind<'a> {
-    Host {
+    HostBorrow {
+        index_bytes: &'a [u8],
+        data_bytes: &'a [u8],
+    },
+    HostOwned {
         index_bytes: Vec<u8>,
         data_bytes: Vec<u8>,
     },
@@ -5358,7 +6675,7 @@ fn pack_match_batch_inputs<'a>(
         ));
     }
     let total_src_bytes: usize = inputs.iter().map(|input| input.src.len()).sum();
-    let mut src_bytes = Vec::<u8>::with_capacity(total_src_bytes);
+    let mut src_words = vec![0u32; total_src_bytes.div_ceil(4)];
     let mut chunk_starts = Vec::<u32>::with_capacity(inputs.len() + 1);
     let mut table_chunk_bases = Vec::<u32>::with_capacity(inputs.len());
     let mut table_chunk_counts = Vec::<u32>::with_capacity(inputs.len());
@@ -5383,7 +6700,16 @@ fn pack_match_batch_inputs<'a>(
     };
     let mut unresolved_cursor = 0usize;
     chunk_starts.push(0);
-    for input in inputs {
+    let mut src_len = 0usize;
+    {
+        let src_words_bytes = bytemuck::cast_slice_mut::<u32, u8>(&mut src_words);
+        for input in inputs {
+            let next_src_len = src_len
+                .checked_add(input.src.len())
+                .ok_or(PDeflateError::NumericOverflow)?;
+            src_words_bytes[src_len..next_src_len].copy_from_slice(input.src);
+            src_len = next_src_len;
+            chunk_starts.push(u32::try_from(src_len).map_err(|_| PDeflateError::NumericOverflow)?);
         if input.max_ref_len != max_ref_len
             || input.min_ref_len != min_ref_len
             || input.section_count != section_count
@@ -5392,10 +6718,7 @@ fn pack_match_batch_inputs<'a>(
                 "gpu match batch params must be consistent",
             ));
         }
-        src_bytes.extend_from_slice(input.src);
         chunk_lens.push(input.src.len());
-        chunk_starts
-            .push(u32::try_from(src_bytes.len()).map_err(|_| PDeflateError::NumericOverflow)?);
         table_chunk_bases
             .push(u32::try_from(global_table_base).map_err(|_| PDeflateError::NumericOverflow)?);
         table_index_packer.align4();
@@ -5452,9 +6775,9 @@ fn pack_match_batch_inputs<'a>(
             (
                 index_bytes.len(),
                 data_bytes.len(),
-                PackedTableUploadKind::Host {
-                    index_bytes: index_bytes.to_vec(),
-                    data_bytes: data_bytes.to_vec(),
+                PackedTableUploadKind::HostBorrow {
+                    index_bytes,
+                    data_bytes,
                 },
             )
         } else {
@@ -5472,7 +6795,7 @@ fn pack_match_batch_inputs<'a>(
             (
                 index_bytes.len(),
                 data_bytes.len(),
-                PackedTableUploadKind::Host {
+                PackedTableUploadKind::HostOwned {
                     index_bytes,
                     data_bytes,
                 },
@@ -5494,11 +6817,27 @@ fn pack_match_batch_inputs<'a>(
         global_table_base = global_table_base
             .checked_add(local_count)
             .ok_or(PDeflateError::NumericOverflow)?;
+        }
     }
     let mut table_device_copies = Vec::<PackedTableDeviceCopy<'a>>::new();
     for upload in table_uploads.into_iter() {
         match upload.kind {
-            PackedTableUploadKind::Host {
+            PackedTableUploadKind::HostBorrow {
+                index_bytes,
+                data_bytes,
+            } => {
+                if upload.index_len != 0 {
+                    let off = usize::try_from(upload.index_offset)
+                        .map_err(|_| PDeflateError::NumericOverflow)?;
+                    table_index_packer.write_bytes_at(off, index_bytes)?;
+                }
+                if upload.data_len != 0 {
+                    let off = usize::try_from(upload.data_offset)
+                        .map_err(|_| PDeflateError::NumericOverflow)?;
+                    table_data_packer.write_bytes_at(off, data_bytes)?;
+                }
+            }
+            PackedTableUploadKind::HostOwned {
                 index_bytes,
                 data_bytes,
             } => {
@@ -5530,7 +6869,7 @@ fn pack_match_batch_inputs<'a>(
     }
 
     Ok(PackedBatchInputs {
-        src_words: pack_bytes_to_words(&src_bytes),
+        src_words,
         chunk_starts,
         table_chunk_bases,
         table_chunk_counts,
@@ -5929,6 +7268,8 @@ pub(crate) fn compute_matches_and_encode_sections_batch(
         out_lens_bytes: u64,
         out_cmd_bytes: u64,
         section_index_cap_bytes: u64,
+        max_tokens_per_section: u32,
+        max_cmd_words_per_section: u32,
     }
 
     let result = (|| -> Result<GpuBatchSectionEncodeOutput, PDeflateError> {
@@ -5990,20 +7331,33 @@ pub(crate) fn compute_matches_and_encode_sections_batch(
             bytemuck::cast_slice(&match_params),
         );
         let match_upload_ms = elapsed_ms(t_match_upload);
-        let mut encoder = r
+        let queue_probe = queue_probe_enabled();
+        let mut pre_match_queue_drain_ms = 0.0_f64;
+        let mut pre_match_queue_drain_poll_calls = 0u64;
+        let mut match_submit_done_wait_ms = 0.0_f64;
+        let mut match_submit_poll_calls = 0u64;
+        let mut section_submit_done_wait_ms = 0.0_f64;
+        let mut section_submit_poll_calls = 0u64;
+        if queue_probe {
+            let (wait_ms, poll_calls) = wait_for_queue_done(&r.queue, &r.device);
+            pre_match_queue_drain_ms = wait_ms;
+            pre_match_queue_drain_poll_calls = poll_calls;
+        }
+
+        let mut match_encoder = r
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("cozip-pdeflate-match-section-encoder"),
             });
         let t_table_copy = Instant::now();
-        encode_table_device_copies(&mut encoder, &scratch, &packed.table_device_copies)?;
+        encode_table_device_copies(&mut match_encoder, &scratch, &packed.table_device_copies)?;
         let match_table_copy_ms = elapsed_ms(t_table_copy);
-        encoder.clear_buffer(&scratch.prefix_first_buffer, 0, None);
-        encoder.clear_buffer(&scratch.table_lens_buffer, 0, None);
-        encoder.clear_buffer(&scratch.table_offsets_buffer, 0, None);
+        match_encoder.clear_buffer(&scratch.prefix_first_buffer, 0, None);
+        match_encoder.clear_buffer(&scratch.table_lens_buffer, 0, None);
+        match_encoder.clear_buffer(&scratch.table_offsets_buffer, 0, None);
         let match_prepare_dispatch_ms = {
             let t_prepare = Instant::now();
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            let mut pass = match_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("cozip-pdeflate-match-prepare-table-pass"),
                 timestamp_writes: None,
             });
@@ -6015,7 +7369,7 @@ pub(crate) fn compute_matches_and_encode_sections_batch(
         };
         let match_kernel_dispatch_ms = {
             let t_match = Instant::now();
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            let mut pass = match_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("cozip-pdeflate-match-pass"),
                 timestamp_writes: None,
             });
@@ -6034,7 +7388,12 @@ pub(crate) fn compute_matches_and_encode_sections_batch(
             let src_base_u32 = packed.chunk_starts[chunk_idx];
             let mut section_offsets = vec![0u32; section_count];
             let mut section_caps = vec![0u32; section_count];
+            let mut section_token_offsets = vec![0u32; section_count];
+            let mut section_token_caps = vec![0u32; section_count];
             let mut total_cmd_cap_bytes: usize = 0;
+            let mut total_token_cap: usize = 0;
+            let mut max_tokens_per_section: usize = 1;
+            let mut max_cmd_words_per_section: usize = 1;
             for sec in 0..section_count {
                 let s0 = section_start(sec, section_count, chunk_len);
                 let s1 = section_start(sec + 1, section_count, chunk_len);
@@ -6048,6 +7407,17 @@ pub(crate) fn compute_matches_and_encode_sections_batch(
                 total_cmd_cap_bytes = aligned
                     .checked_add(cap_bytes)
                     .ok_or(PDeflateError::NumericOverflow)?;
+                section_token_offsets[sec] =
+                    u32::try_from(total_token_cap).map_err(|_| PDeflateError::NumericOverflow)?;
+                let token_cap = sec_len.max(1);
+                section_token_caps[sec] =
+                    u32::try_from(token_cap).map_err(|_| PDeflateError::NumericOverflow)?;
+                total_token_cap = total_token_cap
+                    .checked_add(token_cap)
+                    .ok_or(PDeflateError::NumericOverflow)?;
+                max_tokens_per_section = max_tokens_per_section.max(token_cap);
+                max_cmd_words_per_section =
+                    max_cmd_words_per_section.max(align_up4(cap_bytes).div_ceil(4));
             }
 
             let section_count_u64 =
@@ -6087,6 +7457,13 @@ pub(crate) fn compute_matches_and_encode_sections_batch(
             };
             slot_in_use[slot_index] = true;
             let slot = &scratch.section_slots[slot_index];
+            if u64::try_from(total_token_cap).map_err(|_| PDeflateError::NumericOverflow)?
+                > slot.token_cap_count
+            {
+                return Err(PDeflateError::Gpu(
+                    "gpu section encode token staging cap exceeded".to_string(),
+                ));
+            }
             r.queue.write_buffer(
                 &slot.section_offsets_buffer,
                 0,
@@ -6096,6 +7473,16 @@ pub(crate) fn compute_matches_and_encode_sections_batch(
                 &slot.section_caps_buffer,
                 0,
                 bytemuck::cast_slice(&section_caps),
+            );
+            r.queue.write_buffer(
+                &slot.section_token_offsets_buffer,
+                0,
+                bytemuck::cast_slice(&section_token_offsets),
+            );
+            r.queue.write_buffer(
+                &slot.section_token_caps_buffer,
+                0,
+                bytemuck::cast_slice(&section_token_caps),
             );
             r.queue.write_buffer(
                 &slot.section_params_buffer,
@@ -6109,67 +7496,329 @@ pub(crate) fn compute_matches_and_encode_sections_batch(
                 out_lens_bytes,
                 out_cmd_bytes,
                 section_index_cap_bytes: slot.section_index_cap_bytes,
+                max_tokens_per_section: u32::try_from(max_tokens_per_section)
+                    .map_err(|_| PDeflateError::NumericOverflow)?,
+                max_cmd_words_per_section: u32::try_from(max_cmd_words_per_section)
+                    .map_err(|_| PDeflateError::NumericOverflow)?,
             });
         }
         let section_upload_ms = elapsed_ms(t_section_setup);
         let mut section_pass_dispatch_ms = 0.0_f64;
+        let mut section_tokenize_dispatch_ms = 0.0_f64;
+        let mut section_prefix_dispatch_ms = 0.0_f64;
+        let mut section_scatter_dispatch_ms = 0.0_f64;
+        let mut section_pack_dispatch_ms = 0.0_f64;
+        let mut section_meta_dispatch_ms = 0.0_f64;
         let section_copy_dispatch_ms = 0.0_f64;
+        let mut section_tokenize_wait_ms = 0.0_f64;
+        let mut section_prefix_wait_ms = 0.0_f64;
+        let mut section_scatter_wait_ms = 0.0_f64;
+        let mut section_pack_wait_ms = 0.0_f64;
+        let mut section_meta_wait_ms = 0.0_f64;
+        let mut section_stage_wait_poll_calls = 0u64;
+        let (match_submit_ms, section_submit_ms) = if queue_probe {
+            let t_match_submit = Instant::now();
+            r.queue.submit(Some(match_encoder.finish()));
+            let match_submit_ms = elapsed_ms(t_match_submit);
+            let (wait_ms, poll_calls) = wait_for_queue_done(&r.queue, &r.device);
+            match_submit_done_wait_ms = wait_ms;
+            match_submit_poll_calls = poll_calls;
 
-        for state in section_states.iter() {
-            let slot = &scratch.section_slots[state.slot_index];
-            let groups_x = u32::try_from(state.section_count)
-                .map_err(|_| PDeflateError::NumericOverflow)?
-                .div_ceil(64)
-                .max(1);
+            let mut section_submit_ms = 0.0_f64;
+            let mut submit_and_wait = |encoder: wgpu::CommandEncoder,
+                                       stage_wait_ms: &mut f64|
+             -> f64 {
+                let t_submit = Instant::now();
+                r.queue.submit(Some(encoder.finish()));
+                let submit_ms = elapsed_ms(t_submit);
+                let (wait_ms, poll_calls) = wait_for_queue_done(&r.queue, &r.device);
+                *stage_wait_ms += wait_ms;
+                section_submit_done_wait_ms += wait_ms;
+                section_submit_poll_calls = section_submit_poll_calls.saturating_add(poll_calls);
+                section_stage_wait_poll_calls =
+                    section_stage_wait_poll_calls.saturating_add(poll_calls);
+                submit_ms
+            };
+
             {
-                let t_pass = Instant::now();
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("cozip-pdeflate-se-pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&r.section_encode_pipeline);
-                pass.set_bind_group(0, &slot.bind_group, &[]);
-                pass.dispatch_workgroups(groups_x, 1, 1);
-                drop(pass);
-                section_pass_dispatch_ms += elapsed_ms(t_pass);
+                let mut encoder =
+                    r.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("cozip-pdeflate-se-tokenize-encoder"),
+                        });
+                for state in section_states.iter() {
+                    let slot = &scratch.section_slots[state.slot_index];
+                    let groups_sections = u32::try_from(state.section_count)
+                        .map_err(|_| PDeflateError::NumericOverflow)?
+                        .div_ceil(64)
+                        .max(1);
+                    let t_stage = Instant::now();
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("cozip-pdeflate-se-tokenize-pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&r.section_tokenize_pipeline);
+                    pass.set_bind_group(0, &slot.tokenize_bind_group, &[]);
+                    pass.dispatch_workgroups(groups_sections, 1, 1);
+                    drop(pass);
+                    let dt = elapsed_ms(t_stage);
+                    section_pass_dispatch_ms += dt;
+                    section_tokenize_dispatch_ms += dt;
+                }
+                section_submit_ms += submit_and_wait(encoder, &mut section_tokenize_wait_ms);
             }
             {
-                let t_meta = Instant::now();
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("cozip-pdeflate-se-meta-pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&r.section_meta_pipeline);
-                pass.set_bind_group(0, &slot.meta_bind_group, &[]);
-                pass.dispatch_workgroups(1, 1, 1);
-                drop(pass);
-                section_pass_dispatch_ms += elapsed_ms(t_meta);
+                let mut encoder =
+                    r.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("cozip-pdeflate-se-prefix-encoder"),
+                        });
+                for state in section_states.iter() {
+                    let slot = &scratch.section_slots[state.slot_index];
+                    let groups_sections = u32::try_from(state.section_count)
+                        .map_err(|_| PDeflateError::NumericOverflow)?
+                        .div_ceil(64)
+                        .max(1);
+                    let t_stage = Instant::now();
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("cozip-pdeflate-se-prefix-pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&r.section_prefix_pipeline);
+                    pass.set_bind_group(0, &slot.prefix_bind_group, &[]);
+                    pass.dispatch_workgroups(groups_sections, 1, 1);
+                    drop(pass);
+                    let dt = elapsed_ms(t_stage);
+                    section_pass_dispatch_ms += dt;
+                    section_prefix_dispatch_ms += dt;
+                }
+                section_submit_ms += submit_and_wait(encoder, &mut section_prefix_wait_ms);
             }
-            encoder.copy_buffer_to_buffer(
-                &slot.section_meta_buffer,
-                0,
-                &slot.readback_meta_buffer,
-                0,
-                16,
+            {
+                let mut encoder =
+                    r.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("cozip-pdeflate-se-scatter-encoder"),
+                        });
+                for state in section_states.iter() {
+                    let slot = &scratch.section_slots[state.slot_index];
+                    let scatter_groups_x = state.max_tokens_per_section.div_ceil(64).max(1);
+                    let scatter_groups_y = u32::try_from(state.section_count)
+                        .map_err(|_| PDeflateError::NumericOverflow)?;
+                    let t_stage = Instant::now();
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("cozip-pdeflate-se-scatter-pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&r.section_scatter_pipeline);
+                    pass.set_bind_group(0, &slot.scatter_bind_group, &[]);
+                    pass.dispatch_workgroups(scatter_groups_x, scatter_groups_y, 1);
+                    drop(pass);
+                    let dt = elapsed_ms(t_stage);
+                    section_pass_dispatch_ms += dt;
+                    section_scatter_dispatch_ms += dt;
+                }
+                section_submit_ms += submit_and_wait(encoder, &mut section_scatter_wait_ms);
+            }
+            {
+                let mut encoder =
+                    r.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("cozip-pdeflate-se-pack-encoder"),
+                        });
+                for state in section_states.iter() {
+                    let slot = &scratch.section_slots[state.slot_index];
+                    let pack_groups_x = state.max_cmd_words_per_section.div_ceil(64).max(1);
+                    let pack_groups_y = u32::try_from(state.section_count)
+                        .map_err(|_| PDeflateError::NumericOverflow)?;
+                    let t_stage = Instant::now();
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("cozip-pdeflate-se-pack-pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&r.section_cmd_pack_pipeline);
+                    pass.set_bind_group(0, &slot.pack_bind_group, &[]);
+                    pass.dispatch_workgroups(pack_groups_x, pack_groups_y, 1);
+                    drop(pass);
+                    let dt = elapsed_ms(t_stage);
+                    section_pass_dispatch_ms += dt;
+                    section_pack_dispatch_ms += dt;
+                }
+                section_submit_ms += submit_and_wait(encoder, &mut section_pack_wait_ms);
+            }
+            {
+                let mut encoder =
+                    r.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("cozip-pdeflate-se-meta-encoder"),
+                        });
+                for state in section_states.iter() {
+                    let slot = &scratch.section_slots[state.slot_index];
+                    let t_stage = Instant::now();
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("cozip-pdeflate-se-meta-pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&r.section_meta_pipeline);
+                    pass.set_bind_group(0, &slot.meta_bind_group, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                    drop(pass);
+                    let dt = elapsed_ms(t_stage);
+                    section_pass_dispatch_ms += dt;
+                    section_meta_dispatch_ms += dt;
+                    encoder.copy_buffer_to_buffer(
+                        &slot.section_meta_buffer,
+                        0,
+                        &slot.readback_meta_buffer,
+                        0,
+                        16,
+                    );
+                }
+                section_submit_ms += submit_and_wait(encoder, &mut section_meta_wait_ms);
+            }
+
+            (match_submit_ms, section_submit_ms)
+        } else {
+            for state in section_states.iter() {
+                let slot = &scratch.section_slots[state.slot_index];
+                let groups_sections = u32::try_from(state.section_count)
+                    .map_err(|_| PDeflateError::NumericOverflow)?
+                    .div_ceil(64)
+                    .max(1);
+                {
+                    let t_pass = Instant::now();
+                    let mut pass = match_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("cozip-pdeflate-se-tokenize-pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&r.section_tokenize_pipeline);
+                    pass.set_bind_group(0, &slot.tokenize_bind_group, &[]);
+                    pass.dispatch_workgroups(groups_sections, 1, 1);
+                    drop(pass);
+                    let dt = elapsed_ms(t_pass);
+                    section_pass_dispatch_ms += dt;
+                    section_tokenize_dispatch_ms += dt;
+                }
+                {
+                    let t_prefix = Instant::now();
+                    let mut pass = match_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("cozip-pdeflate-se-prefix-pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&r.section_prefix_pipeline);
+                    pass.set_bind_group(0, &slot.prefix_bind_group, &[]);
+                    pass.dispatch_workgroups(groups_sections, 1, 1);
+                    drop(pass);
+                    let dt = elapsed_ms(t_prefix);
+                    section_pass_dispatch_ms += dt;
+                    section_prefix_dispatch_ms += dt;
+                }
+                {
+                    let t_scatter = Instant::now();
+                    let scatter_groups_x = state.max_tokens_per_section.div_ceil(64).max(1);
+                    let scatter_groups_y = u32::try_from(state.section_count)
+                        .map_err(|_| PDeflateError::NumericOverflow)?;
+                    let mut pass = match_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("cozip-pdeflate-se-scatter-pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&r.section_scatter_pipeline);
+                    pass.set_bind_group(0, &slot.scatter_bind_group, &[]);
+                    pass.dispatch_workgroups(scatter_groups_x, scatter_groups_y, 1);
+                    drop(pass);
+                    let dt = elapsed_ms(t_scatter);
+                    section_pass_dispatch_ms += dt;
+                    section_scatter_dispatch_ms += dt;
+                }
+                {
+                    let t_pack = Instant::now();
+                    let pack_groups_x = state.max_cmd_words_per_section.div_ceil(64).max(1);
+                    let pack_groups_y = u32::try_from(state.section_count)
+                        .map_err(|_| PDeflateError::NumericOverflow)?;
+                    let mut pass = match_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("cozip-pdeflate-se-pack-pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&r.section_cmd_pack_pipeline);
+                    pass.set_bind_group(0, &slot.pack_bind_group, &[]);
+                    pass.dispatch_workgroups(pack_groups_x, pack_groups_y, 1);
+                    drop(pass);
+                    let dt = elapsed_ms(t_pack);
+                    section_pass_dispatch_ms += dt;
+                    section_pack_dispatch_ms += dt;
+                }
+                {
+                    let t_meta = Instant::now();
+                    let mut pass = match_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("cozip-pdeflate-se-meta-pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&r.section_meta_pipeline);
+                    pass.set_bind_group(0, &slot.meta_bind_group, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                    drop(pass);
+                    let dt = elapsed_ms(t_meta);
+                    section_pass_dispatch_ms += dt;
+                    section_meta_dispatch_ms += dt;
+                }
+                match_encoder.copy_buffer_to_buffer(
+                    &slot.section_meta_buffer,
+                    0,
+                    &slot.readback_meta_buffer,
+                    0,
+                    16,
+                );
+            }
+            let t_submit = Instant::now();
+            r.queue.submit(Some(match_encoder.finish()));
+            let submit_ms = elapsed_ms(t_submit);
+            let match_weight =
+                match_table_copy_ms + match_prepare_dispatch_ms + match_kernel_dispatch_ms;
+            let section_weight = section_pass_dispatch_ms + section_copy_dispatch_ms;
+            let weight_sum = match_weight + section_weight;
+            let match_submit_ms = if weight_sum > 0.0 {
+                submit_ms * (match_weight / weight_sum)
+            } else {
+                submit_ms
+            };
+            let section_submit_ms = if weight_sum > 0.0 {
+                submit_ms * (section_weight / weight_sum)
+            } else {
+                0.0
+            };
+            (match_submit_ms, section_submit_ms)
+        };
+        if queue_probe {
+            eprintln!(
+                "[cozip_pdeflate][timing][gpu-stage-probe] chunks={} pre_match_queue_drain_ms={:.3} pre_match_queue_drain_polls={} match_submit_ms={:.3} match_submit_done_wait_ms={:.3} match_submit_polls={} section_submit_ms={:.3} section_submit_done_wait_ms={:.3} section_submit_polls={} match_dispatch_ms={:.3} section_dispatch_ms={:.3}",
+                inputs.len(),
+                pre_match_queue_drain_ms,
+                pre_match_queue_drain_poll_calls,
+                match_submit_ms,
+                match_submit_done_wait_ms,
+                match_submit_poll_calls,
+                section_submit_ms,
+                section_submit_done_wait_ms,
+                section_submit_poll_calls,
+                match_table_copy_ms + match_prepare_dispatch_ms + match_kernel_dispatch_ms,
+                section_pass_dispatch_ms + section_copy_dispatch_ms
+            );
+            eprintln!(
+                "[cozip_pdeflate][timing][gpu-section-stage-probe] chunks={} tokenize_dispatch_ms={:.3} prefix_dispatch_ms={:.3} scatter_dispatch_ms={:.3} pack_dispatch_ms={:.3} meta_dispatch_ms={:.3} tokenize_wait_ms={:.3} prefix_wait_ms={:.3} scatter_wait_ms={:.3} pack_wait_ms={:.3} meta_wait_ms={:.3} section_wait_polls={}",
+                inputs.len(),
+                section_tokenize_dispatch_ms,
+                section_prefix_dispatch_ms,
+                section_scatter_dispatch_ms,
+                section_pack_dispatch_ms,
+                section_meta_dispatch_ms,
+                section_tokenize_wait_ms,
+                section_prefix_wait_ms,
+                section_scatter_wait_ms,
+                section_pack_wait_ms,
+                section_meta_wait_ms,
+                section_stage_wait_poll_calls
             );
         }
-        let t_submit = Instant::now();
-        r.queue.submit(Some(encoder.finish()));
-        let submit_ms = elapsed_ms(t_submit);
-        let match_weight =
-            match_table_copy_ms + match_prepare_dispatch_ms + match_kernel_dispatch_ms;
-        let section_weight = section_pass_dispatch_ms + section_copy_dispatch_ms;
-        let weight_sum = match_weight + section_weight;
-        let match_submit_ms = if weight_sum > 0.0 {
-            submit_ms * (match_weight / weight_sum)
-        } else {
-            submit_ms
-        };
-        let section_submit_ms = if weight_sum > 0.0 {
-            submit_ms * (section_weight / weight_sum)
-        } else {
-            0.0
-        };
 
         let t_wrap = Instant::now();
         let mut chunks = Vec::with_capacity(section_states.len());
@@ -6218,8 +7867,18 @@ pub(crate) fn compute_matches_and_encode_sections_batch(
                 match_submit_ms,
                 section_setup_ms: section_upload_ms,
                 section_pass_dispatch_ms,
+                section_tokenize_dispatch_ms,
+                section_prefix_dispatch_ms,
+                section_scatter_dispatch_ms,
+                section_pack_dispatch_ms,
+                section_meta_dispatch_ms,
                 section_copy_dispatch_ms,
                 section_submit_ms,
+                section_tokenize_wait_ms,
+                section_prefix_wait_ms,
+                section_scatter_wait_ms,
+                section_pack_wait_ms,
+                section_meta_wait_ms,
                 section_wrap_ms,
                 ..GpuBatchKernelProfile::default()
             },
