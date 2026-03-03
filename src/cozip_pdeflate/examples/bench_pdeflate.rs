@@ -42,6 +42,7 @@ struct BenchConfig {
     verify_bytes: bool,
     skip_decompress: bool,
     gpu_compress: bool,
+    gpu_only: bool,
     compare_hybrid: bool,
     gpu_workers: usize,
     gpu_slot_count: usize,
@@ -75,6 +76,7 @@ impl Default for BenchConfig {
             verify_bytes: true,
             skip_decompress: true,
             gpu_compress: false,
+            gpu_only: false,
             compare_hybrid: false,
             gpu_workers: 1,
             gpu_slot_count: 6,
@@ -180,6 +182,13 @@ fn parse_args() -> Result<BenchConfig, String> {
                 })?;
             }
             "--gpu-compress" => cfg.gpu_compress = true,
+            "--gpu-only" => cfg.gpu_only = true,
+            "--gpu-only-enabled" => {
+                i += 1;
+                let v = args.get(i).ok_or("--gpu-only-enabled requires value")?;
+                cfg.gpu_only =
+                    parse_bool(v).ok_or_else(|| format!("invalid --gpu-only-enabled: {v}"))?;
+            }
             "--gpu-compress-enabled" => {
                 i += 1;
                 let v = args.get(i).ok_or("--gpu-compress-enabled requires value")?;
@@ -363,6 +372,9 @@ fn parse_args() -> Result<BenchConfig, String> {
     if !(0.0..=1.0).contains(&cfg.gpu_tail_stop_ratio) {
         return Err("--gpu-tail-stop-ratio must be in range 0.0..=1.0".to_string());
     }
+    if cfg.gpu_only && !cfg.gpu_compress {
+        return Err("--gpu-only requires --gpu-compress".to_string());
+    }
 
     if cfg.profile_timing_detail || cfg.profile_timing_deep {
         cfg.profile_timing = true;
@@ -382,6 +394,7 @@ options:\n\
   --dataset <bench|legacy|random> (default: bench)\n\
   --sections <N>\n\
   --gpu-compress\n\
+  --gpu-only\n\
   --compare-hybrid\n\
   --gpu-workers <N>\n\
   --gpu-slot-count/--gpu-slots <N>\n\
@@ -532,6 +545,22 @@ fn run_once(
             0.0
         });
         decomp_ms = Some(d_ms);
+    } else if verify_bytes {
+        // Verification path for --skip-decompress:
+        // run roundtrip check outside timing so throughput numbers stay compression-only.
+        let mut restored = Vec::with_capacity(input.len());
+        let mut reader = std::io::Cursor::new(&compressed);
+        if let Some(index) = compress.index.as_ref() {
+            cozip
+                .deflate_decompress_stream_zip_compatible_with_index(&mut reader, &mut restored, index)
+                .map_err(|e| e.to_string())?;
+        } else {
+            deflate_decompress_stream_on_cpu(&mut reader, &mut restored)
+                .map_err(|e| e.to_string())?;
+        }
+        if restored != input {
+            return Err("roundtrip mismatch".to_string());
+        }
     }
 
     Ok(RunResult {
@@ -552,12 +581,47 @@ fn format_opt(v: Option<f64>) -> String {
     v.map(|x| format!("{x:.3}")).unwrap_or_else(|| "SKIP".to_string())
 }
 
+fn cpu_parallelism_estimate(stats: &DeflateCpuStreamStats, comp_ms: f64) -> f64 {
+    if comp_ms > 0.0 {
+        stats.cpu_worker_busy_ms / comp_ms
+    } else {
+        0.0
+    }
+}
+
+fn ensure_scheduler_equivalence(cpu: &HybridOptions, hybrid: &HybridOptions) -> Result<(), String> {
+    let same = cpu.chunk_size == hybrid.chunk_size
+        && cpu.gpu_subchunk_size == hybrid.gpu_subchunk_size
+        && cpu.gpu_slot_count == hybrid.gpu_slot_count
+        && cpu.stream_prepare_pipeline_depth == hybrid.stream_prepare_pipeline_depth
+        && cpu.stream_batch_chunks == hybrid.stream_batch_chunks
+        && cpu.stream_max_inflight_chunks == hybrid.stream_max_inflight_chunks
+        && cpu.stream_max_inflight_bytes == hybrid.stream_max_inflight_bytes
+        && cpu.gpu_batch_chunks == hybrid.gpu_batch_chunks
+        && cpu.decode_gpu_batch_chunks == hybrid.decode_gpu_batch_chunks
+        && cpu.gpu_pipelined_submit_chunks == hybrid.gpu_pipelined_submit_chunks
+        && cpu.token_finalize_segment_size == hybrid.token_finalize_segment_size
+        && cpu.compression_level == hybrid.compression_level
+        && cpu.compression_mode == hybrid.compression_mode
+        && cpu.gpu_tail_stop_ratio == hybrid.gpu_tail_stop_ratio
+        && cpu.gpu_min_chunk_size == hybrid.gpu_min_chunk_size
+        && cpu.scheduler_policy == hybrid.scheduler_policy
+        && cpu.profile_timing == hybrid.profile_timing
+        && cpu.profile_timing_detail == hybrid.profile_timing_detail
+        && cpu.profile_timing_deep == hybrid.profile_timing_deep;
+    if same {
+        Ok(())
+    } else {
+        Err("CPU_ONLY と CPU+GPU で scheduler/queue 関連のオプションが一致していません".to_string())
+    }
+}
+
 fn main() -> Result<(), String> {
     let cfg = parse_args()?;
     let size_bytes = cfg.size_mib * 1024 * 1024;
     let input = generate_input(size_bytes, cfg.dataset);
 
-    let cpu_opts = HybridOptions {
+    let base_opts = HybridOptions {
         chunk_size: cfg.chunk_mib * 1024 * 1024,
         gpu_subchunk_size: cfg.gpu_subchunk_kib * 1024,
         gpu_slot_count: cfg.gpu_slot_count,
@@ -571,31 +635,11 @@ fn main() -> Result<(), String> {
         token_finalize_segment_size: cfg.token_finalize_segment_size,
         compression_level: 6,
         compression_mode: cfg.mode,
+        // CPU_ONLY / Hybrid ともに同一スケジューラ条件を使う。
+        // 差分は prefer_gpu/gpu_fraction/gpu_only のみ。
         prefer_gpu: false,
+        gpu_only: false,
         gpu_fraction: 0.0,
-        gpu_tail_stop_ratio: 1.0,
-        gpu_min_chunk_size: cfg.gpu_min_chunk_kib * 1024,
-        profile_timing: cfg.profile_timing,
-        profile_timing_detail: cfg.profile_timing_detail,
-        profile_timing_deep: cfg.profile_timing_deep,
-        ..HybridOptions::default()
-    };
-    let hybrid_opts = HybridOptions {
-        chunk_size: cfg.chunk_mib * 1024 * 1024,
-        gpu_subchunk_size: cfg.gpu_subchunk_kib * 1024,
-        gpu_slot_count: cfg.gpu_slot_count,
-        gpu_batch_chunks: cfg.gpu_batch_chunks,
-        gpu_pipelined_submit_chunks: cfg.gpu_submit_chunks,
-        stream_prepare_pipeline_depth: cfg.stream_pipeline_depth,
-        stream_batch_chunks: cfg.stream_batch_chunks,
-        stream_max_inflight_chunks: cfg.stream_max_inflight_chunks,
-        stream_max_inflight_bytes: cfg.stream_max_inflight_mib * 1024 * 1024,
-        scheduler_policy: cfg.scheduler_policy,
-        token_finalize_segment_size: cfg.token_finalize_segment_size,
-        compression_level: 6,
-        compression_mode: cfg.mode,
-        prefer_gpu: cfg.gpu_compress,
-        gpu_fraction: if cfg.gpu_compress { cfg.gpu_fraction } else { 0.0 },
         gpu_tail_stop_ratio: cfg.gpu_tail_stop_ratio,
         gpu_min_chunk_size: cfg.gpu_min_chunk_kib * 1024,
         profile_timing: cfg.profile_timing,
@@ -603,12 +647,23 @@ fn main() -> Result<(), String> {
         profile_timing_deep: cfg.profile_timing_deep,
         ..HybridOptions::default()
     };
+    let mut cpu_opts = base_opts.clone();
+    cpu_opts.prefer_gpu = false;
+    cpu_opts.gpu_only = false;
+    cpu_opts.gpu_fraction = 0.0;
+
+    let mut hybrid_opts = base_opts;
+    hybrid_opts.prefer_gpu = cfg.gpu_compress;
+    hybrid_opts.gpu_only = cfg.gpu_only && cfg.gpu_compress;
+    hybrid_opts.gpu_fraction = if cfg.gpu_compress { cfg.gpu_fraction } else { 0.0 };
+
+    ensure_scheduler_equivalence(&cpu_opts, &hybrid_opts)?;
 
     let cpu = CoZipDeflate::init(cpu_opts).map_err(|e| e.to_string())?;
     let hybrid = CoZipDeflate::init(hybrid_opts).map_err(|e| e.to_string())?;
 
     println!(
-        "cozip_pdeflate benchmark\nsize_mib={} runs={} warmups={} chunk_mib={} sections={} dataset={} gpu_compress={} gpu_workers={} gpu_slot_count={} gpu_batch_chunks={} gpu_submit_chunks={} gpu_subchunk_kib={} token_finalize_segment_size={} stream_pipeline_depth={} stream_batch_chunks={} stream_max_inflight_chunks={} stream_max_inflight_mib={} gpu_fraction={:.2} gpu_min_chunk_kib={} scheduler={:?} gpu_tail_stop_ratio={:.2} compare_hybrid={} verify_bytes={}",
+        "cozip_pdeflate benchmark\nsize_mib={} runs={} warmups={} chunk_mib={} sections={} dataset={} gpu_compress={} gpu_only={} gpu_workers={} gpu_slot_count={} gpu_batch_chunks={} gpu_submit_chunks={} gpu_subchunk_kib={} token_finalize_segment_size={} stream_pipeline_depth={} stream_batch_chunks={} stream_max_inflight_chunks={} stream_max_inflight_mib={} gpu_fraction={:.2} gpu_min_chunk_kib={} scheduler={:?} gpu_tail_stop_ratio={:.2} compare_hybrid={} verify_bytes={}",
         cfg.size_mib,
         cfg.runs,
         cfg.warmups,
@@ -616,6 +671,7 @@ fn main() -> Result<(), String> {
         cfg.sections,
         cfg.dataset.as_str(),
         cfg.gpu_compress,
+        cfg.gpu_only,
         cfg.gpu_workers,
         cfg.gpu_slot_count,
         cfg.gpu_batch_chunks,
@@ -635,7 +691,7 @@ fn main() -> Result<(), String> {
     );
     println!("skip_decompress={}", cfg.skip_decompress);
     if cfg.skip_decompress && cfg.verify_bytes {
-        println!("[bench] verify_bytes is ignored because decompression is skipped");
+        println!("[bench] verify_bytes is enabled; roundtrip check runs outside timing");
     }
 
     for _ in 0..cfg.warmups {
@@ -661,6 +717,9 @@ fn main() -> Result<(), String> {
     let mut speedup_comp = Vec::with_capacity(cfg.runs);
     let mut speedup_decomp = Vec::with_capacity(cfg.runs);
     let mut last_hybrid_stats = DeflateCpuStreamStats::default();
+    let mut last_hybrid_comp_ms = 0.0_f64;
+    let mut last_cpu_stats = DeflateCpuStreamStats::default();
+    let mut last_cpu_comp_ms = 0.0_f64;
 
     for i in 0..cfg.runs {
         if cfg.compare_hybrid {
@@ -673,17 +732,22 @@ fn main() -> Result<(), String> {
                 cfg.verify_bytes,
             )?;
             last_hybrid_stats = h.compress_stats;
+            last_hybrid_comp_ms = h.comp_ms;
+            last_cpu_stats = c.compress_stats;
+            last_cpu_comp_ms = c.comp_ms;
             let spc = if h.comp_ms > 0.0 { c.comp_ms / h.comp_ms } else { 0.0 };
             let spd = match (c.decomp_ms, h.decomp_ms) {
                 (Some(a), Some(b)) if b > 0.0 => a / b,
                 _ => 0.0,
             };
+            let hybrid_label = if cfg.gpu_only { "GPU_ONLY" } else { "CPU+GPU" };
             println!(
-                "run {}/{}: CPU_ONLY comp_ms={:.3} decomp={} | CPU+GPU comp_ms={:.3} decomp={} ratio={:.4} speedup_comp={:.3}x speedup_decomp={:.3}x",
+                "run {}/{}: CPU_ONLY comp_ms={:.3} decomp={} | {} comp_ms={:.3} decomp={} ratio={:.4} speedup_comp={:.3}x speedup_decomp={:.3}x",
                 i + 1,
                 cfg.runs,
                 c.comp_ms,
                 format_opt(c.decomp_ms),
+                hybrid_label,
                 h.comp_ms,
                 format_opt(h.decomp_ms),
                 h.ratio,
@@ -716,6 +780,7 @@ fn main() -> Result<(), String> {
                 cfg.verify_bytes,
             )?;
             last_hybrid_stats = r.compress_stats;
+            last_hybrid_comp_ms = r.comp_ms;
             println!(
                 "run {}/{}: comp_ms={:.3} decomp={} comp_mib_s={:.2} decomp_mib_s={} ratio={:.4}",
                 i + 1,
@@ -847,6 +912,43 @@ fn main() -> Result<(), String> {
         } else {
             0.0
         }
+    );
+    println!(
+        "[cozip_pdeflate][timing][scheduler-probe] gpu_eligible_chunks={} cpu_claimed_gpu_eligible_chunks={} gpu_claimed_chunks={} gpu_encoded_chunks={} gpu_fallback_chunks={}",
+        last_hybrid_stats.gpu_eligible_chunks,
+        last_hybrid_stats.cpu_claimed_gpu_eligible_chunks,
+        last_hybrid_stats.gpu_claimed_chunks,
+        last_hybrid_stats.gpu_worker_chunks,
+        last_hybrid_stats
+            .gpu_claimed_chunks
+            .saturating_sub(last_hybrid_stats.gpu_worker_chunks)
+    );
+    if cfg.compare_hybrid {
+        println!(
+            "[cozip_pdeflate][timing][cpu-only-probe] comp_ms={:.3} cpu_worker_busy_ms={:.3} cpu_parallelism={:.2} cpu_queue_lock_wait_ms={:.3} cpu_wait_for_task_ms={:.3} writer_wait_ms={:.3} writer_hol_wait_ms={:.3} write_stage_ms={:.3}",
+            last_cpu_comp_ms,
+            last_cpu_stats.cpu_worker_busy_ms,
+            cpu_parallelism_estimate(&last_cpu_stats, last_cpu_comp_ms),
+            last_cpu_stats.cpu_queue_lock_wait_ms,
+            last_cpu_stats.cpu_wait_for_task_ms,
+            last_cpu_stats.writer_wait_ms,
+            last_cpu_stats.writer_hol_wait_ms,
+            last_cpu_stats.write_stage_ms
+        );
+    }
+    println!(
+        "[cozip_pdeflate][timing][hybrid-probe] comp_ms={:.3} cpu_worker_busy_ms={:.3} cpu_parallelism={:.2} gpu_worker_busy_ms={:.3} cpu_queue_lock_wait_ms={:.3} gpu_queue_lock_wait_ms={:.3} cpu_wait_for_task_ms={:.3} gpu_wait_for_task_ms={:.3} writer_wait_ms={:.3} writer_hol_wait_ms={:.3} write_stage_ms={:.3}",
+        last_hybrid_comp_ms,
+        last_hybrid_stats.cpu_worker_busy_ms,
+        cpu_parallelism_estimate(&last_hybrid_stats, last_hybrid_comp_ms),
+        last_hybrid_stats.gpu_worker_busy_ms,
+        last_hybrid_stats.cpu_queue_lock_wait_ms,
+        last_hybrid_stats.gpu_queue_lock_wait_ms,
+        last_hybrid_stats.cpu_wait_for_task_ms,
+        last_hybrid_stats.gpu_wait_for_task_ms,
+        last_hybrid_stats.writer_wait_ms,
+        last_hybrid_stats.writer_hol_wait_ms,
+        last_hybrid_stats.write_stage_ms
     );
 
     Ok(())

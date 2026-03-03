@@ -507,6 +507,112 @@ pub fn pdeflate_compress(
     pdeflate_compress_with_stats(input, options).map(|(out, _)| out)
 }
 
+pub fn pdeflate_compress_chunk_cpu(
+    chunk: &[u8],
+    options: &PDeflateOptions,
+) -> Result<Vec<u8>, PDeflateError> {
+    validate_options(options)?;
+    let mut cpu_opts = options.clone();
+    cpu_opts.gpu_compress_enabled = false;
+    cpu_opts.chunk_size = chunk.len().max(1);
+    let encoded = compress_chunk_cpu_only(chunk, &cpu_opts)?;
+    Ok(encoded.payload)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PDeflateChunkCompressMeta {
+    pub gpu_used: bool,
+    pub table_entries: usize,
+    pub section_count: usize,
+    pub gpu_upload_ms: f64,
+    pub gpu_wait_ms: f64,
+    pub gpu_map_copy_ms: f64,
+    pub gpu_total_ms: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PDeflateChunkCompressResult {
+    pub payload: Vec<u8>,
+    pub meta: PDeflateChunkCompressMeta,
+}
+
+pub fn pdeflate_compress_chunk_with_meta(
+    chunk: &[u8],
+    options: &PDeflateOptions,
+) -> Result<PDeflateChunkCompressResult, PDeflateError> {
+    validate_options(options)?;
+    let mut opts = options.clone();
+    opts.chunk_size = chunk.len().max(1);
+    let encoded = compress_chunk(chunk, &opts)?;
+    let meta = PDeflateChunkCompressMeta {
+        gpu_used: encoded.profile.gpu_used,
+        table_entries: encoded.table_entries,
+        section_count: encoded.section_count,
+        gpu_upload_ms: encoded.profile.gpu_upload_ms,
+        gpu_wait_ms: encoded.profile.gpu_wait_ms,
+        gpu_map_copy_ms: encoded.profile.gpu_map_copy_ms,
+        gpu_total_ms: encoded.profile.gpu_total_ms,
+    };
+    Ok(PDeflateChunkCompressResult {
+        payload: encoded.payload,
+        meta,
+    })
+}
+
+pub fn pdeflate_compress_chunk_batch_with_meta(
+    chunks: &[&[u8]],
+    options: &PDeflateOptions,
+) -> Result<Vec<PDeflateChunkCompressResult>, PDeflateError> {
+    validate_options(options)?;
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let chunk_size = chunks[0].len().max(1);
+    if chunks.iter().any(|chunk| chunk.len() != chunks[0].len()) {
+        return Err(PDeflateError::InvalidOptions(
+            "batch chunks must be equal-sized",
+        ));
+    }
+
+    let mut input = Vec::with_capacity(
+        chunk_size
+            .checked_mul(chunks.len())
+            .ok_or(PDeflateError::NumericOverflow)?,
+    );
+    for chunk in chunks {
+        input.extend_from_slice(chunk);
+    }
+
+    let mut opts = options.clone();
+    opts.chunk_size = chunk_size;
+    opts.gpu_compress_enabled = true;
+    let indices: Vec<usize> = (0..chunks.len()).collect();
+    let (encoded, _batch_profile) = compress_chunk_gpu_batch(&input, chunk_size, &indices, &opts)?;
+
+    let mut out = vec![PDeflateChunkCompressResult::default(); chunks.len()];
+    for (index, chunk) in encoded {
+        if index >= out.len() {
+            return Err(PDeflateError::InvalidStream(
+                "batch encode index out of range",
+            ));
+        }
+        out[index] = PDeflateChunkCompressResult {
+            payload: chunk.payload,
+            meta: PDeflateChunkCompressMeta {
+                gpu_used: chunk.profile.gpu_used,
+                table_entries: chunk.table_entries,
+                section_count: chunk.section_count,
+                gpu_upload_ms: chunk.profile.gpu_upload_ms,
+                gpu_wait_ms: chunk.profile.gpu_wait_ms,
+                gpu_map_copy_ms: chunk.profile.gpu_map_copy_ms,
+                gpu_total_ms: chunk.profile.gpu_total_ms,
+            },
+        };
+    }
+    Ok(out)
+}
+
 pub fn pdeflate_decompress(stream: &[u8]) -> Result<Vec<u8>, PDeflateError> {
     pdeflate_decompress_with_stats(stream).map(|(out, _)| out)
 }
@@ -3292,7 +3398,7 @@ fn build_table(chunk: &[u8], options: &PDeflateOptions) -> (Vec<Vec<u8>>, BuildT
     // probe volume for large chunks.
     let sample_stride = options.table_sample_stride.max(1).saturating_mul(8);
     // Table seeding is the dominant cost path. Keep probe fan-out tighter here.
-    let probe_limit = options.match_probe_limit.min(1);
+    let probe_limit = options.match_probe_limit.max(1);
     let min_seed_match_len = options.min_ref_len.max(6);
 
     // zlib-style hot-path: fixed slots instead of HashMap entry churn.
@@ -3868,7 +3974,7 @@ fn has_any_match(
     }
 
     let candidates = select_candidates(src, pos, by_prefix2);
-    let probe_limit = options.match_probe_limit.min(1);
+    let probe_limit = options.match_probe_limit.max(1);
 
     for &id in candidates.iter().take(probe_limit) {
         if let Some(m) = metrics.as_mut() {
@@ -3959,7 +4065,7 @@ fn find_best_match(
     let mut best_len = 0usize;
 
     let candidates = select_candidates(src, pos, by_prefix2);
-    let probe_limit = options.match_probe_limit.min(1);
+    let probe_limit = options.match_probe_limit.max(1);
     let mut checked = 0usize;
     for &id in candidates.iter() {
         if checked >= probe_limit {
