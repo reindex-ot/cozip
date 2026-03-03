@@ -5,6 +5,32 @@ use cozip_pdeflate::{
     deflate_decompress_stream_on_cpu,
 };
 
+#[derive(Debug, Clone, Copy)]
+enum DatasetKind {
+    Bench,
+    Legacy,
+    Random,
+}
+
+impl DatasetKind {
+    fn from_str(v: &str) -> Option<Self> {
+        match v {
+            "bench" => Some(Self::Bench),
+            "legacy" => Some(Self::Legacy),
+            "random" => Some(Self::Random),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bench => "bench",
+            Self::Legacy => "legacy",
+            Self::Random => "random",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct BenchConfig {
     size_mib: usize,
@@ -12,14 +38,22 @@ struct BenchConfig {
     warmups: usize,
     chunk_mib: usize,
     sections: usize,
+    dataset: DatasetKind,
     verify_bytes: bool,
     skip_decompress: bool,
     gpu_compress: bool,
     compare_hybrid: bool,
     gpu_workers: usize,
     gpu_slot_count: usize,
+    gpu_batch_chunks: usize,
     gpu_submit_chunks: usize,
-    gpu_pipelined_submit_chunks: usize,
+    gpu_subchunk_kib: usize,
+    token_finalize_segment_size: usize,
+    stream_pipeline_depth: usize,
+    stream_batch_chunks: usize,
+    stream_max_inflight_chunks: usize,
+    stream_max_inflight_mib: usize,
+    gpu_fraction: f32,
     gpu_min_chunk_kib: usize,
     scheduler_policy: HybridSchedulerPolicy,
     gpu_tail_stop_ratio: f32,
@@ -32,23 +66,31 @@ struct BenchConfig {
 impl Default for BenchConfig {
     fn default() -> Self {
         Self {
-            size_mib: 1024,
-            runs: 3,
-            warmups: 1,
+            size_mib: 4096,
+            runs: 1,
+            warmups: 0,
             chunk_mib: 4,
             sections: 128,
+            dataset: DatasetKind::Bench,
             verify_bytes: true,
             skip_decompress: true,
             gpu_compress: false,
             compare_hybrid: false,
             gpu_workers: 1,
-            gpu_slot_count: 16,
-            gpu_submit_chunks: 4,
-            gpu_pipelined_submit_chunks: 4,
+            gpu_slot_count: 6,
+            gpu_batch_chunks: 6,
+            gpu_submit_chunks: 3,
+            gpu_subchunk_kib: 512,
+            token_finalize_segment_size: 4096,
+            stream_pipeline_depth: 3,
+            stream_batch_chunks: 0,
+            stream_max_inflight_chunks: 0,
+            stream_max_inflight_mib: 0,
+            gpu_fraction: 1.0,
             gpu_min_chunk_kib: 64,
             scheduler_policy: HybridSchedulerPolicy::GlobalQueueLocalBuffers,
             gpu_tail_stop_ratio: 1.0,
-            mode: CompressionMode::Balanced,
+            mode: CompressionMode::Ratio,
             profile_timing: env_flag("COZIP_PROFILE_TIMING"),
             profile_timing_detail: env_flag("COZIP_PROFILE_TIMING_DETAIL"),
             profile_timing_deep: env_flag("COZIP_PROFILE_DEEP"),
@@ -130,6 +172,13 @@ fn parse_args() -> Result<BenchConfig, String> {
                     .parse::<usize>()
                     .map_err(|e| format!("invalid --sections: {e}"))?;
             }
+            "--dataset" => {
+                i += 1;
+                let v = args.get(i).ok_or("--dataset requires value")?;
+                cfg.dataset = DatasetKind::from_str(v.as_str()).ok_or_else(|| {
+                    format!("invalid --dataset: {v} (expected bench|legacy|random)")
+                })?;
+            }
             "--gpu-compress" => cfg.gpu_compress = true,
             "--gpu-compress-enabled" => {
                 i += 1;
@@ -152,6 +201,14 @@ fn parse_args() -> Result<BenchConfig, String> {
                     .parse::<usize>()
                     .map_err(|e| format!("invalid --gpu-workers: {e}"))?;
             }
+            "--gpu-batch-chunks" => {
+                i += 1;
+                cfg.gpu_batch_chunks = args
+                    .get(i)
+                    .ok_or("--gpu-batch-chunks requires value")?
+                    .parse::<usize>()
+                    .map_err(|e| format!("invalid --gpu-batch-chunks: {e}"))?;
+            }
             "--gpu-submit-chunks" => {
                 i += 1;
                 cfg.gpu_submit_chunks = args
@@ -160,21 +217,77 @@ fn parse_args() -> Result<BenchConfig, String> {
                     .parse::<usize>()
                     .map_err(|e| format!("invalid --gpu-submit-chunks: {e}"))?;
             }
-            "--gpu-slot-count" => {
+            "--gpu-slot-count" | "--gpu-slots" => {
                 i += 1;
                 cfg.gpu_slot_count = args
                     .get(i)
-                    .ok_or("--gpu-slot-count requires value")?
+                    .ok_or("--gpu-slot-count/--gpu-slots requires value")?
                     .parse::<usize>()
                     .map_err(|e| format!("invalid --gpu-slot-count: {e}"))?;
             }
             "--gpu-pipelined-submit-chunks" => {
                 i += 1;
-                cfg.gpu_pipelined_submit_chunks = args
+                cfg.gpu_submit_chunks = args
                     .get(i)
                     .ok_or("--gpu-pipelined-submit-chunks requires value")?
                     .parse::<usize>()
                     .map_err(|e| format!("invalid --gpu-pipelined-submit-chunks: {e}"))?;
+            }
+            "--gpu-subchunk-kib" => {
+                i += 1;
+                cfg.gpu_subchunk_kib = args
+                    .get(i)
+                    .ok_or("--gpu-subchunk-kib requires value")?
+                    .parse::<usize>()
+                    .map_err(|e| format!("invalid --gpu-subchunk-kib: {e}"))?;
+            }
+            "--token-finalize-segment-size" => {
+                i += 1;
+                cfg.token_finalize_segment_size = args
+                    .get(i)
+                    .ok_or("--token-finalize-segment-size requires value")?
+                    .parse::<usize>()
+                    .map_err(|e| format!("invalid --token-finalize-segment-size: {e}"))?;
+            }
+            "--stream-pipeline-depth" => {
+                i += 1;
+                cfg.stream_pipeline_depth = args
+                    .get(i)
+                    .ok_or("--stream-pipeline-depth requires value")?
+                    .parse::<usize>()
+                    .map_err(|e| format!("invalid --stream-pipeline-depth: {e}"))?;
+            }
+            "--stream-batch-chunks" => {
+                i += 1;
+                cfg.stream_batch_chunks = args
+                    .get(i)
+                    .ok_or("--stream-batch-chunks requires value")?
+                    .parse::<usize>()
+                    .map_err(|e| format!("invalid --stream-batch-chunks: {e}"))?;
+            }
+            "--stream-max-inflight-chunks" => {
+                i += 1;
+                cfg.stream_max_inflight_chunks = args
+                    .get(i)
+                    .ok_or("--stream-max-inflight-chunks requires value")?
+                    .parse::<usize>()
+                    .map_err(|e| format!("invalid --stream-max-inflight-chunks: {e}"))?;
+            }
+            "--stream-max-inflight-mib" => {
+                i += 1;
+                cfg.stream_max_inflight_mib = args
+                    .get(i)
+                    .ok_or("--stream-max-inflight-mib requires value")?
+                    .parse::<usize>()
+                    .map_err(|e| format!("invalid --stream-max-inflight-mib: {e}"))?;
+            }
+            "--gpu-fraction" => {
+                i += 1;
+                cfg.gpu_fraction = args
+                    .get(i)
+                    .ok_or("--gpu-fraction requires value")?
+                    .parse::<f32>()
+                    .map_err(|e| format!("invalid --gpu-fraction: {e}"))?;
             }
             "--gpu-min-chunk-kib" => {
                 i += 1;
@@ -232,10 +345,20 @@ fn parse_args() -> Result<BenchConfig, String> {
     if cfg.runs == 0 || cfg.size_mib == 0 || cfg.chunk_mib == 0 {
         return Err("--size-mib/--runs/--chunk-mib must be > 0".to_string());
     }
-    if cfg.gpu_slot_count == 0 || cfg.gpu_submit_chunks == 0 || cfg.gpu_pipelined_submit_chunks == 0
+    if cfg.gpu_slot_count == 0
+        || cfg.gpu_batch_chunks == 0
+        || cfg.gpu_submit_chunks == 0
+        || cfg.gpu_subchunk_kib == 0
+        || cfg.token_finalize_segment_size == 0
+        || cfg.stream_pipeline_depth == 0
     {
-        return Err("gpu-slot-count/gpu-submit-chunks/gpu-pipelined-submit-chunks must be > 0"
-            .to_string());
+        return Err("gpu-slot-count/gpu-batch-chunks/gpu-submit-chunks/gpu-subchunk-kib/token-finalize-segment-size/stream-pipeline-depth must be > 0".to_string());
+    }
+    if cfg.stream_batch_chunks != 0 {
+        return Err("--stream-batch-chunks is fixed to 0 (legacy batch mode was removed)".to_string());
+    }
+    if !(0.0..=1.0).contains(&cfg.gpu_fraction) {
+        return Err("--gpu-fraction must be in range 0.0..=1.0".to_string());
     }
     if !(0.0..=1.0).contains(&cfg.gpu_tail_stop_ratio) {
         return Err("--gpu-tail-stop-ratio must be in range 0.0..=1.0".to_string());
@@ -256,23 +379,50 @@ options:\n\
   --runs <N>\n\
   --warmups <N>\n\
   --chunk-mib <N>\n\
+  --dataset <bench|legacy|random> (default: bench)\n\
   --sections <N>\n\
   --gpu-compress\n\
   --compare-hybrid\n\
   --gpu-workers <N>\n\
-  --gpu-slot-count <N>\n\
+  --gpu-slot-count/--gpu-slots <N>\n\
+  --gpu-batch-chunks <N>\n\
   --gpu-submit-chunks <N>\n\
-  --gpu-pipelined-submit-chunks <N>\n\
+  --gpu-pipelined-submit-chunks <N> (legacy alias of --gpu-submit-chunks)\n\
+  --gpu-subchunk-kib <N>\n\
+  --token-finalize-segment-size <N>\n\
+  --stream-pipeline-depth <N>\n\
+  --stream-batch-chunks <N> (fixed to 0)\n\
+  --stream-max-inflight-chunks <N>\n\
+  --stream-max-inflight-mib <N>\n\
+  --gpu-fraction <R>\n\
   --gpu-min-chunk-kib <N>\n\
   --scheduler <global|global-local>\n\
   --gpu-tail-stop-ratio <R>\n\
-  --mode <speed|balanced|ratio> (default: balanced)\n\
+  --mode <speed|balanced|ratio> (default: ratio)\n\
   --skip-decompress / --no-skip-decompress\n\
   --verify / --no-verify / --verify-bytes <0|1>"
     );
 }
 
-fn generate_input(size_bytes: usize) -> Vec<u8> {
+fn build_dataset_bench(size_bytes: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(size_bytes);
+    let mut state: u32 = 0x1234_5678;
+    while out.len() < size_bytes {
+        let zone = (out.len() / 4096) % 3;
+        match zone {
+            0 => out.extend_from_slice(b"cozip-cpu-gpu-deflate-"),
+            1 => out.extend_from_slice(b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            _ => {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                out.push((state >> 24) as u8);
+            }
+        }
+    }
+    out.truncate(size_bytes);
+    out
+}
+
+fn build_dataset_legacy(size_bytes: usize) -> Vec<u8> {
     let mut out = vec![0u8; size_bytes];
     let text = b"ABABABABCCABCCD--cozip-pdeflate-bench--";
     let mut rng = 0x1234_5678_u32;
@@ -296,6 +446,26 @@ fn generate_input(size_bytes: usize) -> Vec<u8> {
         };
     }
     out
+}
+
+fn build_dataset_random(size_bytes: usize) -> Vec<u8> {
+    let mut out = vec![0u8; size_bytes];
+    let mut state = 0x5a17_3c9d_u32;
+    for b in &mut out {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        *b = (state >> 24) as u8;
+    }
+    out
+}
+
+fn generate_input(size_bytes: usize, dataset: DatasetKind) -> Vec<u8> {
+    match dataset {
+        DatasetKind::Bench => build_dataset_bench(size_bytes),
+        DatasetKind::Legacy => build_dataset_legacy(size_bytes),
+        DatasetKind::Random => build_dataset_random(size_bytes),
+    }
 }
 
 fn mean(v: &[f64]) -> f64 {
@@ -385,14 +555,21 @@ fn format_opt(v: Option<f64>) -> String {
 fn main() -> Result<(), String> {
     let cfg = parse_args()?;
     let size_bytes = cfg.size_mib * 1024 * 1024;
-    let input = generate_input(size_bytes);
+    let input = generate_input(size_bytes, cfg.dataset);
 
     let cpu_opts = HybridOptions {
         chunk_size: cfg.chunk_mib * 1024 * 1024,
+        gpu_subchunk_size: cfg.gpu_subchunk_kib * 1024,
         gpu_slot_count: cfg.gpu_slot_count,
-        gpu_batch_chunks: cfg.gpu_submit_chunks,
-        gpu_pipelined_submit_chunks: cfg.gpu_pipelined_submit_chunks,
+        gpu_batch_chunks: cfg.gpu_batch_chunks,
+        gpu_pipelined_submit_chunks: cfg.gpu_submit_chunks,
+        stream_prepare_pipeline_depth: cfg.stream_pipeline_depth,
+        stream_batch_chunks: cfg.stream_batch_chunks,
+        stream_max_inflight_chunks: cfg.stream_max_inflight_chunks,
+        stream_max_inflight_bytes: cfg.stream_max_inflight_mib * 1024 * 1024,
         scheduler_policy: cfg.scheduler_policy,
+        token_finalize_segment_size: cfg.token_finalize_segment_size,
+        compression_level: 6,
         compression_mode: cfg.mode,
         prefer_gpu: false,
         gpu_fraction: 0.0,
@@ -405,13 +582,20 @@ fn main() -> Result<(), String> {
     };
     let hybrid_opts = HybridOptions {
         chunk_size: cfg.chunk_mib * 1024 * 1024,
+        gpu_subchunk_size: cfg.gpu_subchunk_kib * 1024,
         gpu_slot_count: cfg.gpu_slot_count,
-        gpu_batch_chunks: cfg.gpu_submit_chunks,
-        gpu_pipelined_submit_chunks: cfg.gpu_pipelined_submit_chunks,
+        gpu_batch_chunks: cfg.gpu_batch_chunks,
+        gpu_pipelined_submit_chunks: cfg.gpu_submit_chunks,
+        stream_prepare_pipeline_depth: cfg.stream_pipeline_depth,
+        stream_batch_chunks: cfg.stream_batch_chunks,
+        stream_max_inflight_chunks: cfg.stream_max_inflight_chunks,
+        stream_max_inflight_bytes: cfg.stream_max_inflight_mib * 1024 * 1024,
         scheduler_policy: cfg.scheduler_policy,
+        token_finalize_segment_size: cfg.token_finalize_segment_size,
+        compression_level: 6,
         compression_mode: cfg.mode,
         prefer_gpu: cfg.gpu_compress,
-        gpu_fraction: if cfg.gpu_compress { 1.0 } else { 0.0 },
+        gpu_fraction: if cfg.gpu_compress { cfg.gpu_fraction } else { 0.0 },
         gpu_tail_stop_ratio: cfg.gpu_tail_stop_ratio,
         gpu_min_chunk_size: cfg.gpu_min_chunk_kib * 1024,
         profile_timing: cfg.profile_timing,
@@ -424,17 +608,25 @@ fn main() -> Result<(), String> {
     let hybrid = CoZipDeflate::init(hybrid_opts).map_err(|e| e.to_string())?;
 
     println!(
-        "cozip_pdeflate benchmark\nsize_mib={} runs={} warmups={} chunk_mib={} sections={} gpu_compress={} gpu_workers={} gpu_slot_count={} gpu_submit_chunks={} gpu_pipelined_submit_chunks={} gpu_min_chunk_kib={} scheduler={:?} gpu_tail_stop_ratio={:.2} compare_hybrid={} verify_bytes={}",
+        "cozip_pdeflate benchmark\nsize_mib={} runs={} warmups={} chunk_mib={} sections={} dataset={} gpu_compress={} gpu_workers={} gpu_slot_count={} gpu_batch_chunks={} gpu_submit_chunks={} gpu_subchunk_kib={} token_finalize_segment_size={} stream_pipeline_depth={} stream_batch_chunks={} stream_max_inflight_chunks={} stream_max_inflight_mib={} gpu_fraction={:.2} gpu_min_chunk_kib={} scheduler={:?} gpu_tail_stop_ratio={:.2} compare_hybrid={} verify_bytes={}",
         cfg.size_mib,
         cfg.runs,
         cfg.warmups,
         cfg.chunk_mib,
         cfg.sections,
+        cfg.dataset.as_str(),
         cfg.gpu_compress,
         cfg.gpu_workers,
         cfg.gpu_slot_count,
+        cfg.gpu_batch_chunks,
         cfg.gpu_submit_chunks,
-        cfg.gpu_pipelined_submit_chunks,
+        cfg.gpu_subchunk_kib,
+        cfg.token_finalize_segment_size,
+        cfg.stream_pipeline_depth,
+        cfg.stream_batch_chunks,
+        cfg.stream_max_inflight_chunks,
+        cfg.stream_max_inflight_mib,
+        cfg.gpu_fraction,
         cfg.gpu_min_chunk_kib,
         cfg.scheduler_policy,
         cfg.gpu_tail_stop_ratio,
