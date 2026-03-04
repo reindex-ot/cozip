@@ -61,6 +61,7 @@ struct BenchConfig {
     profile_timing: bool,
     profile_timing_detail: bool,
     profile_timing_deep: bool,
+    profile_outer: bool,
 }
 
 impl Default for BenchConfig {
@@ -95,6 +96,8 @@ impl Default for BenchConfig {
             profile_timing: env_flag("COZIP_PROFILE_TIMING"),
             profile_timing_detail: env_flag("COZIP_PROFILE_TIMING_DETAIL"),
             profile_timing_deep: env_flag("COZIP_PROFILE_DEEP"),
+            profile_outer: env_flag("COZIP_PDEFLATE_PROFILE_OUTER")
+                || env_flag("COZIP_PDEFLATE_PROFILE"),
         }
     }
 }
@@ -103,6 +106,8 @@ impl Default for BenchConfig {
 struct RunResult {
     comp_ms: f64,
     decomp_ms: Option<f64>,
+    verify_compare_ms: Option<f64>,
+    verify_roundtrip_ms: Option<f64>,
     ratio: f64,
     comp_mib_s: f64,
     decomp_mib_s: Option<f64>,
@@ -343,6 +348,8 @@ fn parse_args() -> Result<BenchConfig, String> {
             }
             "--skip-decompress" => cfg.skip_decompress = true,
             "--no-skip-decompress" => cfg.skip_decompress = false,
+            "--profile-outer" => cfg.profile_outer = true,
+            "--no-profile-outer" => cfg.profile_outer = false,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -416,7 +423,8 @@ options:\n\
   --gpu-tail-stop-ratio <R>\n\
   --mode <speed|balanced|ratio> (default: ratio)\n\
   --skip-decompress / --no-skip-decompress\n\
-  --verify / --no-verify / --verify-bytes <0|1>"
+  --verify / --no-verify / --verify-bytes <0|1>\n\
+  --profile-outer / --no-profile-outer"
     );
 }
 
@@ -526,26 +534,39 @@ fn run_once(
 
     let mut decomp_ms = None;
     let mut decomp_mib_s = None;
+    let mut verify_compare_ms = None;
+    let mut verify_roundtrip_ms = None;
     if !skip_decompress {
         let mut restored = Vec::with_capacity(input.len());
-        let mut reader = std::io::Cursor::new(&compressed);
         let d0 = Instant::now();
-        if let Some(index) = compress.index.as_ref() {
-            cozip
-                .deflate_decompress_stream_zip_compatible_with_index(
-                    &mut reader,
-                    &mut restored,
-                    index,
-                )
-                .map_err(|e| e.to_string())?;
-        } else {
-            cozip
-                .pdeflate_decompress_stream(&mut reader, &mut restored)
-                .map_err(|e| e.to_string())?;
+        if let Err(primary_err) = cozip.pdeflate_decompress_bytes(&compressed, &mut restored) {
+            if let Some(index) = compress.index.as_ref() {
+                restored.clear();
+                let mut reader = std::io::Cursor::new(&compressed);
+                cozip
+                    .deflate_decompress_stream_zip_compatible_with_index(
+                        &mut reader,
+                        &mut restored,
+                        index,
+                    )
+                    .map_err(|fallback_err| {
+                        format!(
+                            "pdeflate_decompress_bytes failed: {primary_err}; indexed fallback failed: {fallback_err}"
+                        )
+                    })?;
+            } else {
+                return Err(primary_err.to_string());
+            }
         }
         let d_ms = d0.elapsed().as_secs_f64() * 1000.0;
-        if verify_bytes && restored != input {
-            return Err("roundtrip mismatch".to_string());
+        if verify_bytes {
+            let v0 = Instant::now();
+            let ok = restored == input;
+            let v_ms = v0.elapsed().as_secs_f64() * 1000.0;
+            verify_compare_ms = Some(v_ms);
+            if !ok {
+                return Err("roundtrip mismatch".to_string());
+            }
         }
         decomp_mib_s = Some(if d_ms > 0.0 {
             size_mib as f64 * 1000.0 / d_ms
@@ -557,21 +578,30 @@ fn run_once(
         // Verification path for --skip-decompress:
         // run roundtrip check outside timing so throughput numbers stay compression-only.
         let mut restored = Vec::with_capacity(input.len());
-        let mut reader = std::io::Cursor::new(&compressed);
-        if let Some(index) = compress.index.as_ref() {
-            cozip
-                .deflate_decompress_stream_zip_compatible_with_index(
-                    &mut reader,
-                    &mut restored,
-                    index,
-                )
-                .map_err(|e| e.to_string())?;
-        } else {
-            cozip
-                .pdeflate_decompress_stream(&mut reader, &mut restored)
-                .map_err(|e| e.to_string())?;
+        let v0 = Instant::now();
+        if let Err(primary_err) = cozip.pdeflate_decompress_bytes(&compressed, &mut restored) {
+            if let Some(index) = compress.index.as_ref() {
+                restored.clear();
+                let mut reader = std::io::Cursor::new(&compressed);
+                cozip
+                    .deflate_decompress_stream_zip_compatible_with_index(
+                        &mut reader,
+                        &mut restored,
+                        index,
+                    )
+                    .map_err(|fallback_err| {
+                        format!(
+                            "pdeflate_decompress_bytes failed: {primary_err}; indexed fallback failed: {fallback_err}"
+                        )
+                    })?;
+            } else {
+                return Err(primary_err.to_string());
+            }
         }
-        if restored != input {
+        let ok = restored == input;
+        let v_ms = v0.elapsed().as_secs_f64() * 1000.0;
+        verify_roundtrip_ms = Some(v_ms);
+        if !ok {
             return Err("roundtrip mismatch".to_string());
         }
     }
@@ -579,6 +609,8 @@ fn run_once(
     Ok(RunResult {
         comp_ms,
         decomp_ms,
+        verify_compare_ms,
+        verify_roundtrip_ms,
         ratio: compressed.len() as f64 / input.len() as f64,
         comp_mib_s: if comp_ms > 0.0 {
             size_mib as f64 * 1000.0 / comp_ms
@@ -593,6 +625,11 @@ fn run_once(
 fn format_opt(v: Option<f64>) -> String {
     v.map(|x| format!("{x:.3}"))
         .unwrap_or_else(|| "SKIP".to_string())
+}
+
+fn format_opt_labeled(v: Option<f64>, label: &str) -> String {
+    v.map(|x| format!(" {label}={x:.3}"))
+        .unwrap_or_else(String::new)
 }
 
 fn cpu_parallelism_estimate(stats: &DeflateCpuStreamStats, comp_ms: f64) -> f64 {
@@ -711,6 +748,16 @@ fn main() -> Result<(), String> {
     if cfg.skip_decompress && cfg.verify_bytes {
         println!("[bench] verify_bytes is enabled; roundtrip check runs outside timing");
     }
+    let per_iteration_execs = if cfg.compare_hybrid { 2 } else { 1 };
+    let total_timed_execs = cfg.runs.saturating_mul(per_iteration_execs);
+    let total_warmup_execs = cfg.warmups.saturating_mul(per_iteration_execs);
+    println!(
+        "[bench] execution_plan iterations={} compare_hybrid={} execs_per_iteration={} timed_execs_total={} warmup_execs_total={}",
+        cfg.runs, cfg.compare_hybrid, per_iteration_execs, total_timed_execs, total_warmup_execs
+    );
+    if cfg.compare_hybrid {
+        println!("[bench] compare-hybrid runs CPU_ONLY then CPU+GPU in each iteration");
+    }
 
     for _ in 0..cfg.warmups {
         if cfg.compare_hybrid {
@@ -776,18 +823,41 @@ fn main() -> Result<(), String> {
             };
             let hybrid_label = if cfg.gpu_only { "GPU_ONLY" } else { "CPU+GPU" };
             println!(
-                "run {}/{}: CPU_ONLY comp_ms={:.3} decomp={} | {} comp_ms={:.3} decomp={} ratio={:.4} speedup_comp={:.3}x speedup_decomp={:.3}x",
+                "run {}/{}: CPU_ONLY comp_ms={:.3} decomp={}{}{} | {} comp_ms={:.3} decomp={}{}{} ratio={:.4} speedup_comp={:.3}x speedup_decomp={:.3}x",
                 i + 1,
                 cfg.runs,
                 c.comp_ms,
                 format_opt(c.decomp_ms),
+                format_opt_labeled(c.verify_compare_ms, "verify_cmp_ms"),
+                format_opt_labeled(c.verify_roundtrip_ms, "verify_roundtrip_ms"),
                 hybrid_label,
                 h.comp_ms,
                 format_opt(h.decomp_ms),
+                format_opt_labeled(h.verify_compare_ms, "verify_cmp_ms"),
+                format_opt_labeled(h.verify_roundtrip_ms, "verify_roundtrip_ms"),
                 h.ratio,
                 spc,
                 spd
             );
+            if cfg.profile_outer {
+                println!(
+                    "[bench][outer] run={} mode=CPU_ONLY comp_ms={:.3} decomp_ms={}{}{}",
+                    i + 1,
+                    c.comp_ms,
+                    format_opt(c.decomp_ms),
+                    format_opt_labeled(c.verify_compare_ms, "verify_cmp_ms"),
+                    format_opt_labeled(c.verify_roundtrip_ms, "verify_roundtrip_ms")
+                );
+                println!(
+                    "[bench][outer] run={} mode={} comp_ms={:.3} decomp_ms={}{}{}",
+                    i + 1,
+                    hybrid_label,
+                    h.comp_ms,
+                    format_opt(h.decomp_ms),
+                    format_opt_labeled(h.verify_compare_ms, "verify_cmp_ms"),
+                    format_opt_labeled(h.verify_roundtrip_ms, "verify_roundtrip_ms")
+                );
+            }
             cpu_comp_ms.push(c.comp_ms);
             if let Some(v) = c.decomp_ms {
                 cpu_decomp_ms.push(v);
@@ -816,17 +886,29 @@ fn main() -> Result<(), String> {
             last_hybrid_stats = r.compress_stats;
             last_hybrid_comp_ms = r.comp_ms;
             println!(
-                "run {}/{}: comp_ms={:.3} decomp={} comp_mib_s={:.2} decomp_mib_s={} ratio={:.4}",
+                "run {}/{}: comp_ms={:.3} decomp={}{}{} comp_mib_s={:.2} decomp_mib_s={} ratio={:.4}",
                 i + 1,
                 cfg.runs,
                 r.comp_ms,
                 format_opt(r.decomp_ms),
+                format_opt_labeled(r.verify_compare_ms, "verify_cmp_ms"),
+                format_opt_labeled(r.verify_roundtrip_ms, "verify_roundtrip_ms"),
                 r.comp_mib_s,
                 r.decomp_mib_s
                     .map(|x| format!("{x:.2}"))
                     .unwrap_or_else(|| "SKIP".to_string()),
                 r.ratio
             );
+            if cfg.profile_outer {
+                println!(
+                    "[bench][outer] run={} mode=SINGLE comp_ms={:.3} decomp_ms={}{}{}",
+                    i + 1,
+                    r.comp_ms,
+                    format_opt(r.decomp_ms),
+                    format_opt_labeled(r.verify_compare_ms, "verify_cmp_ms"),
+                    format_opt_labeled(r.verify_roundtrip_ms, "verify_roundtrip_ms")
+                );
+            }
             comp_ms.push(r.comp_ms);
             if let Some(v) = r.decomp_ms {
                 decomp_ms.push(v);
@@ -1045,7 +1127,8 @@ fn main() -> Result<(), String> {
         + last_hybrid_stats.legacy_gpu_kernel_section_submit_ms
         + last_hybrid_stats.legacy_gpu_kernel_section_wait_ms;
     let k5_sparse_ms = last_hybrid_stats.legacy_gpu_sparse_total_ms;
-    let call_known_ms = k1_pack_inputs_ms + k2_scratch_ms + k3_match_ms + k4_section_ms + k5_sparse_ms;
+    let call_known_ms =
+        k1_pack_inputs_ms + k2_scratch_ms + k3_match_ms + k4_section_ms + k5_sparse_ms;
     let call_other_ms = (last_hybrid_stats.legacy_gpu_profile_call_ms - call_known_ms).max(0.0);
     let profile_call_ms = last_hybrid_stats.legacy_gpu_profile_call_ms.max(1e-9);
     println!(
@@ -1070,10 +1153,13 @@ fn main() -> Result<(), String> {
     let p5_host_copy_ms = last_hybrid_stats.legacy_gpu_kernel_pack_host_copy_ms;
     let p6_device_plan_ms = last_hybrid_stats.legacy_gpu_kernel_pack_device_copy_plan_ms;
     let p7_finalize_ms = last_hybrid_stats.legacy_gpu_kernel_pack_finalize_ms;
-    let pack_known_ms =
-        p1_alloc_ms + p2_resolve_ms + p3_src_copy_ms + p4_metadata_ms + p5_host_copy_ms
-            + p6_device_plan_ms
-            + p7_finalize_ms;
+    let pack_known_ms = p1_alloc_ms
+        + p2_resolve_ms
+        + p3_src_copy_ms
+        + p4_metadata_ms
+        + p5_host_copy_ms
+        + p6_device_plan_ms
+        + p7_finalize_ms;
     let pack_other_ms = (k1_pack_inputs_ms - pack_known_ms).max(0.0);
     let pack_total_ms = k1_pack_inputs_ms.max(1e-9);
     println!(
@@ -1101,7 +1187,8 @@ fn main() -> Result<(), String> {
     let r3_submit_ms = last_hybrid_stats.legacy_gpu_kernel_pack_resolve_submit_ms;
     let r4_map_wait_ms = last_hybrid_stats.legacy_gpu_kernel_pack_resolve_map_wait_ms;
     let r5_parse_ms = last_hybrid_stats.legacy_gpu_kernel_pack_resolve_parse_ms;
-    let resolve_known_ms = r1_scan_ms + r2_readback_setup_ms + r3_submit_ms + r4_map_wait_ms + r5_parse_ms;
+    let resolve_known_ms =
+        r1_scan_ms + r2_readback_setup_ms + r3_submit_ms + r4_map_wait_ms + r5_parse_ms;
     let resolve_other_ms = (p2_resolve_ms - resolve_known_ms).max(0.0);
     let resolve_total_ms = p2_resolve_ms.max(1e-9);
     println!(

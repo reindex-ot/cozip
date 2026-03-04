@@ -1,9 +1,9 @@
-use std::sync::mpsc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use super::PDeflateError;
+use super::{PDeflateError, PDeflateOptions};
 
 const WORKGROUP_SIZE: u32 = 128;
 const PREFIX2_TABLE_SIZE: usize = 1 << 16;
@@ -14,6 +14,10 @@ const BUILD_TABLE_STAGE_COUNT: usize = 7;
 const BUILD_TABLE_STAGE_QUERY_COUNT: u32 = (BUILD_TABLE_STAGE_COUNT as u32) * 2;
 const SPARSE_KERNEL_STAGE_COUNT: usize = 2;
 const SPARSE_KERNEL_STAGE_QUERY_COUNT: u32 = (SPARSE_KERNEL_STAGE_COUNT as u32) * 2;
+const GPU_DECODE_TABLE_REPEAT_STRIDE: usize = 270;
+const GPU_DECODE_SECTION_META_HEADER_WORDS: usize = 4;
+const GPU_DECODE_SECTION_META_WORDS: usize = 4;
+const GPU_DECODE_MAX_TABLE_ID: usize = 0x0fff - 1;
 
 const MATCH_SHADER: &str = r#"
 @group(0) @binding(0) var<storage, read> src_words: array<u32>;
@@ -1899,6 +1903,162 @@ fn main() {
 }
 "#;
 
+const DECODE_V2_SHADER: &str = r#"
+const LITERAL_TAG: u32 = 0x0fffu;
+const MAX_CMD_LEN: u32 = 270u;
+const TABLE_REPEAT_STRIDE: u32 = 270u;
+const META_HEADER_WORDS: u32 = 4u;
+const META_WORDS: u32 = 4u;
+
+@group(0) @binding(0) var<storage, read> cmd_words: array<u32>;
+@group(0) @binding(1) var<storage, read> section_meta_words: array<u32>;
+@group(0) @binding(2) var<storage, read> table_words: array<u32>;
+@group(0) @binding(3) var<storage, read_write> out_words: array<u32>;
+@group(0) @binding(4) var<storage, read_write> error_words: array<u32>;
+
+fn load_cmd_u8(idx: u32) -> u32 {
+    let w = cmd_words[idx >> 2u];
+    let shift = (idx & 3u) * 8u;
+    return (w >> shift) & 0xffu;
+}
+
+fn load_table_u8(idx: u32) -> u32 {
+    let w = table_words[idx >> 2u];
+    let shift = (idx & 3u) * 8u;
+    return (w >> shift) & 0xffu;
+}
+
+fn load_cmd_u16(idx: u32) -> u32 {
+    let b0 = load_cmd_u8(idx);
+    let b1 = load_cmd_u8(idx + 1u);
+    return b0 | (b1 << 8u);
+}
+
+fn store_out_u8(idx: u32, value: u32) {
+    let word_idx = idx >> 2u;
+    let shift = (idx & 3u) * 8u;
+    let mask = ~(0xffu << shift);
+    let cur = out_words[word_idx];
+    out_words[word_idx] = (cur & mask) | ((value & 0xffu) << shift);
+}
+
+fn mark_error(sec: u32, code: u32) {
+    error_words[sec] = code;
+}
+
+@compute
+@workgroup_size(1, 1, 1)
+fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    if (gid3.x != 0u || gid3.y != 0u || gid3.z != 0u) {
+        return;
+    }
+    let section_count = section_meta_words[0];
+    let table_count = section_meta_words[1];
+    if (section_count == 0u) {
+        return;
+    }
+
+    var sec: u32 = 0u;
+    loop {
+        if (sec >= section_count) {
+            break;
+        }
+        let meta_base = META_HEADER_WORDS + sec * META_WORDS;
+        let cmd_start = section_meta_words[meta_base];
+        let cmd_len = section_meta_words[meta_base + 1u];
+        let out_start = section_meta_words[meta_base + 2u];
+        let out_len = section_meta_words[meta_base + 3u];
+        let cmd_end = cmd_start + cmd_len;
+        let out_end = out_start + out_len;
+
+        var cmd_cursor = cmd_start;
+        var out_cursor = out_start;
+        var err: u32 = 0u;
+        loop {
+            if (out_cursor >= out_end) {
+                break;
+            }
+            if (cmd_cursor + 2u > cmd_end) {
+                err = 1u;
+                break;
+            }
+            let cmd = load_cmd_u16(cmd_cursor);
+            cmd_cursor = cmd_cursor + 2u;
+
+            let tag = cmd & 0x0fffu;
+            let len4 = (cmd >> 12u) & 0x0fu;
+            var len = len4;
+            if (len4 == 0x0fu) {
+                if (cmd_cursor >= cmd_end) {
+                    err = 2u;
+                    break;
+                }
+                len = 15u + load_cmd_u8(cmd_cursor);
+                cmd_cursor = cmd_cursor + 1u;
+            }
+            if (len == 0u) {
+                err = 3u;
+                break;
+            }
+            if (len > MAX_CMD_LEN) {
+                err = 4u;
+                break;
+            }
+            if (len > (out_end - out_cursor)) {
+                err = 5u;
+                break;
+            }
+
+            if (tag == LITERAL_TAG) {
+                if (len > (cmd_end - cmd_cursor)) {
+                    err = 6u;
+                    break;
+                }
+                var i = 0u;
+                loop {
+                    if (i >= len) {
+                        break;
+                    }
+                    let b = load_cmd_u8(cmd_cursor + i);
+                    store_out_u8(out_cursor + i, b);
+                    i = i + 1u;
+                }
+                cmd_cursor = cmd_cursor + len;
+                out_cursor = out_cursor + len;
+                continue;
+            }
+
+            if (tag >= table_count) {
+                err = 7u;
+                break;
+            }
+            if (len < 3u) {
+                err = 8u;
+                break;
+            }
+
+            let table_base = tag * TABLE_REPEAT_STRIDE;
+            var j = 0u;
+            loop {
+                if (j >= len) {
+                    break;
+                }
+                let b = load_table_u8(table_base + j);
+                store_out_u8(out_cursor + j, b);
+                j = j + 1u;
+            }
+            out_cursor = out_cursor + len;
+        }
+
+        if (err == 0u && cmd_cursor != cmd_end) {
+            err = 9u;
+        }
+        mark_error(sec, err);
+        sec = sec + 1u;
+    }
+}
+"#;
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct GpuMatchProfile {
     pub(crate) upload_ms: f64,
@@ -2216,11 +2376,14 @@ struct GpuMatchRuntime {
     build_table_pack_index_pipeline: wgpu::ComputePipeline,
     match_prepare_table_bind_group_layout: wgpu::BindGroupLayout,
     match_prepare_table_pipeline: wgpu::ComputePipeline,
+    decode_v2_bind_group_layout: wgpu::BindGroupLayout,
+    decode_v2_pipeline: wgpu::ComputePipeline,
     max_storage_binding_size: u64,
     scratch_pool: Mutex<Vec<GpuBatchScratch>>,
     scratch_hot: Mutex<Option<GpuBatchScratch>>,
     sparse_pack_pool: Mutex<Vec<GpuSparsePackScratch>>,
     sparse_pack_hot: Mutex<Option<GpuSparsePackScratch>>,
+    decode_slot_pool: Mutex<GpuDecodeSlotPool>,
 }
 
 struct GpuBatchScratch {
@@ -2300,6 +2463,141 @@ struct GpuSparsePackScratch {
     readback_buffer: wgpu::Buffer,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuDecodeSlotClass {
+    Normal,
+    Large,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuDecodeSlotState {
+    Free,
+    Inflight,
+    Ready,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct GpuDecodeSlotCaps {
+    cmd_cap_bytes: u64,
+    section_meta_cap: usize,
+    table_cap_bytes: u64,
+    out_cap_bytes: u64,
+    error_cap_words: usize,
+}
+
+impl GpuDecodeSlotCaps {
+    fn fits(&self, req: GpuDecodeSlotRequirement) -> bool {
+        req.cmd_bytes <= self.cmd_cap_bytes
+            && req.section_meta_count <= self.section_meta_cap
+            && req.table_bytes <= self.table_cap_bytes
+            && req.out_bytes <= self.out_cap_bytes
+            && req.error_words <= self.error_cap_words
+    }
+
+    fn max_with(self, rhs: GpuDecodeSlotCaps) -> GpuDecodeSlotCaps {
+        GpuDecodeSlotCaps {
+            cmd_cap_bytes: self.cmd_cap_bytes.max(rhs.cmd_cap_bytes),
+            section_meta_cap: self.section_meta_cap.max(rhs.section_meta_cap),
+            table_cap_bytes: self.table_cap_bytes.max(rhs.table_cap_bytes),
+            out_cap_bytes: self.out_cap_bytes.max(rhs.out_cap_bytes),
+            error_cap_words: self.error_cap_words.max(rhs.error_cap_words),
+        }
+    }
+}
+
+struct GpuDecodeSlotBuffers {
+    cmd_buffer: wgpu::Buffer,
+    section_meta_buffer: wgpu::Buffer,
+    table_buffer: wgpu::Buffer,
+    out_buffer: wgpu::Buffer,
+    out_readback_buffer: wgpu::Buffer,
+    error_buffer: wgpu::Buffer,
+}
+
+struct GpuDecodeSlotEntry {
+    slot_index: usize,
+    generation: u64,
+    state: GpuDecodeSlotState,
+    caps: GpuDecodeSlotCaps,
+    buffers: GpuDecodeSlotBuffers,
+    decode_bind_group: wgpu::BindGroup,
+}
+
+#[derive(Default)]
+struct GpuDecodeSlotGroup {
+    caps: GpuDecodeSlotCaps,
+    slots: Vec<GpuDecodeSlotEntry>,
+}
+
+#[derive(Default)]
+struct GpuDecodeSlotPool {
+    normal: GpuDecodeSlotGroup,
+    large: GpuDecodeSlotGroup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct GpuDecodeSlotRequirement {
+    cmd_bytes: u64,
+    section_meta_count: usize,
+    table_bytes: u64,
+    out_bytes: u64,
+    error_words: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GpuDecodePayloadLayout {
+    table_count: usize,
+    table_index_start: usize,
+    table_data_start: usize,
+    table_end: usize,
+    cmd_start: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreparedGpuDecodeJob<'a> {
+    job: &'a GpuDecodeJob<'a>,
+    req: GpuDecodeSlotRequirement,
+    layout: GpuDecodePayloadLayout,
+}
+
+struct PendingGpuDecodeMap {
+    out_data_copy_len: u64,
+    out_total_copy_len: u64,
+    out_len: usize,
+    error_words: usize,
+    submit_seq: u64,
+    submit_ms: f64,
+    kernel_timestamp_ms: Option<f64>,
+    ts_readback_buffer: Option<wgpu::Buffer>,
+    ts_map_rx: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    submit_at: Instant,
+    completion_rx: mpsc::Receiver<()>,
+    map_rx: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct GpuDecodeV2WaitProfile {
+    submit_seq: u64,
+    submit_ms: f64,
+    submit_done_wait_ms: f64,
+    map_callback_wait_ms: f64,
+    map_copy_ms: f64,
+    kernel_timestamp_ms: f64,
+    queue_stall_est_ms: f64,
+}
+
+struct InflightGpuDecodeSubmission<'a> {
+    prepared: PreparedGpuDecodeJob<'a>,
+    class: GpuDecodeSlotClass,
+    slot_idx: usize,
+    slot_handle: GpuDecodeSlot,
+    pending: PendingGpuDecodeMap,
+    map_requested_at: Option<Instant>,
+    completion_done: bool,
+    map_done: Option<Result<(), PDeflateError>>,
+    wait_profile: GpuDecodeV2WaitProfile,
+}
+
 #[derive(Clone, Copy)]
 struct GpuSparsePackScratchCaps {
     params_bytes: u64,
@@ -2327,6 +2625,7 @@ struct GpuBatchScratchCaps {
 
 const GPU_SCRATCH_POOL_LIMIT: usize = 4;
 const GPU_SPARSE_PACK_POOL_LIMIT: usize = 16;
+const GPU_DECODE_LARGE_SLOT_INDEX_BASE: usize = 1 << 30;
 // Command stream cap heuristic for GPU section encode.
 // If this underestimates a pathological section, kernel marks overflow and
 // caller falls back to CPU for correctness.
@@ -2342,6 +2641,8 @@ static SPARSE_KERNEL_TS_PROBE_UNSUPPORTED_LOGGED: OnceLock<()> = OnceLock::new()
 static BUILD_TABLE_BREAKDOWN_SEQ: AtomicUsize = AtomicUsize::new(0);
 static RESOLVE_MAP_WAIT_PROBE_SEQ: AtomicUsize = AtomicUsize::new(0);
 static SPARSE_LENS_WAIT_PROBE_SEQ: AtomicUsize = AtomicUsize::new(0);
+static GPU_DECODE_V2_WAIT_PROBE_SEQ: AtomicUsize = AtomicUsize::new(0);
+static GPU_DECODE_V2_KERNEL_TS_UNSUPPORTED_LOGGED: OnceLock<()> = OnceLock::new();
 static BUILD_TABLE_DEVICE_SEQ: AtomicU64 = AtomicU64::new(0);
 static GPU_SUBMIT_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -2371,24 +2672,28 @@ fn queue_probe_enabled() -> bool {
 
 fn table_stage_probe_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("COZIP_PDEFLATE_PROFILE_TABLE_STAGE_PROBE") {
-        Ok(v) => {
-            let s = v.trim();
-            !(s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false"))
-        }
-        Err(_) => env_flag_enabled("COZIP_PDEFLATE_PROFILE"),
-    })
+    *ENABLED.get_or_init(
+        || match std::env::var("COZIP_PDEFLATE_PROFILE_TABLE_STAGE_PROBE") {
+            Ok(v) => {
+                let s = v.trim();
+                !(s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false"))
+            }
+            Err(_) => env_flag_enabled("COZIP_PDEFLATE_PROFILE"),
+        },
+    )
 }
 
 fn table_build_breakdown_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("COZIP_PDEFLATE_PROFILE_TABLE_BUILD_BREAKDOWN") {
-        Ok(v) => {
-            let s = v.trim();
-            !(s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false"))
-        }
-        Err(_) => env_flag_enabled("COZIP_PDEFLATE_PROFILE"),
-    })
+    *ENABLED.get_or_init(
+        || match std::env::var("COZIP_PDEFLATE_PROFILE_TABLE_BUILD_BREAKDOWN") {
+            Ok(v) => {
+                let s = v.trim();
+                !(s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false"))
+            }
+            Err(_) => env_flag_enabled("COZIP_PDEFLATE_PROFILE"),
+        },
+    )
 }
 
 fn resolve_map_wait_probe_enabled() -> bool {
@@ -2440,10 +2745,27 @@ fn sparse_kernel_ts_probe_enabled() -> bool {
     )
 }
 
+fn gpu_decode_v2_wait_probe_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        match std::env::var("COZIP_PDEFLATE_PROFILE_GPU_DECODE_V2_WAIT_PROBE") {
+            Ok(v) => {
+                let s = v.trim();
+                !(s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false"))
+            }
+            Err(_) => env_flag_enabled("COZIP_PDEFLATE_PROFILE"),
+        }
+    })
+}
+
+fn gpu_decode_v2_wait_probe_should_log(seq: usize) -> bool {
+    seq < 8 || seq % 64 == 0
+}
+
 fn sparse_inflight_submit_chunks() -> usize {
     static VALUE: OnceLock<usize> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        match std::env::var("COZIP_PDEFLATE_SPARSE_INFLIGHT_SUBMIT_CHUNKS") {
+    *VALUE.get_or_init(
+        || match std::env::var("COZIP_PDEFLATE_SPARSE_INFLIGHT_SUBMIT_CHUNKS") {
             Ok(v) => v
                 .trim()
                 .parse::<usize>()
@@ -2451,8 +2773,8 @@ fn sparse_inflight_submit_chunks() -> usize {
                 .filter(|n| *n > 0)
                 .unwrap_or(usize::MAX),
             Err(_) => 4,
-        }
-    })
+        },
+    )
 }
 
 fn table_stage_probe_should_log(seq: usize) -> bool {
@@ -2460,7 +2782,9 @@ fn table_stage_probe_should_log(seq: usize) -> bool {
 }
 
 fn next_gpu_submit_seq() -> u64 {
-    GPU_SUBMIT_SEQ.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+    GPU_SUBMIT_SEQ
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1)
 }
 
 fn wait_for_queue_done(queue: &wgpu::Queue, device: &wgpu::Device) -> (f64, u64) {
@@ -3447,7 +3771,6 @@ fn init_runtime() -> Result<GpuMatchRuntime, String> {
         module: &shader,
         entry_point: "main",
     });
-
     let pack_chunk_bind_group_layout =
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("cozip-pdeflate-pack-chunk-bgl"),
@@ -4864,6 +5187,78 @@ fn init_runtime() -> Result<GpuMatchRuntime, String> {
             module: &match_prepare_table_shader,
             entry_point: "main",
         });
+    let decode_v2_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cozip-pdeflate-decode-v2-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+    let decode_v2_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("cozip-pdeflate-decode-v2-shader"),
+        source: wgpu::ShaderSource::Wgsl(DECODE_V2_SHADER.into()),
+    });
+    let decode_v2_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("cozip-pdeflate-decode-v2-pl"),
+            bind_group_layouts: &[&decode_v2_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+    let decode_v2_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("cozip-pdeflate-decode-v2-pipeline"),
+        layout: Some(&decode_v2_pipeline_layout),
+        module: &decode_v2_shader,
+        entry_point: "main",
+    });
     let pack_sparse_stats_zero_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("cozip-pdeflate-pack-sparse-stats-zero"),
         size: 32,
@@ -4915,11 +5310,14 @@ fn init_runtime() -> Result<GpuMatchRuntime, String> {
         build_table_pack_index_pipeline,
         match_prepare_table_bind_group_layout,
         match_prepare_table_pipeline,
+        decode_v2_bind_group_layout,
+        decode_v2_pipeline,
         max_storage_binding_size,
         scratch_pool: Mutex::new(Vec::new()),
         scratch_hot: Mutex::new(None),
         sparse_pack_pool: Mutex::new(Vec::new()),
         sparse_pack_hot: Mutex::new(None),
+        decode_slot_pool: Mutex::new(GpuDecodeSlotPool::default()),
     })
 }
 
@@ -6081,7 +6479,9 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
             }
         }
         phase1_wait_ready_total = phase1_wait_ready_total.saturating_add(collected_after_wait);
-        if collected_after_wait == 0 && (remaining_sizes > 0 || sparse_stats_pending || sparse_ts_pending) {
+        if collected_after_wait == 0
+            && (remaining_sizes > 0 || sparse_stats_pending || sparse_ts_pending)
+        {
             return Err(PDeflateError::Gpu(
                 "gpu sparse size/stats pending stalled after wait".to_string(),
             ));
@@ -6099,7 +6499,8 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
             let ticks: &[u64] = bytemuck::cast_slice(&mapped);
             let period_ms = (r.queue.get_timestamp_period() as f64) / 1_000_000.0;
             for dispatch_idx in 0..inputs.len() {
-                let stage_base = dispatch_idx.saturating_mul(SPARSE_KERNEL_STAGE_QUERY_COUNT as usize);
+                let stage_base =
+                    dispatch_idx.saturating_mul(SPARSE_KERNEL_STAGE_QUERY_COUNT as usize);
                 if stage_base + 3 < ticks.len() {
                     let t0 = ticks[stage_base];
                     let t1 = ticks[stage_base + 1];
@@ -6149,9 +6550,8 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
         let total_words_u32 = *size_words.get(11).unwrap_or(&0);
         drop(size_mapped);
         dispatch_jobs[idx].scratch.params_readback_buffer.unmap();
-        payload_table_counts.push(
-            usize::try_from(table_count_u32).map_err(|_| PDeflateError::NumericOverflow)?,
-        );
+        payload_table_counts
+            .push(usize::try_from(table_count_u32).map_err(|_| PDeflateError::NumericOverflow)?);
 
         if total_len_u32 == 0xffff_ffff || total_words_u32 == 0 {
             return Err(PDeflateError::Gpu(
@@ -6194,7 +6594,8 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
     r.queue.submit(Some(payload_encoder.finish()));
     let payload_submit_ms = elapsed_ms(t_payload_submit);
     submit_ms += payload_submit_ms;
-    let payload_upload_dispatch_ms = (elapsed_ms(t_payload_submit_all) - payload_submit_ms).max(0.0);
+    let payload_upload_dispatch_ms =
+        (elapsed_ms(t_payload_submit_all) - payload_submit_ms).max(0.0);
     upload_ms += payload_upload_dispatch_ms;
     upload_dispatch_ms += payload_upload_dispatch_ms;
 
@@ -6294,8 +6695,9 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
             } else {
                 0u64
             };
-            let payload_readback_bytes =
-                payload_copy_bytes.iter().fold(0u64, |acc, v| acc.saturating_add(*v));
+            let payload_readback_bytes = payload_copy_bytes
+                .iter()
+                .fold(0u64, |acc, v| acc.saturating_add(*v));
             let readback_bytes = size_readback_bytes
                 .saturating_add(stats_readback_bytes)
                 .saturating_add(ts_readback_bytes)
@@ -6389,9 +6791,7 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
                         phase1_submit_done_wait_ms,
                         sparse_ts_queue_stall_est_ms,
                         sparse_ts_parse_ms,
-                        sparse_ts_map_status
-                            .as_deref()
-                            .unwrap_or("ok"),
+                        sparse_ts_map_status.as_deref().unwrap_or("ok"),
                     );
                 }
             }
@@ -6945,6 +7345,1296 @@ pub(crate) fn read_section_commands_from_device_batch(
 
 pub(crate) fn is_runtime_available() -> bool {
     runtime().is_ok()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_decode_slot_pool_for_test() -> Result<(), PDeflateError> {
+    let runtime = runtime()?;
+    let mut pool = runtime
+        .decode_slot_pool
+        .lock()
+        .map_err(|_| PDeflateError::Gpu("gpu decode slot pool mutex poisoned".to_string()))?;
+    *pool = GpuDecodeSlotPool::default();
+    Ok(())
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GpuDecodeSlot {
+    pub slot_index: usize,
+    pub generation: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GpuDecodeSectionMeta {
+    pub cmd_offset: usize,
+    pub cmd_len: usize,
+    pub out_offset: usize,
+    pub out_len: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct GpuDecodeJob<'a> {
+    pub chunk_index: usize,
+    pub payload: &'a [u8],
+    pub table_count: usize,
+    pub chunk_uncompressed_len: usize,
+    pub out_offset: usize,
+    pub out_len: usize,
+    pub section_meta: Vec<GpuDecodeSectionMeta>,
+    pub preferred_slot: Option<GpuDecodeSlot>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GpuDecodeDisposition {
+    SubmittedGpu,
+    CpuFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GpuDecodeResult {
+    pub chunk_index: usize,
+    pub slot: Option<GpuDecodeSlot>,
+    pub disposition: GpuDecodeDisposition,
+    pub decoded_chunk: Option<Vec<u8>>,
+}
+
+fn decode_fallback_results(jobs: &[GpuDecodeJob<'_>]) -> Vec<GpuDecodeResult> {
+    jobs.iter()
+        .map(|job| GpuDecodeResult {
+            chunk_index: job.chunk_index,
+            slot: None,
+            disposition: GpuDecodeDisposition::CpuFallback,
+            decoded_chunk: None,
+        })
+        .collect()
+}
+
+fn read_le_u16_at(src: &[u8], offset: usize) -> Result<u16, PDeflateError> {
+    let end = offset
+        .checked_add(2)
+        .ok_or(PDeflateError::NumericOverflow)?;
+    let bytes = src.get(offset..end).ok_or(PDeflateError::InvalidStream(
+        "gpu decode chunk header truncated",
+    ))?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_le_u32_at(src: &[u8], offset: usize) -> Result<u32, PDeflateError> {
+    let end = offset
+        .checked_add(4)
+        .ok_or(PDeflateError::NumericOverflow)?;
+    let bytes = src.get(offset..end).ok_or(PDeflateError::InvalidStream(
+        "gpu decode chunk header truncated",
+    ))?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn parse_gpu_decode_payload_layout(
+    payload: &[u8],
+) -> Result<GpuDecodePayloadLayout, PDeflateError> {
+    if payload.len() < PACK_CHUNK_HEADER_SIZE {
+        return Err(PDeflateError::InvalidStream(
+            "gpu decode chunk header truncated",
+        ));
+    }
+    let magic = payload.get(0..4).ok_or(PDeflateError::InvalidStream(
+        "gpu decode chunk header truncated",
+    ))?;
+    if magic != PACK_CHUNK_MAGIC {
+        return Err(PDeflateError::InvalidStream("gpu decode bad chunk magic"));
+    }
+    let version = read_le_u16_at(payload, 4)?;
+    if version != PACK_CHUNK_VERSION {
+        return Err(PDeflateError::InvalidStream(
+            "gpu decode unsupported chunk version",
+        ));
+    }
+    let table_count = usize::from(read_le_u16_at(payload, 12)?);
+    if table_count > GPU_DECODE_MAX_TABLE_ID {
+        return Err(PDeflateError::InvalidStream(
+            "gpu decode table_count too large",
+        ));
+    }
+    let table_index_offset = usize::try_from(read_le_u32_at(payload, 16)?)
+        .map_err(|_| PDeflateError::NumericOverflow)?;
+    let table_data_offset = usize::try_from(read_le_u32_at(payload, 20)?)
+        .map_err(|_| PDeflateError::NumericOverflow)?;
+    let section_index_offset = usize::try_from(read_le_u32_at(payload, 24)?)
+        .map_err(|_| PDeflateError::NumericOverflow)?;
+    let section_cmd_offset = usize::try_from(read_le_u32_at(payload, 28)?)
+        .map_err(|_| PDeflateError::NumericOverflow)?;
+    if !(table_index_offset <= table_data_offset
+        && table_data_offset <= section_index_offset
+        && section_index_offset <= section_cmd_offset
+        && section_cmd_offset <= payload.len())
+    {
+        return Err(PDeflateError::InvalidStream(
+            "gpu decode chunk offsets invalid",
+        ));
+    }
+    if table_index_offset != PACK_CHUNK_HEADER_SIZE {
+        return Err(PDeflateError::InvalidStream(
+            "gpu decode unexpected table_index_offset",
+        ));
+    }
+    let table_index_len = table_data_offset.saturating_sub(table_index_offset);
+    if table_index_len != table_count {
+        return Err(PDeflateError::InvalidStream(
+            "gpu decode table index length mismatch",
+        ));
+    }
+    Ok(GpuDecodePayloadLayout {
+        table_count,
+        table_index_start: table_index_offset,
+        table_data_start: table_data_offset,
+        table_end: section_index_offset,
+        cmd_start: section_cmd_offset,
+    })
+}
+
+fn gpu_decode_slot_split(slot_count: usize) -> (usize, usize) {
+    let total = slot_count.max(1);
+    if total == 1 {
+        return (1, 0);
+    }
+    let large = if total >= 4 { (total / 4).max(1) } else { 1 };
+    let normal = total.saturating_sub(large).max(1);
+    (normal, total.saturating_sub(normal))
+}
+
+fn gpu_decode_normal_caps(options: &PDeflateOptions) -> Result<GpuDecodeSlotCaps, PDeflateError> {
+    let base_table = options
+        .max_table_entries
+        .saturating_mul(GPU_DECODE_TABLE_REPEAT_STRIDE)
+        .max(4096);
+    Ok(GpuDecodeSlotCaps {
+        cmd_cap_bytes: u64::try_from(options.chunk_size.saturating_mul(2).max(64 * 1024))
+            .map_err(|_| PDeflateError::NumericOverflow)?,
+        section_meta_cap: options.section_count.max(1),
+        table_cap_bytes: u64::try_from(base_table).map_err(|_| PDeflateError::NumericOverflow)?,
+        out_cap_bytes: u64::try_from(options.chunk_size.max(64 * 1024))
+            .map_err(|_| PDeflateError::NumericOverflow)?,
+        error_cap_words: options.section_count.max(1),
+    })
+}
+
+fn gpu_decode_large_caps(base: GpuDecodeSlotCaps) -> GpuDecodeSlotCaps {
+    GpuDecodeSlotCaps {
+        cmd_cap_bytes: base.cmd_cap_bytes.saturating_mul(2),
+        section_meta_cap: base.section_meta_cap.saturating_mul(2),
+        table_cap_bytes: base.table_cap_bytes.saturating_mul(2),
+        out_cap_bytes: base.out_cap_bytes.saturating_mul(2),
+        error_cap_words: base.error_cap_words.saturating_mul(2),
+    }
+}
+
+fn build_gpu_decode_slot_requirement(
+    job: &GpuDecodeJob<'_>,
+    layout: GpuDecodePayloadLayout,
+) -> Result<GpuDecodeSlotRequirement, PDeflateError> {
+    if job.table_count != layout.table_count {
+        return Err(PDeflateError::InvalidStream(
+            "gpu decode table_count mismatch",
+        ));
+    }
+    if layout.cmd_start > job.payload.len() || layout.table_end > job.payload.len() {
+        return Err(PDeflateError::InvalidStream(
+            "gpu decode payload layout out of bounds",
+        ));
+    }
+    let cmd_bytes = u64::try_from(job.payload.len().saturating_sub(layout.cmd_start))
+        .map_err(|_| PDeflateError::NumericOverflow)?;
+    let table_repeat_bytes = layout
+        .table_count
+        .checked_mul(GPU_DECODE_TABLE_REPEAT_STRIDE)
+        .ok_or(PDeflateError::NumericOverflow)?;
+    let table_bytes =
+        u64::try_from(table_repeat_bytes).map_err(|_| PDeflateError::NumericOverflow)?;
+    let out_bytes =
+        u64::try_from(job.chunk_uncompressed_len).map_err(|_| PDeflateError::NumericOverflow)?;
+    Ok(GpuDecodeSlotRequirement {
+        cmd_bytes,
+        section_meta_count: job.section_meta.len(),
+        table_bytes,
+        out_bytes,
+        error_words: job.section_meta.len().max(1),
+    })
+}
+
+fn create_gpu_decode_slot_entry(
+    runtime: &GpuMatchRuntime,
+    class: GpuDecodeSlotClass,
+    local_index: usize,
+    caps: GpuDecodeSlotCaps,
+) -> Result<GpuDecodeSlotEntry, PDeflateError> {
+    let index_base = match class {
+        GpuDecodeSlotClass::Normal => 0usize,
+        GpuDecodeSlotClass::Large => GPU_DECODE_LARGE_SLOT_INDEX_BASE,
+    };
+    let slot_index = index_base
+        .checked_add(local_index)
+        .ok_or(PDeflateError::NumericOverflow)?;
+    let cmd_size = u64::try_from(align_up4(
+        usize::try_from(caps.cmd_cap_bytes).map_err(|_| PDeflateError::NumericOverflow)?,
+    ))
+    .map_err(|_| PDeflateError::NumericOverflow)?
+    .max(4);
+    let section_meta_size = u64::try_from(
+        GPU_DECODE_SECTION_META_HEADER_WORDS
+            .saturating_add(
+                caps.section_meta_cap
+                    .saturating_mul(GPU_DECODE_SECTION_META_WORDS),
+            )
+            .saturating_mul(std::mem::size_of::<u32>()),
+    )
+    .map_err(|_| PDeflateError::NumericOverflow)?
+    .max(4);
+    let table_size = u64::try_from(align_up4(
+        usize::try_from(caps.table_cap_bytes).map_err(|_| PDeflateError::NumericOverflow)?,
+    ))
+    .map_err(|_| PDeflateError::NumericOverflow)?
+    .max(4);
+    let out_size = u64::try_from(align_up4(
+        usize::try_from(caps.out_cap_bytes).map_err(|_| PDeflateError::NumericOverflow)?,
+    ))
+    .map_err(|_| PDeflateError::NumericOverflow)?
+    .max(4);
+    let error_size = u64::try_from(
+        caps.error_cap_words
+            .saturating_mul(std::mem::size_of::<u32>()),
+    )
+    .map_err(|_| PDeflateError::NumericOverflow)?
+    .max(4);
+    let class_label = match class {
+        GpuDecodeSlotClass::Normal => "normal",
+        GpuDecodeSlotClass::Large => "large",
+    };
+    let cmd_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(&format!(
+            "cozip-pdeflate-decode-v2-{}-cmd-slot-{}",
+            class_label, local_index
+        )),
+        size: cmd_size,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let section_meta_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(&format!(
+            "cozip-pdeflate-decode-v2-{}-section-meta-slot-{}",
+            class_label, local_index
+        )),
+        size: section_meta_size,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let table_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(&format!(
+            "cozip-pdeflate-decode-v2-{}-table-slot-{}",
+            class_label, local_index
+        )),
+        size: table_size,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let out_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(&format!(
+            "cozip-pdeflate-decode-v2-{}-out-slot-{}",
+            class_label, local_index
+        )),
+        size: out_size,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let out_readback_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(&format!(
+            "cozip-pdeflate-decode-v2-{}-out-readback-slot-{}",
+            class_label, local_index
+        )),
+        size: out_size
+            .checked_add(error_size)
+            .ok_or(PDeflateError::NumericOverflow)?,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let error_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(&format!(
+            "cozip-pdeflate-decode-v2-{}-error-slot-{}",
+            class_label, local_index
+        )),
+        size: error_size,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let decode_bind_group = runtime
+        .device
+        .create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(&format!(
+                "cozip-pdeflate-decode-v2-{}-bg-slot-{}",
+                class_label, local_index
+            )),
+            layout: &runtime.decode_v2_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: cmd_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: section_meta_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: table_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: out_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: error_buffer.as_entire_binding(),
+                },
+            ],
+        });
+    Ok(GpuDecodeSlotEntry {
+        slot_index,
+        generation: 0,
+        state: GpuDecodeSlotState::Free,
+        caps,
+        buffers: GpuDecodeSlotBuffers {
+            cmd_buffer,
+            section_meta_buffer,
+            table_buffer,
+            out_buffer,
+            out_readback_buffer,
+            error_buffer,
+        },
+        decode_bind_group,
+    })
+}
+
+fn ensure_gpu_decode_slot_group(
+    runtime: &GpuMatchRuntime,
+    group: &mut GpuDecodeSlotGroup,
+    class: GpuDecodeSlotClass,
+    target_count: usize,
+    target_caps: GpuDecodeSlotCaps,
+) -> Result<(), PDeflateError> {
+    if target_count == 0 {
+        group.caps = target_caps;
+        group.slots.clear();
+        return Ok(());
+    }
+    let merged_caps = group.caps.max_with(target_caps);
+    if group.slots.is_empty() || merged_caps != group.caps {
+        group.caps = merged_caps;
+        group.slots.clear();
+    } else {
+        group.caps = merged_caps;
+    }
+    while group.slots.len() < target_count {
+        let local_index = group.slots.len();
+        group.slots.push(create_gpu_decode_slot_entry(
+            runtime,
+            class,
+            local_index,
+            group.caps,
+        )?);
+    }
+    Ok(())
+}
+
+fn recycle_gpu_decode_ready_slots(group: &mut GpuDecodeSlotGroup) {
+    for slot in &mut group.slots {
+        if slot.state == GpuDecodeSlotState::Ready {
+            slot.state = GpuDecodeSlotState::Free;
+        }
+    }
+}
+
+fn acquire_gpu_decode_slot(
+    group: &mut GpuDecodeSlotGroup,
+    req: GpuDecodeSlotRequirement,
+) -> Option<(usize, GpuDecodeSlot)> {
+    if !group.caps.fits(req) {
+        return None;
+    }
+    for (idx, slot) in group.slots.iter_mut().enumerate() {
+        if slot.state == GpuDecodeSlotState::Free {
+            slot.state = GpuDecodeSlotState::Inflight;
+            slot.generation = slot.generation.saturating_add(1);
+            return Some((
+                idx,
+                GpuDecodeSlot {
+                    slot_index: slot.slot_index,
+                    generation: slot.generation,
+                },
+            ));
+        }
+    }
+    None
+}
+
+fn acquire_preferred_gpu_decode_slot(
+    group: &mut GpuDecodeSlotGroup,
+    req: GpuDecodeSlotRequirement,
+    preferred: GpuDecodeSlot,
+) -> Option<(usize, GpuDecodeSlot)> {
+    if !group.caps.fits(req) {
+        return None;
+    }
+    for (idx, slot) in group.slots.iter_mut().enumerate() {
+        if slot.slot_index != preferred.slot_index
+            || slot.generation != preferred.generation
+            || slot.state != GpuDecodeSlotState::Free
+        {
+            continue;
+        }
+        slot.state = GpuDecodeSlotState::Inflight;
+        slot.generation = slot.generation.saturating_add(1);
+        return Some((
+            idx,
+            GpuDecodeSlot {
+                slot_index: slot.slot_index,
+                generation: slot.generation,
+            },
+        ));
+    }
+    None
+}
+
+fn mark_gpu_decode_slot_ready(group: &mut GpuDecodeSlotGroup, slot_idx: usize) {
+    if let Some(slot) = group.slots.get_mut(slot_idx) {
+        if slot.state == GpuDecodeSlotState::Inflight {
+            slot.state = GpuDecodeSlotState::Ready;
+        }
+    }
+}
+
+fn mark_gpu_decode_slot_free(group: &mut GpuDecodeSlotGroup, slot_idx: usize) {
+    if let Some(slot) = group.slots.get_mut(slot_idx) {
+        slot.state = GpuDecodeSlotState::Free;
+    }
+}
+
+fn try_acquire_gpu_decode_slot_for_job(
+    pool: &mut GpuDecodeSlotPool,
+    prepared: PreparedGpuDecodeJob<'_>,
+) -> Option<(GpuDecodeSlotClass, usize, GpuDecodeSlot)> {
+    let prefer_large = !pool.normal.caps.fits(prepared.req);
+    if let Some(preferred) = prepared.job.preferred_slot {
+        if preferred.slot_index >= GPU_DECODE_LARGE_SLOT_INDEX_BASE {
+            if let Some((idx, slot)) =
+                acquire_preferred_gpu_decode_slot(&mut pool.large, prepared.req, preferred)
+            {
+                return Some((GpuDecodeSlotClass::Large, idx, slot));
+            }
+        } else if let Some((idx, slot)) =
+            acquire_preferred_gpu_decode_slot(&mut pool.normal, prepared.req, preferred)
+        {
+            return Some((GpuDecodeSlotClass::Normal, idx, slot));
+        }
+    }
+    if prefer_large {
+        if let Some((idx, slot)) = acquire_gpu_decode_slot(&mut pool.large, prepared.req) {
+            return Some((GpuDecodeSlotClass::Large, idx, slot));
+        }
+        if let Some((idx, slot)) = acquire_gpu_decode_slot(&mut pool.normal, prepared.req) {
+            return Some((GpuDecodeSlotClass::Normal, idx, slot));
+        }
+    } else {
+        if let Some((idx, slot)) = acquire_gpu_decode_slot(&mut pool.normal, prepared.req) {
+            return Some((GpuDecodeSlotClass::Normal, idx, slot));
+        }
+        if let Some((idx, slot)) = acquire_gpu_decode_slot(&mut pool.large, prepared.req) {
+            return Some((GpuDecodeSlotClass::Large, idx, slot));
+        }
+    }
+    None
+}
+
+fn build_gpu_decode_table_repeat_bytes(
+    payload: &[u8],
+    layout: GpuDecodePayloadLayout,
+) -> Result<Vec<u8>, PDeflateError> {
+    let table_index = payload
+        .get(layout.table_index_start..layout.table_data_start)
+        .ok_or(PDeflateError::InvalidStream(
+            "gpu decode table index slice out of bounds",
+        ))?;
+    if table_index.len() != layout.table_count {
+        return Err(PDeflateError::InvalidStream(
+            "gpu decode table index length mismatch",
+        ));
+    }
+    let table_data = payload
+        .get(layout.table_data_start..layout.table_end)
+        .ok_or(PDeflateError::InvalidStream(
+            "gpu decode table data slice out of bounds",
+        ))?;
+    let mut table_offsets = Vec::with_capacity(layout.table_count.saturating_add(1));
+    table_offsets.push(0usize);
+    for &entry_len_u8 in table_index {
+        if entry_len_u8 == 0 {
+            return Err(PDeflateError::InvalidStream(
+                "gpu decode table entry len is zero",
+            ));
+        }
+        let next = table_offsets
+            .last()
+            .copied()
+            .ok_or(PDeflateError::NumericOverflow)?
+            .checked_add(usize::from(entry_len_u8))
+            .ok_or(PDeflateError::NumericOverflow)?;
+        table_offsets.push(next);
+    }
+    if table_offsets.last().copied().unwrap_or(0) != table_data.len() {
+        return Err(PDeflateError::InvalidStream(
+            "gpu decode table data length mismatch",
+        ));
+    }
+    let repeat_total = layout
+        .table_count
+        .checked_mul(GPU_DECODE_TABLE_REPEAT_STRIDE)
+        .ok_or(PDeflateError::NumericOverflow)?;
+    let mut table_repeat = vec![0u8; repeat_total];
+    for id in 0..layout.table_count {
+        let t0 = table_offsets[id];
+        let t1 = table_offsets[id + 1];
+        let entry = table_data.get(t0..t1).ok_or(PDeflateError::InvalidStream(
+            "gpu decode table entry range invalid",
+        ))?;
+        if entry.is_empty() {
+            return Err(PDeflateError::InvalidStream("gpu decode empty table entry"));
+        }
+        let dst = &mut table_repeat
+            [id * GPU_DECODE_TABLE_REPEAT_STRIDE..(id + 1) * GPU_DECODE_TABLE_REPEAT_STRIDE];
+        for i in 0..dst.len() {
+            dst[i] = entry[i % entry.len()];
+        }
+    }
+    Ok(table_repeat)
+}
+
+fn upload_gpu_decode_job_to_slot(
+    runtime: &GpuMatchRuntime,
+    slot: &GpuDecodeSlotEntry,
+    prepared: PreparedGpuDecodeJob<'_>,
+) -> Result<(), PDeflateError> {
+    let table_repeat_bytes =
+        build_gpu_decode_table_repeat_bytes(prepared.job.payload, prepared.layout)?;
+    let cmd_bytes = prepared
+        .job
+        .payload
+        .get(prepared.layout.cmd_start..)
+        .ok_or(PDeflateError::InvalidStream(
+            "gpu decode cmd slice out of bounds",
+        ))?;
+    let mut section_meta_words = Vec::<u32>::with_capacity(
+        GPU_DECODE_SECTION_META_HEADER_WORDS
+            .saturating_add(prepared.job.section_meta.len() * GPU_DECODE_SECTION_META_WORDS),
+    );
+    section_meta_words.push(
+        u32::try_from(prepared.job.section_meta.len())
+            .map_err(|_| PDeflateError::NumericOverflow)?,
+    );
+    section_meta_words.push(
+        u32::try_from(prepared.layout.table_count).map_err(|_| PDeflateError::NumericOverflow)?,
+    );
+    section_meta_words.push(
+        u32::try_from(GPU_DECODE_TABLE_REPEAT_STRIDE)
+            .map_err(|_| PDeflateError::NumericOverflow)?,
+    );
+    section_meta_words.push(0u32);
+    for section in &prepared.job.section_meta {
+        let cmd_end = section
+            .cmd_offset
+            .checked_add(section.cmd_len)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        if cmd_end > cmd_bytes.len() {
+            return Err(PDeflateError::InvalidStream(
+                "gpu decode section cmd range out of bounds",
+            ));
+        }
+        let out_end = section
+            .out_offset
+            .checked_add(section.out_len)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        if out_end > prepared.job.chunk_uncompressed_len {
+            return Err(PDeflateError::InvalidStream(
+                "gpu decode section out range out of bounds",
+            ));
+        }
+        section_meta_words
+            .push(u32::try_from(section.cmd_offset).map_err(|_| PDeflateError::NumericOverflow)?);
+        section_meta_words
+            .push(u32::try_from(section.cmd_len).map_err(|_| PDeflateError::NumericOverflow)?);
+        section_meta_words
+            .push(u32::try_from(section.out_offset).map_err(|_| PDeflateError::NumericOverflow)?);
+        section_meta_words
+            .push(u32::try_from(section.out_len).map_err(|_| PDeflateError::NumericOverflow)?);
+    }
+    if !cmd_bytes.is_empty() {
+        let cmd_words = pack_bytes_to_words(cmd_bytes);
+        runtime.queue.write_buffer(
+            &slot.buffers.cmd_buffer,
+            0,
+            bytemuck::cast_slice(&cmd_words),
+        );
+    }
+    if !table_repeat_bytes.is_empty() {
+        let table_words = pack_bytes_to_words(&table_repeat_bytes);
+        runtime.queue.write_buffer(
+            &slot.buffers.table_buffer,
+            0,
+            bytemuck::cast_slice(&table_words),
+        );
+    }
+    runtime.queue.write_buffer(
+        &slot.buffers.section_meta_buffer,
+        0,
+        bytemuck::cast_slice(&section_meta_words),
+    );
+    let zero = vec![0u32; prepared.job.section_meta.len().max(1)];
+    runtime
+        .queue
+        .write_buffer(&slot.buffers.error_buffer, 0, bytemuck::cast_slice(&zero));
+    Ok(())
+}
+
+fn submit_gpu_decode_job_on_slot(
+    runtime: &GpuMatchRuntime,
+    slot: &GpuDecodeSlotEntry,
+    prepared: PreparedGpuDecodeJob<'_>,
+    kernel_ts_probe: bool,
+) -> Result<PendingGpuDecodeMap, PDeflateError> {
+    let out_data_copy_len = u64::try_from(align_up4(prepared.job.chunk_uncompressed_len))
+        .map_err(|_| PDeflateError::NumericOverflow)?
+        .max(4);
+    let error_words = prepared.job.section_meta.len().max(1);
+    let err_copy_len = u64::try_from(error_words.saturating_mul(std::mem::size_of::<u32>()))
+        .map_err(|_| PDeflateError::NumericOverflow)?
+        .max(4);
+    let out_total_copy_len = out_data_copy_len
+        .checked_add(err_copy_len)
+        .ok_or(PDeflateError::NumericOverflow)?;
+    let mut encoder = runtime
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("cozip-pdeflate-decode-v2-encoder"),
+        });
+    let mut ts_readback_buffer = None;
+    let mut ts_query_set = None;
+    let mut ts_resolve_buffer = None;
+    if kernel_ts_probe {
+        ts_query_set = Some(runtime.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("cozip-pdeflate-decode-v2-ts-query"),
+            ty: wgpu::QueryType::Timestamp,
+            count: 2,
+        }));
+        ts_resolve_buffer = Some(runtime.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-decode-v2-ts-resolve"),
+            size: 16,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        }));
+        ts_readback_buffer = Some(runtime.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-decode-v2-ts-readback"),
+            size: 16,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        }));
+    }
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("cozip-pdeflate-decode-v2-pass"),
+            timestamp_writes: ts_query_set.as_ref().map(|query_set| {
+                wgpu::ComputePassTimestampWrites {
+                    query_set,
+                    beginning_of_pass_write_index: Some(0),
+                    end_of_pass_write_index: Some(1),
+                }
+            }),
+        });
+        pass.set_pipeline(&runtime.decode_v2_pipeline);
+        pass.set_bind_group(0, &slot.decode_bind_group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    if let (Some(query_set), Some(resolve_buffer), Some(readback_buffer)) = (
+        ts_query_set.as_ref(),
+        ts_resolve_buffer.as_ref(),
+        ts_readback_buffer.as_ref(),
+    ) {
+        encoder.resolve_query_set(query_set, 0..2, resolve_buffer, 0);
+        encoder.copy_buffer_to_buffer(resolve_buffer, 0, readback_buffer, 0, 16);
+    }
+    encoder.copy_buffer_to_buffer(
+        &slot.buffers.out_buffer,
+        0,
+        &slot.buffers.out_readback_buffer,
+        0,
+        out_data_copy_len,
+    );
+    encoder.copy_buffer_to_buffer(
+        &slot.buffers.error_buffer,
+        0,
+        &slot.buffers.out_readback_buffer,
+        out_data_copy_len,
+        err_copy_len,
+    );
+    let submit_seq = next_gpu_submit_seq();
+    let t_submit = Instant::now();
+    let _submission = runtime.queue.submit(Some(encoder.finish()));
+    let submit_ms = elapsed_ms(t_submit);
+    let (done_tx, done_rx) = mpsc::channel();
+    runtime.queue.on_submitted_work_done(move || {
+        let _ = done_tx.send(());
+    });
+    Ok(PendingGpuDecodeMap {
+        out_data_copy_len,
+        out_total_copy_len,
+        out_len: prepared.job.chunk_uncompressed_len,
+        error_words,
+        submit_seq,
+        submit_ms,
+        kernel_timestamp_ms: if kernel_ts_probe {
+            None
+        } else {
+            Some(f64::NAN)
+        },
+        ts_readback_buffer,
+        ts_map_rx: None,
+        submit_at: Instant::now(),
+        completion_rx: done_rx,
+        map_rx: None,
+    })
+}
+
+fn collect_gpu_decode_job_from_slot(
+    slot: &GpuDecodeSlotEntry,
+    pending: &PendingGpuDecodeMap,
+) -> Result<(Option<Vec<u8>>, f64), PDeflateError> {
+    let t_collect = Instant::now();
+    let error_bytes = pending
+        .error_words
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(PDeflateError::NumericOverflow)?;
+    let out_slice = slot
+        .buffers
+        .out_readback_buffer
+        .slice(..pending.out_total_copy_len);
+    let mapped = out_slice.get_mapped_range();
+    let out_data_offset =
+        usize::try_from(pending.out_data_copy_len).map_err(|_| PDeflateError::NumericOverflow)?;
+    let err_end = out_data_offset
+        .checked_add(error_bytes)
+        .ok_or(PDeflateError::NumericOverflow)?
+        .min(mapped.len());
+    let mut has_error = false;
+    if pending.out_len > out_data_offset {
+        drop(mapped);
+        slot.buffers.out_readback_buffer.unmap();
+        return Err(PDeflateError::Gpu(
+            "gpu decode readback payload length out of bounds".to_string(),
+        ));
+    }
+    if pending.error_words > 0 {
+        if err_end < out_data_offset || err_end > mapped.len() {
+            drop(mapped);
+            slot.buffers.out_readback_buffer.unmap();
+            return Err(PDeflateError::Gpu(
+                "gpu decode readback error trailer out of bounds".to_string(),
+            ));
+        }
+        let err_words: &[u32] = bytemuck::cast_slice(&mapped[out_data_offset..err_end]);
+        has_error = err_words
+            .iter()
+            .take(pending.error_words)
+            .copied()
+            .any(|code| code != 0);
+    }
+    let result = if has_error {
+        Ok(None)
+    } else {
+        let mut decoded = vec![0u8; pending.out_len];
+        if !decoded.is_empty() {
+            decoded.copy_from_slice(&mapped[..pending.out_len]);
+        }
+        Ok(Some(decoded))
+    };
+    drop(mapped);
+    slot.buffers.out_readback_buffer.unmap();
+    result.map(|decoded_chunk| (decoded_chunk, elapsed_ms(t_collect)))
+}
+
+pub(crate) fn decode_chunks_gpu_v2(
+    jobs: &[GpuDecodeJob<'_>],
+    options: &PDeflateOptions,
+) -> Result<Vec<GpuDecodeResult>, PDeflateError> {
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let gpu_requested = options.gpu_decompress_enabled || options.gpu_decompress_force_gpu;
+    if !gpu_requested || !is_runtime_available() {
+        return Ok(decode_fallback_results(jobs));
+    }
+    let runtime = runtime()?;
+
+    let mut prepared_jobs = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        let layout = parse_gpu_decode_payload_layout(job.payload)?;
+        let req = build_gpu_decode_slot_requirement(job, layout)?;
+        prepared_jobs.push(PreparedGpuDecodeJob { job, req, layout });
+    }
+
+    let (normal_target_count, large_target_count) = gpu_decode_slot_split(options.gpu_slot_count);
+    let normal_base = gpu_decode_normal_caps(options)?;
+    let mut large_base = gpu_decode_large_caps(normal_base);
+    let mut normal_req_max = GpuDecodeSlotCaps::default();
+    let mut large_req_max = GpuDecodeSlotCaps::default();
+    for prepared in &prepared_jobs {
+        let req_caps = GpuDecodeSlotCaps {
+            cmd_cap_bytes: prepared.req.cmd_bytes,
+            section_meta_cap: prepared.req.section_meta_count,
+            table_cap_bytes: prepared.req.table_bytes,
+            out_cap_bytes: prepared.req.out_bytes,
+            error_cap_words: prepared.req.error_words,
+        };
+        if normal_base.fits(prepared.req) {
+            normal_req_max = normal_req_max.max_with(req_caps);
+        } else {
+            large_req_max = large_req_max.max_with(req_caps);
+        }
+    }
+    let normal_target_caps = normal_base.max_with(normal_req_max);
+    if large_req_max.cmd_cap_bytes > 0
+        || large_req_max.section_meta_cap > 0
+        || large_req_max.table_cap_bytes > 0
+        || large_req_max.out_cap_bytes > 0
+        || large_req_max.error_cap_words > 0
+    {
+        large_base = large_base.max_with(large_req_max);
+    }
+
+    let mut pool = runtime
+        .decode_slot_pool
+        .lock()
+        .map_err(|_| PDeflateError::Gpu("gpu decode slot pool mutex poisoned".to_string()))?;
+    ensure_gpu_decode_slot_group(
+        runtime,
+        &mut pool.normal,
+        GpuDecodeSlotClass::Normal,
+        normal_target_count,
+        normal_target_caps,
+    )?;
+    ensure_gpu_decode_slot_group(
+        runtime,
+        &mut pool.large,
+        GpuDecodeSlotClass::Large,
+        large_target_count,
+        large_base,
+    )?;
+
+    let micro_submit = options.gpu_submit_chunks.max(1);
+    let max_inflight = options.gpu_slot_count.max(1);
+    let wait_probe_enabled = gpu_decode_v2_wait_probe_enabled();
+    let kernel_ts_probe = wait_probe_enabled && runtime.supports_timestamp_query;
+    if wait_probe_enabled && !runtime.supports_timestamp_query {
+        let _ = GPU_DECODE_V2_KERNEL_TS_UNSUPPORTED_LOGGED.get_or_init(|| {
+            eprintln!(
+                "[cozip_pdeflate][timing][decode-v2-wait-breakdown] status=disabled reason=timestamp_query_not_supported"
+            );
+        });
+    }
+    let mut next_submit_idx = 0usize;
+    let mut inflight = Vec::<InflightGpuDecodeSubmission<'_>>::new();
+    let mut out = Vec::with_capacity(prepared_jobs.len());
+    let mut wait_probe_submit_ms = 0.0_f64;
+    let mut wait_probe_submit_done_wait_ms = 0.0_f64;
+    let mut wait_probe_map_callback_wait_ms = 0.0_f64;
+    let mut wait_probe_map_copy_ms = 0.0_f64;
+    let mut wait_probe_kernel_timestamp_ms = 0.0_f64;
+    let mut wait_probe_kernel_timestamp_samples = 0usize;
+    let mut wait_probe_queue_stall_est_ms = 0.0_f64;
+    let mut wait_probe_ready_any_hits = 0usize;
+    let mut wait_probe_wait_loops = 0usize;
+    let mut wait_probe_inflight_batches_sum = 0usize;
+    let mut wait_probe_inflight_batches_max = 0usize;
+    let mut wait_probe_inflight_samples = 0usize;
+    let mut wait_probe_completed_jobs = 0usize;
+
+    while next_submit_idx < prepared_jobs.len() || !inflight.is_empty() {
+        recycle_gpu_decode_ready_slots(&mut pool.normal);
+        recycle_gpu_decode_ready_slots(&mut pool.large);
+
+        let mut submitted_in_round = 0usize;
+        while next_submit_idx < prepared_jobs.len()
+            && submitted_in_round < micro_submit
+            && inflight.len() < max_inflight
+        {
+            let prepared = prepared_jobs[next_submit_idx];
+            let acquired = try_acquire_gpu_decode_slot_for_job(&mut pool, prepared);
+            let Some((class, slot_idx, slot_handle)) = acquired else {
+                let fit_any =
+                    pool.normal.caps.fits(prepared.req) || pool.large.caps.fits(prepared.req);
+                if !fit_any {
+                    out.push(GpuDecodeResult {
+                        chunk_index: prepared.job.chunk_index,
+                        slot: None,
+                        disposition: GpuDecodeDisposition::CpuFallback,
+                        decoded_chunk: None,
+                    });
+                    next_submit_idx = next_submit_idx.saturating_add(1);
+                    submitted_in_round = submitted_in_round.saturating_add(1);
+                    continue;
+                }
+                break;
+            };
+
+            let submit_result = match class {
+                GpuDecodeSlotClass::Normal => {
+                    let slot = &pool.normal.slots[slot_idx];
+                    upload_gpu_decode_job_to_slot(runtime, slot, prepared).and_then(|_| {
+                        submit_gpu_decode_job_on_slot(runtime, slot, prepared, kernel_ts_probe)
+                    })
+                }
+                GpuDecodeSlotClass::Large => {
+                    let slot = &pool.large.slots[slot_idx];
+                    upload_gpu_decode_job_to_slot(runtime, slot, prepared).and_then(|_| {
+                        submit_gpu_decode_job_on_slot(runtime, slot, prepared, kernel_ts_probe)
+                    })
+                }
+            };
+            match submit_result {
+                Ok(pending) => {
+                    if wait_probe_enabled {
+                        wait_probe_submit_ms += pending.submit_ms;
+                    }
+                    inflight.push(InflightGpuDecodeSubmission {
+                        prepared,
+                        class,
+                        slot_idx,
+                        slot_handle,
+                        pending,
+                        map_requested_at: None,
+                        completion_done: false,
+                        map_done: None,
+                        wait_profile: GpuDecodeV2WaitProfile::default(),
+                    });
+                }
+                Err(_) => {
+                    match class {
+                        GpuDecodeSlotClass::Normal => {
+                            mark_gpu_decode_slot_free(&mut pool.normal, slot_idx)
+                        }
+                        GpuDecodeSlotClass::Large => {
+                            mark_gpu_decode_slot_free(&mut pool.large, slot_idx)
+                        }
+                    }
+                    out.push(GpuDecodeResult {
+                        chunk_index: prepared.job.chunk_index,
+                        slot: None,
+                        disposition: GpuDecodeDisposition::CpuFallback,
+                        decoded_chunk: None,
+                    });
+                }
+            }
+            next_submit_idx = next_submit_idx.saturating_add(1);
+            submitted_in_round = submitted_in_round.saturating_add(1);
+        }
+
+        if inflight.is_empty() {
+            continue;
+        }
+        if wait_probe_enabled {
+            wait_probe_inflight_samples = wait_probe_inflight_samples.saturating_add(1);
+            wait_probe_inflight_batches_sum =
+                wait_probe_inflight_batches_sum.saturating_add(inflight.len());
+            wait_probe_inflight_batches_max = wait_probe_inflight_batches_max.max(inflight.len());
+        }
+
+        runtime.device.poll(wgpu::Maintain::Poll);
+        let mut completed_in_round = 0usize;
+        let mut i = 0usize;
+        while i < inflight.len() {
+            {
+                let pending = &mut inflight[i];
+                if !pending.completion_done {
+                    match pending.pending.completion_rx.try_recv() {
+                        Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
+                            pending.completion_done = true;
+                            pending.wait_profile.submit_seq = pending.pending.submit_seq;
+                            pending.wait_profile.submit_ms = pending.pending.submit_ms;
+                            pending.wait_profile.submit_done_wait_ms =
+                                elapsed_ms(pending.pending.submit_at);
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {}
+                    }
+                }
+
+                if pending.completion_done
+                    && pending.pending.kernel_timestamp_ms.is_none()
+                    && pending.pending.ts_map_rx.is_none()
+                {
+                    if let Some(ts_buffer) = pending.pending.ts_readback_buffer.as_ref() {
+                        let (ts_tx, ts_rx) = mpsc::channel();
+                        ts_buffer
+                            .slice(..)
+                            .map_async(wgpu::MapMode::Read, move |res| {
+                                let _ = ts_tx.send(res);
+                            });
+                        pending.pending.ts_map_rx = Some(ts_rx);
+                    }
+                }
+
+                if pending.pending.kernel_timestamp_ms.is_none() {
+                    if let Some(ts_rx) = pending.pending.ts_map_rx.as_ref() {
+                        match ts_rx.try_recv() {
+                            Ok(Ok(())) => {
+                                if let Some(ts_buffer) = pending.pending.ts_readback_buffer.take() {
+                                    let mapped = ts_buffer.slice(..).get_mapped_range();
+                                    let ts_words: &[u64] = bytemuck::cast_slice(&mapped);
+                                    let kernel_ms = if ts_words.len() >= 2
+                                        && ts_words[1] >= ts_words[0]
+                                    {
+                                        let period_ms = (runtime.queue.get_timestamp_period()
+                                            as f64)
+                                            / 1_000_000.0;
+                                        (ts_words[1].saturating_sub(ts_words[0]) as f64) * period_ms
+                                    } else {
+                                        f64::NAN
+                                    };
+                                    drop(mapped);
+                                    ts_buffer.unmap();
+                                    pending.pending.kernel_timestamp_ms = Some(kernel_ms);
+                                } else {
+                                    pending.pending.kernel_timestamp_ms = Some(f64::NAN);
+                                }
+                                pending.pending.ts_map_rx = None;
+                            }
+                            Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+                                let _ = pending.pending.ts_readback_buffer.take();
+                                pending.pending.kernel_timestamp_ms = Some(f64::NAN);
+                                pending.pending.ts_map_rx = None;
+                            }
+                            Err(mpsc::TryRecvError::Empty) => {}
+                        }
+                    }
+                }
+
+                if pending.completion_done && pending.pending.map_rx.is_none() {
+                    let out_slice = match pending.class {
+                        GpuDecodeSlotClass::Normal => pool.normal.slots[pending.slot_idx]
+                            .buffers
+                            .out_readback_buffer
+                            .slice(..pending.pending.out_total_copy_len),
+                        GpuDecodeSlotClass::Large => pool.large.slots[pending.slot_idx]
+                            .buffers
+                            .out_readback_buffer
+                            .slice(..pending.pending.out_total_copy_len),
+                    };
+                    let (map_tx, map_rx) = mpsc::channel();
+                    out_slice.map_async(wgpu::MapMode::Read, move |res| {
+                        let _ = map_tx.send(res);
+                    });
+                    pending.map_requested_at = Some(Instant::now());
+                    pending.pending.map_rx = Some(map_rx);
+                }
+
+                if pending.map_done.is_none() {
+                    if let Some(map_rx) = pending.pending.map_rx.as_ref() {
+                        match map_rx.try_recv() {
+                            Ok(res) => {
+                                if let Some(t_map_wait) = pending.map_requested_at.take() {
+                                    pending.wait_profile.map_callback_wait_ms =
+                                        elapsed_ms(t_map_wait);
+                                }
+                                pending.map_done = Some(res.map_err(|e| {
+                                    PDeflateError::Gpu(format!("gpu decode out map failed: {e}"))
+                                }));
+                            }
+                            Err(mpsc::TryRecvError::Empty) => {}
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                if let Some(t_map_wait) = pending.map_requested_at.take() {
+                                    pending.wait_profile.map_callback_wait_ms =
+                                        elapsed_ms(t_map_wait);
+                                }
+                                pending.map_done = Some(Err(PDeflateError::Gpu(
+                                    "gpu decode out map channel closed".to_string(),
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+
+            let done =
+                inflight[i].map_done.is_some() && inflight[i].pending.kernel_timestamp_ms.is_some();
+            if !done {
+                i = i.saturating_add(1);
+                continue;
+            }
+
+            let mut submission = inflight.swap_remove(i);
+            let map_done = submission.map_done.take();
+            let map_ok = matches!(map_done, Some(Ok(())));
+
+            let decode_result = if map_ok {
+                let collected = match submission.class {
+                    GpuDecodeSlotClass::Normal => {
+                        let slot = &pool.normal.slots[submission.slot_idx];
+                        collect_gpu_decode_job_from_slot(slot, &submission.pending)
+                    }
+                    GpuDecodeSlotClass::Large => {
+                        let slot = &pool.large.slots[submission.slot_idx];
+                        collect_gpu_decode_job_from_slot(slot, &submission.pending)
+                    }
+                };
+                match collected {
+                    Ok((decoded_chunk, map_copy_ms)) => {
+                        submission.wait_profile.map_copy_ms = map_copy_ms;
+                        GpuDecodeResult {
+                            chunk_index: submission.prepared.job.chunk_index,
+                            slot: Some(submission.slot_handle),
+                            disposition: if decoded_chunk.is_some() {
+                                GpuDecodeDisposition::SubmittedGpu
+                            } else {
+                                GpuDecodeDisposition::CpuFallback
+                            },
+                            decoded_chunk,
+                        }
+                    }
+                    Err(_) => GpuDecodeResult {
+                        chunk_index: submission.prepared.job.chunk_index,
+                        slot: None,
+                        disposition: GpuDecodeDisposition::CpuFallback,
+                        decoded_chunk: None,
+                    },
+                }
+            } else {
+                GpuDecodeResult {
+                    chunk_index: submission.prepared.job.chunk_index,
+                    slot: None,
+                    disposition: GpuDecodeDisposition::CpuFallback,
+                    decoded_chunk: None,
+                }
+            };
+            if wait_probe_enabled {
+                submission.wait_profile.kernel_timestamp_ms =
+                    submission.pending.kernel_timestamp_ms.unwrap_or(f64::NAN);
+                let kernel_ms = submission.wait_profile.kernel_timestamp_ms;
+                submission.wait_profile.queue_stall_est_ms = if kernel_ms.is_finite() {
+                    (submission.wait_profile.submit_done_wait_ms - kernel_ms).max(0.0)
+                } else {
+                    submission.wait_profile.submit_done_wait_ms.max(0.0)
+                };
+                wait_probe_submit_done_wait_ms += submission.wait_profile.submit_done_wait_ms;
+                wait_probe_map_callback_wait_ms += submission.wait_profile.map_callback_wait_ms;
+                wait_probe_map_copy_ms += submission.wait_profile.map_copy_ms;
+                wait_probe_queue_stall_est_ms += submission.wait_profile.queue_stall_est_ms;
+                if kernel_ms.is_finite() {
+                    wait_probe_kernel_timestamp_ms += kernel_ms;
+                    wait_probe_kernel_timestamp_samples =
+                        wait_probe_kernel_timestamp_samples.saturating_add(1);
+                }
+                wait_probe_completed_jobs = wait_probe_completed_jobs.saturating_add(1);
+                let seq = GPU_DECODE_V2_WAIT_PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+                if gpu_decode_v2_wait_probe_should_log(seq) {
+                    let kernel_ts_status = if kernel_ms.is_finite() {
+                        "ok"
+                    } else {
+                        "disabled"
+                    };
+                    eprintln!(
+                        "[cozip_pdeflate][timing][decode-v2-wait-breakdown] seq={} chunk_idx={} slot_idx={} submit_seq={} submit_ms={:.3} submit_done_wait_ms={:.3} map_callback_wait_ms={:.3} map_copy_ms={:.3} kernel_timestamp_ms={:.3} queue_stall_est_ms={:.3} kernel_ts_status={}",
+                        seq,
+                        submission.prepared.job.chunk_index,
+                        submission.slot_handle.slot_index,
+                        submission.wait_profile.submit_seq,
+                        submission.wait_profile.submit_ms,
+                        submission.wait_profile.submit_done_wait_ms,
+                        submission.wait_profile.map_callback_wait_ms,
+                        submission.wait_profile.map_copy_ms,
+                        if kernel_ms.is_finite() {
+                            kernel_ms
+                        } else {
+                            0.0
+                        },
+                        submission.wait_profile.queue_stall_est_ms,
+                        kernel_ts_status
+                    );
+                }
+            }
+
+            match submission.class {
+                GpuDecodeSlotClass::Normal => {
+                    mark_gpu_decode_slot_ready(&mut pool.normal, submission.slot_idx)
+                }
+                GpuDecodeSlotClass::Large => {
+                    mark_gpu_decode_slot_ready(&mut pool.large, submission.slot_idx)
+                }
+            }
+            out.push(decode_result);
+            completed_in_round = completed_in_round.saturating_add(1);
+        }
+
+        if completed_in_round == 0 {
+            if wait_probe_enabled {
+                wait_probe_wait_loops = wait_probe_wait_loops.saturating_add(1);
+            }
+            runtime.device.poll(wgpu::Maintain::Wait);
+        } else if wait_probe_enabled {
+            wait_probe_ready_any_hits = wait_probe_ready_any_hits.saturating_add(1);
+        }
+    }
+
+    out.sort_by_key(|r| r.chunk_index);
+    recycle_gpu_decode_ready_slots(&mut pool.normal);
+    recycle_gpu_decode_ready_slots(&mut pool.large);
+    if wait_probe_enabled {
+        let inflight_avg = if wait_probe_inflight_samples > 0 {
+            (wait_probe_inflight_batches_sum as f64) / (wait_probe_inflight_samples as f64)
+        } else {
+            0.0
+        };
+        let kernel_ts_status = if wait_probe_kernel_timestamp_samples > 0 {
+            "ok"
+        } else {
+            "disabled"
+        };
+        eprintln!(
+            "[cozip_pdeflate][timing][decode-v2-ready-any] jobs={} submit_ms={:.3} submit_done_wait_ms={:.3} map_callback_wait_ms={:.3} map_copy_ms={:.3} kernel_timestamp_ms={:.3} queue_stall_est_ms={:.3} ready_any_hits={} wait_loops={} inflight_batches_avg={:.2} inflight_batches_max={} inflight_samples={} kernel_ts_status={}",
+            wait_probe_completed_jobs,
+            wait_probe_submit_ms,
+            wait_probe_submit_done_wait_ms,
+            wait_probe_map_callback_wait_ms,
+            wait_probe_map_copy_ms,
+            wait_probe_kernel_timestamp_ms,
+            wait_probe_queue_stall_est_ms,
+            wait_probe_ready_any_hits,
+            wait_probe_wait_loops,
+            inflight_avg,
+            wait_probe_inflight_batches_max,
+            wait_probe_inflight_samples,
+            kernel_ts_status
+        );
+    }
+    Ok(out)
 }
 
 pub(crate) fn max_safe_match_batch_chunks(chunk_size: usize) -> Result<usize, PDeflateError> {
@@ -7637,13 +9327,7 @@ pub(crate) fn build_table_gpu_device(
             &resolve_buffer,
             0,
         );
-        ts_encoder.copy_buffer_to_buffer(
-            &resolve_buffer,
-            0,
-            &readback_buffer,
-            0,
-            ts_bytes.max(8),
-        );
+        ts_encoder.copy_buffer_to_buffer(&resolve_buffer, 0, &readback_buffer, 0, ts_bytes.max(8));
         let t_probe_submit = Instant::now();
         let _stage_probe_submit_seq = next_gpu_submit_seq();
         let submission = r.queue.submit(Some(ts_encoder.finish()));
@@ -7691,9 +9375,7 @@ pub(crate) fn build_table_gpu_device(
             if let Some(err) = stage_probe_error.as_ref() {
                 eprintln!(
                     "[cozip_pdeflate][timing][gpu-table-stage-probe] seq={} sample_count={} map_status=error err=\"{}\"",
-                    seq,
-                    sample_count,
-                    err
+                    seq, sample_count, err
                 );
             } else {
                 let total_stage_ms: f64 = stage_gpu_ms.iter().sum();
@@ -7822,7 +9504,13 @@ fn resolve_packed_table_sizes(
 
 fn resolve_packed_table_sizes_batch(
     packed_tables: &[&GpuPackedTableDevice],
-) -> Result<(Vec<(usize, usize, usize)>, ResolvePackedTableSizesBatchProfile), PDeflateError> {
+) -> Result<
+    (
+        Vec<(usize, usize, usize)>,
+        ResolvePackedTableSizesBatchProfile,
+    ),
+    PDeflateError,
+> {
     let t_total = Instant::now();
     let mut profile = ResolvePackedTableSizesBatchProfile::default();
     let mut out = vec![(0usize, 0usize, 0usize); packed_tables.len()];
@@ -7896,7 +9584,8 @@ fn resolve_packed_table_sizes_batch(
                 .map(|(seq, _, _)| packed.build_submit_seq > *seq)
                 .unwrap_or(true);
             if should_replace {
-                latest_build_submit = Some((packed.build_submit_seq, packed.build_id, submit_index));
+                latest_build_submit =
+                    Some((packed.build_submit_seq, packed.build_id, submit_index));
             }
         }
     }
@@ -8034,7 +9723,11 @@ fn resolve_packed_table_sizes_batch(
                 prebuild_stage_gpu_sum_ms,
                 prebuild_tail_ms,
                 prebuild_other_ms,
-                if unresolved_f > 0.0 { prebuild_total_ms / unresolved_f } else { 0.0 },
+                if unresolved_f > 0.0 {
+                    prebuild_total_ms / unresolved_f
+                } else {
+                    0.0
+                },
             );
             if resolve_wait_attribution_probe_enabled() {
                 eprintln!(
@@ -8326,26 +10019,26 @@ fn pack_match_batch_inputs<'a>(
             table_chunk_meta_words.push(0);
             let mut local_count = 0usize;
             let (index_len, data_len, kind) = if let Some(table_gpu) = input.table_gpu {
-                let (count_hint, index_len_hint, data_len_hint, unresolved_gpu_sizes) =
-                    if table_gpu.sizes_known
-                        || table_gpu.table_count > 0
-                        || table_gpu.table_index_len > 0
-                        || table_gpu.table_data_len > 0
-                    {
-                        (
-                            table_gpu.table_count,
-                            table_gpu.table_index_len,
-                            table_gpu.table_data_len,
-                            false,
-                        )
-                    } else {
-                        (
-                            table_gpu.max_entries,
-                            table_gpu.max_entries,
-                            table_gpu.table_data_bytes_cap,
-                            true,
-                        )
-                    };
+                let (count_hint, index_len_hint, data_len_hint, unresolved_gpu_sizes) = if table_gpu
+                    .sizes_known
+                    || table_gpu.table_count > 0
+                    || table_gpu.table_index_len > 0
+                    || table_gpu.table_data_len > 0
+                {
+                    (
+                        table_gpu.table_count,
+                        table_gpu.table_index_len,
+                        table_gpu.table_data_len,
+                        false,
+                    )
+                } else {
+                    (
+                        table_gpu.max_entries,
+                        table_gpu.max_entries,
+                        table_gpu.table_data_bytes_cap,
+                        true,
+                    )
+                };
                 local_count = count_hint;
                 if !unresolved_gpu_sizes {
                     table_chunk_meta_words[meta_word_base] =

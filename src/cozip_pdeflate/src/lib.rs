@@ -202,7 +202,12 @@ impl CoZipDeflate {
             deflate_decompress_stream_indexed_on_cpu(reader, writer, index)
         } else {
             let _ = index;
-            pdeflate_decompress_stream_with_stats(reader, writer)
+            pdeflate_decompress_stream_with_stats(
+                reader,
+                writer,
+                &self.options,
+                self.gpu_context.is_some(),
+            )
         }
     }
 
@@ -216,7 +221,12 @@ impl CoZipDeflate {
             deflate_decompress_stream_indexed_on_cpu(reader, writer, index)
         } else {
             let _ = index;
-            pdeflate_decompress_stream_with_stats(reader, writer)
+            pdeflate_decompress_stream_with_stats(
+                reader,
+                writer,
+                &self.options,
+                self.gpu_context.is_some(),
+            )
         }
     }
 
@@ -225,8 +235,33 @@ impl CoZipDeflate {
         reader: &mut R,
         writer: &mut W,
     ) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
-        let _ = self;
-        pdeflate_decompress_stream_with_stats(reader, writer)
+        pdeflate_decompress_stream_with_stats(
+            reader,
+            writer,
+            &self.options,
+            self.gpu_context.is_some(),
+        )
+    }
+
+    pub fn pdeflate_decompress_bytes(
+        &self,
+        stream: &[u8],
+        output: &mut Vec<u8>,
+    ) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
+        let legacy_options = legacy_options_from_hybrid(&self.options, self.gpu_context.is_some());
+        let legacy_stats = legacy_pdeflate_cpu::pdeflate_decompress_into_with_stats_with_options(
+            stream,
+            output,
+            &legacy_options,
+        )
+        .map_err(map_legacy_pdeflate_error)?;
+        Ok(DeflateCpuStreamStats {
+            input_bytes: legacy_stats.input_bytes,
+            output_bytes: legacy_stats.output_bytes,
+            chunk_count: legacy_stats.chunk_count,
+            cpu_chunks: legacy_stats.chunk_count,
+            ..DeflateCpuStreamStats::default()
+        })
     }
 }
 
@@ -269,6 +304,8 @@ fn legacy_options_from_hybrid(
     let mut legacy = legacy_pdeflate_cpu::PDeflateOptions {
         chunk_size: options.chunk_size.max(1),
         gpu_compress_enabled: is_gpu_requested(options) && gpu_available,
+        gpu_decompress_enabled: is_gpu_requested(options) && gpu_available,
+        gpu_decompress_force_gpu: options.gpu_only,
         gpu_workers: 1,
         gpu_slot_count: options.gpu_slot_count.max(1),
         gpu_submit_chunks: options.gpu_batch_chunks.max(1),
@@ -315,14 +352,39 @@ fn pdeflate_compress_stream_with_stats<R: Read + Send, W: Write>(
 fn pdeflate_decompress_stream_with_stats<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
+    options: &HybridOptions,
+    gpu_available: bool,
 ) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
+    let t_all = Instant::now();
     let mut stream = Vec::new();
+    let t_read = Instant::now();
     reader.read_to_end(&mut stream)?;
+    let t_read_ms = elapsed_ms(t_read);
     let mut restored = Vec::new();
-    let legacy_stats =
-        legacy_pdeflate_cpu::pdeflate_decompress_into_with_stats(&stream, &mut restored)
-            .map_err(map_legacy_pdeflate_error)?;
+    let legacy_options = legacy_options_from_hybrid(options, gpu_available);
+    let t_decode = Instant::now();
+    let legacy_stats = legacy_pdeflate_cpu::pdeflate_decompress_into_with_stats_with_options(
+        &stream,
+        &mut restored,
+        &legacy_options,
+    )
+    .map_err(map_legacy_pdeflate_error)?;
+    let t_decode_ms = elapsed_ms(t_decode);
+    let t_write = Instant::now();
     writer.write_all(&restored)?;
+    let t_write_ms = elapsed_ms(t_write);
+    let t_all_ms = elapsed_ms(t_all);
+    if options.profile_timing {
+        eprintln!(
+            "[cozip_pdeflate][timing][decompress-stream-phases] in_mib={:.2} out_mib={:.2} read_to_end_ms={:.3} decode_ms={:.3} write_all_ms={:.3} total_ms={:.3}",
+            (stream.len() as f64) / (1024.0 * 1024.0),
+            (restored.len() as f64) / (1024.0 * 1024.0),
+            t_read_ms,
+            t_decode_ms,
+            t_write_ms,
+            t_all_ms
+        );
+    }
     Ok(DeflateCpuStreamStats {
         input_bytes: legacy_stats.input_bytes,
         output_bytes: legacy_stats.output_bytes,
@@ -599,11 +661,11 @@ impl WorkerCounters {
                 / 1_000_000.0,
             legacy_gpu_sparse_table_size_resolve_ms: self
                 .legacy_gpu_sparse_table_size_resolve_ns
-                .load(Ordering::Relaxed) as f64
+                .load(Ordering::Relaxed)
+                as f64
                 / 1_000_000.0,
-            legacy_gpu_sparse_prepare_ms: self
-                .legacy_gpu_sparse_prepare_ns
-                .load(Ordering::Relaxed) as f64
+            legacy_gpu_sparse_prepare_ms: self.legacy_gpu_sparse_prepare_ns.load(Ordering::Relaxed)
+                as f64
                 / 1_000_000.0,
             legacy_gpu_sparse_prepare_misc_ms: self
                 .legacy_gpu_sparse_prepare_misc_ns
@@ -640,7 +702,8 @@ impl WorkerCounters {
                 / 1_000_000.0,
             legacy_gpu_kernel_pack_resolve_sizes_ms: self
                 .legacy_gpu_kernel_pack_resolve_sizes_ns
-                .load(Ordering::Relaxed) as f64
+                .load(Ordering::Relaxed)
+                as f64
                 / 1_000_000.0,
             legacy_gpu_kernel_pack_resolve_scan_ms: self
                 .legacy_gpu_kernel_pack_resolve_scan_ns
@@ -648,19 +711,23 @@ impl WorkerCounters {
                 / 1_000_000.0,
             legacy_gpu_kernel_pack_resolve_readback_setup_ms: self
                 .legacy_gpu_kernel_pack_resolve_readback_setup_ns
-                .load(Ordering::Relaxed) as f64
+                .load(Ordering::Relaxed)
+                as f64
                 / 1_000_000.0,
             legacy_gpu_kernel_pack_resolve_submit_ms: self
                 .legacy_gpu_kernel_pack_resolve_submit_ns
-                .load(Ordering::Relaxed) as f64
+                .load(Ordering::Relaxed)
+                as f64
                 / 1_000_000.0,
             legacy_gpu_kernel_pack_resolve_map_wait_ms: self
                 .legacy_gpu_kernel_pack_resolve_map_wait_ns
-                .load(Ordering::Relaxed) as f64
+                .load(Ordering::Relaxed)
+                as f64
                 / 1_000_000.0,
             legacy_gpu_kernel_pack_resolve_parse_ms: self
                 .legacy_gpu_kernel_pack_resolve_parse_ns
-                .load(Ordering::Relaxed) as f64
+                .load(Ordering::Relaxed)
+                as f64
                 / 1_000_000.0,
             legacy_gpu_kernel_pack_src_copy_ms: self
                 .legacy_gpu_kernel_pack_src_copy_ns
@@ -668,7 +735,8 @@ impl WorkerCounters {
                 / 1_000_000.0,
             legacy_gpu_kernel_pack_metadata_loop_ms: self
                 .legacy_gpu_kernel_pack_metadata_loop_ns
-                .load(Ordering::Relaxed) as f64
+                .load(Ordering::Relaxed)
+                as f64
                 / 1_000_000.0,
             legacy_gpu_kernel_pack_host_copy_ms: self
                 .legacy_gpu_kernel_pack_host_copy_ns
@@ -676,7 +744,8 @@ impl WorkerCounters {
                 / 1_000_000.0,
             legacy_gpu_kernel_pack_device_copy_plan_ms: self
                 .legacy_gpu_kernel_pack_device_copy_plan_ns
-                .load(Ordering::Relaxed) as f64
+                .load(Ordering::Relaxed)
+                as f64
                 / 1_000_000.0,
             legacy_gpu_kernel_pack_finalize_ms: self
                 .legacy_gpu_kernel_pack_finalize_ns
@@ -3961,10 +4030,12 @@ fn compress_gpu_stream_worker_pdeflate_payload(
                 (breakdown.kernel_pack_resolve_submit_ms * 1_000_000.0) as u64,
                 Ordering::Relaxed,
             );
-            counters.legacy_gpu_kernel_pack_resolve_map_wait_ns.fetch_add(
-                (breakdown.kernel_pack_resolve_map_wait_ms * 1_000_000.0) as u64,
-                Ordering::Relaxed,
-            );
+            counters
+                .legacy_gpu_kernel_pack_resolve_map_wait_ns
+                .fetch_add(
+                    (breakdown.kernel_pack_resolve_map_wait_ms * 1_000_000.0) as u64,
+                    Ordering::Relaxed,
+                );
             counters.legacy_gpu_kernel_pack_resolve_parse_ns.fetch_add(
                 (breakdown.kernel_pack_resolve_parse_ms * 1_000_000.0) as u64,
                 Ordering::Relaxed,

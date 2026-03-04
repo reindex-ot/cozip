@@ -175,6 +175,8 @@ pub struct PDeflateOptions {
     pub hash_history_limit: usize,
     pub table_sample_stride: usize,
     pub gpu_compress_enabled: bool,
+    pub gpu_decompress_enabled: bool,
+    pub gpu_decompress_force_gpu: bool,
     pub gpu_workers: usize,
     pub gpu_slot_count: usize,
     pub gpu_submit_chunks: usize,
@@ -197,6 +199,8 @@ impl Default for PDeflateOptions {
             hash_history_limit: 16,
             table_sample_stride: 4,
             gpu_compress_enabled: false,
+            gpu_decompress_enabled: true,
+            gpu_decompress_force_gpu: false,
             gpu_workers: 1,
             gpu_slot_count: 16,
             gpu_submit_chunks: 4,
@@ -242,6 +246,21 @@ struct ChunkDecoded {
     table_entries: usize,
     section_count: usize,
     profile: ChunkDecodeProfile,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DecodeChunkTask {
+    payload_offset: usize,
+    payload_len: usize,
+    out_offset: usize,
+    out_len: usize,
+}
+
+#[derive(Debug)]
+struct ChunkDecodePreprocess {
+    table_count: usize,
+    chunk_uncompressed_len: usize,
+    section_meta: Vec<gpu::GpuDecodeSectionMeta>,
 }
 
 struct GpuPreparedChunk<'a> {
@@ -1221,13 +1240,23 @@ pub fn pdeflate_decompress_with_stats(
     stream: &[u8],
 ) -> Result<(Vec<u8>, PDeflateStats), PDeflateError> {
     let mut output = Vec::new();
-    let stats = pdeflate_decompress_into_with_stats(stream, &mut output)?;
+    let options = PDeflateOptions::default();
+    let stats = pdeflate_decompress_into_with_stats_with_options(stream, &mut output, &options)?;
     Ok((output, stats))
 }
 
 pub fn pdeflate_decompress_into_with_stats(
     stream: &[u8],
     output: &mut Vec<u8>,
+) -> Result<PDeflateStats, PDeflateError> {
+    let options = PDeflateOptions::default();
+    pdeflate_decompress_into_with_stats_with_options(stream, output, &options)
+}
+
+pub fn pdeflate_decompress_into_with_stats_with_options(
+    stream: &[u8],
+    output: &mut Vec<u8>,
+    options: &PDeflateOptions,
 ) -> Result<PDeflateStats, PDeflateError> {
     let mut cursor = 0usize;
     let magic = read_exact(stream, &mut cursor, 4)?;
@@ -1269,21 +1298,399 @@ pub fn pdeflate_decompress_into_with_stats(
     let mut prof_lit_cmds = 0_u64;
     let mut prof_ref_bytes = 0_u64;
     let mut prof_lit_bytes = 0_u64;
+    let mut prof_cpu_decode_chunks = 0_usize;
+    let mut prof_gpu_decode_chunks = 0_usize;
+    let prof_gpu_decompress_enabled =
+        options.gpu_decompress_enabled || options.gpu_decompress_force_gpu;
     let mut prof_chunk_decode_suppressed = 0usize;
+    let prof_parse_tasks_ms;
+    let prof_decode_workers_ms;
+    let prof_aggregate_stats_ms;
     let mut out_cursor = 0usize;
-
-    for chunk_idx in 0..chunk_count {
+    let mut chunk_tasks = Vec::with_capacity(chunk_count);
+    let mut gpu_decode_jobs = Vec::with_capacity(chunk_count);
+    let parse_tasks_t0 = Instant::now();
+    for chunk_index in 0..chunk_count {
         let chunk_len = read_u32_le(stream, &mut cursor)? as usize;
+        let payload_offset = cursor;
         let chunk_payload = read_exact(stream, &mut cursor, chunk_len)?;
-        let chunk_out_len = chunk_uncompressed_len(chunk_payload)?;
+        let preprocess = preprocess_chunk_for_gpu_decode(chunk_payload)?;
+        let chunk_out_len = preprocess.chunk_uncompressed_len;
         let chunk_out_end = out_cursor
             .checked_add(chunk_out_len)
             .ok_or(PDeflateError::NumericOverflow)?;
         if chunk_out_end > output.len() {
             return Err(PDeflateError::InvalidStream("decoded size overflow"));
         }
-        let decoded = decompress_chunk_into(chunk_payload, &mut output[out_cursor..chunk_out_end])?;
+        chunk_tasks.push(DecodeChunkTask {
+            payload_offset,
+            payload_len: chunk_len,
+            out_offset: out_cursor,
+            out_len: chunk_out_len,
+        });
+        gpu_decode_jobs.push(gpu::GpuDecodeJob {
+            chunk_index,
+            payload: chunk_payload,
+            table_count: preprocess.table_count,
+            chunk_uncompressed_len: chunk_out_len,
+            out_offset: out_cursor,
+            out_len: chunk_out_len,
+            section_meta: preprocess.section_meta,
+            preferred_slot: None,
+        });
         out_cursor = chunk_out_end;
+    }
+
+    if out_cursor != original_len {
+        return Err(PDeflateError::InvalidStream("decoded size mismatch"));
+    }
+    if cursor != stream.len() {
+        return Err(PDeflateError::InvalidStream("trailing bytes in stream"));
+    }
+    prof_parse_tasks_ms = elapsed_ms(parse_tasks_t0);
+
+    let mut decoded_chunks: Vec<Option<ChunkDecoded>> = (0..chunk_count).map(|_| None).collect();
+    let mut gpu_decoded_flags = vec![false; chunk_count];
+    let decode_workers_t0 = Instant::now();
+    let output_base = output.as_mut_ptr() as usize;
+    let gpu_enabled = prof_gpu_decompress_enabled && gpu::is_runtime_available();
+    let cpu_worker_count = if options.gpu_decompress_force_gpu {
+        0
+    } else {
+        thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(chunk_count.max(1))
+            .max(1)
+    };
+    let prof_cpu_decode_workers = cpu_worker_count;
+    let gpu_batch_limit = options.gpu_pipelined_submit_chunks.max(1);
+    let queue_state = Arc::new(Mutex::new((0..chunk_count).collect::<VecDeque<usize>>()));
+    let err_slot = Arc::new(Mutex::new(None::<PDeflateError>));
+    let err_flag = Arc::new(AtomicBool::new(false));
+    let mut cpu_worker_profiles: Vec<(usize, usize, f64)> = Vec::with_capacity(cpu_worker_count);
+    let mut cpu_worker_outputs: Vec<Vec<(usize, Result<ChunkDecoded, PDeflateError>)>> =
+        Vec::with_capacity(cpu_worker_count);
+    let mut gpu_worker_output: Vec<(usize, Result<ChunkDecoded, PDeflateError>, bool)> = Vec::new();
+    let mut gpu_worker_busy_ms = 0.0_f64;
+    let mut gpu_claimed_chunks = 0usize;
+    let mut worker_panicked = false;
+
+    thread::scope(|scope| {
+        let mut cpu_handles = Vec::with_capacity(cpu_worker_count);
+        for worker_id in 0..cpu_worker_count {
+            let queue_state = Arc::clone(&queue_state);
+            let err_slot = Arc::clone(&err_slot);
+            let err_flag = Arc::clone(&err_flag);
+            let tasks = &chunk_tasks;
+            cpu_handles.push(scope.spawn(move || {
+                let mut local = Vec::new();
+                let mut chunk_count_local = 0usize;
+                let t_worker = Instant::now();
+                loop {
+                    if err_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let idx = {
+                        let mut queue = match queue_state.lock() {
+                            Ok(v) => v,
+                            Err(_) => {
+                                set_worker_error_once(
+                                    &err_slot,
+                                    &err_flag,
+                                    PDeflateError::Gpu("decode queue mutex poisoned".to_string()),
+                                );
+                                break;
+                            }
+                        };
+                        queue.pop_front()
+                    };
+                    let Some(idx) = idx else {
+                        break;
+                    };
+                    chunk_count_local = chunk_count_local.saturating_add(1);
+                    let task = tasks[idx];
+                    let payload =
+                        &stream[task.payload_offset..task.payload_offset + task.payload_len];
+                    let out_ptr = (output_base + task.out_offset) as *mut u8;
+                    let out_slice =
+                        unsafe { std::slice::from_raw_parts_mut(out_ptr, task.out_len) };
+                    local.push((idx, decompress_chunk_into(payload, out_slice)));
+                }
+                (local, worker_id, chunk_count_local, elapsed_ms(t_worker))
+            }));
+        }
+
+        let gpu_handle = if gpu_enabled {
+            let queue_state = Arc::clone(&queue_state);
+            let err_slot = Arc::clone(&err_slot);
+            let err_flag = Arc::clone(&err_flag);
+            let tasks = &chunk_tasks;
+            let gpu_jobs = &gpu_decode_jobs;
+            Some(scope.spawn(move || {
+                let mut local = Vec::new();
+                let t_gpu_worker = Instant::now();
+                loop {
+                    if err_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let batch_indices = {
+                        let mut queue = match queue_state.lock() {
+                            Ok(v) => v,
+                            Err(_) => {
+                                set_worker_error_once(
+                                    &err_slot,
+                                    &err_flag,
+                                    PDeflateError::Gpu("decode queue mutex poisoned".to_string()),
+                                );
+                                break;
+                            }
+                        };
+                        let mut picked = Vec::with_capacity(gpu_batch_limit);
+                        while picked.len() < gpu_batch_limit {
+                            let Some(idx) = queue.pop_front() else {
+                                break;
+                            };
+                            let eligible = if options.gpu_decompress_force_gpu {
+                                true
+                            } else {
+                                tasks
+                                    .get(idx)
+                                    .map(|task| task.out_len >= options.gpu_min_chunk_size)
+                                    .unwrap_or(false)
+                            };
+                            if eligible {
+                                picked.push(idx);
+                            } else {
+                                // Not suitable for GPU: return to CPU workers via front.
+                                queue.push_front(idx);
+                                break;
+                            }
+                        }
+                        picked
+                    };
+                    if batch_indices.is_empty() {
+                        break;
+                    }
+                    let batch_jobs: Vec<_> = batch_indices
+                        .iter()
+                        .map(|&idx| gpu_jobs[idx].clone())
+                        .collect();
+                    let gpu_results = match gpu::decode_chunks_gpu_v2(&batch_jobs, options) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            set_worker_error_once(&err_slot, &err_flag, err);
+                            break;
+                        }
+                    };
+                    if gpu_results.len() != batch_jobs.len() {
+                        set_worker_error_once(
+                            &err_slot,
+                            &err_flag,
+                            PDeflateError::Gpu(
+                                "gpu decode v2 returned mismatched result length".to_string(),
+                            ),
+                        );
+                        break;
+                    }
+                    for result in gpu_results {
+                        let chunk_idx = result.chunk_index;
+                        let task = match tasks.get(chunk_idx).copied() {
+                            Some(v) => v,
+                            None => {
+                                set_worker_error_once(
+                                    &err_slot,
+                                    &err_flag,
+                                    PDeflateError::InvalidStream(
+                                        "gpu decode result chunk index out of bounds",
+                                    ),
+                                );
+                                break;
+                            }
+                        };
+                        match result.disposition {
+                            gpu::GpuDecodeDisposition::SubmittedGpu => {
+                                if let Some(decoded_chunk) = result.decoded_chunk {
+                                    if decoded_chunk.len() == task.out_len {
+                                        let out_ptr = (output_base + task.out_offset) as *mut u8;
+                                        let out_slice = unsafe {
+                                            std::slice::from_raw_parts_mut(out_ptr, task.out_len)
+                                        };
+                                        out_slice.copy_from_slice(&decoded_chunk);
+                                        local.push((
+                                            chunk_idx,
+                                            Ok(ChunkDecoded {
+                                                table_entries: gpu_jobs[chunk_idx].table_count,
+                                                section_count: gpu_jobs[chunk_idx]
+                                                    .section_meta
+                                                    .len(),
+                                                profile: ChunkDecodeProfile::default(),
+                                            }),
+                                            true,
+                                        ));
+                                        continue;
+                                    }
+                                }
+                                let payload = &stream
+                                    [task.payload_offset..task.payload_offset + task.payload_len];
+                                let out_ptr = (output_base + task.out_offset) as *mut u8;
+                                let out_slice = unsafe {
+                                    std::slice::from_raw_parts_mut(out_ptr, task.out_len)
+                                };
+                                local.push((
+                                    chunk_idx,
+                                    decompress_chunk_into(payload, out_slice),
+                                    false,
+                                ));
+                            }
+                            gpu::GpuDecodeDisposition::CpuFallback => {
+                                let payload = &stream
+                                    [task.payload_offset..task.payload_offset + task.payload_len];
+                                let out_ptr = (output_base + task.out_offset) as *mut u8;
+                                let out_slice = unsafe {
+                                    std::slice::from_raw_parts_mut(out_ptr, task.out_len)
+                                };
+                                local.push((
+                                    chunk_idx,
+                                    decompress_chunk_into(payload, out_slice),
+                                    false,
+                                ));
+                            }
+                        }
+                    }
+                }
+                let busy_ms = elapsed_ms(t_gpu_worker);
+                let claimed = local.len();
+                (local, busy_ms, claimed)
+            }))
+        } else {
+            None
+        };
+
+        for handle in cpu_handles {
+            match handle.join() {
+                Ok((local, worker_id, chunk_count_local, busy_ms)) => {
+                    cpu_worker_profiles.push((worker_id, chunk_count_local, busy_ms));
+                    cpu_worker_outputs.push(local);
+                }
+                Err(_) => worker_panicked = true,
+            }
+        }
+
+        if let Some(handle) = gpu_handle {
+            match handle.join() {
+                Ok((local, busy_ms, claimed)) => {
+                    gpu_worker_output = local;
+                    gpu_worker_busy_ms = busy_ms;
+                    gpu_claimed_chunks = claimed;
+                }
+                Err(_) => worker_panicked = true,
+            }
+        }
+    });
+
+    if worker_panicked {
+        return Err(PDeflateError::InvalidStream("decode worker panicked"));
+    }
+    take_worker_error(&err_slot)?;
+
+    for local in cpu_worker_outputs {
+        for (idx, result) in local {
+            if idx >= decoded_chunks.len() {
+                return Err(PDeflateError::InvalidStream(
+                    "cpu decode result chunk index out of bounds",
+                ));
+            }
+            if decoded_chunks[idx].is_some() {
+                return Err(PDeflateError::InvalidStream("duplicate cpu decode result"));
+            }
+            decoded_chunks[idx] = Some(result?);
+        }
+    }
+    for (idx, result, from_gpu) in gpu_worker_output {
+        if idx >= decoded_chunks.len() {
+            return Err(PDeflateError::InvalidStream(
+                "gpu decode result chunk index out of bounds",
+            ));
+        }
+        if decoded_chunks[idx].is_some() {
+            return Err(PDeflateError::InvalidStream("duplicate gpu decode result"));
+        }
+        decoded_chunks[idx] = Some(result?);
+        gpu_decoded_flags[idx] = from_gpu;
+        if from_gpu {
+            prof_gpu_decode_chunks = prof_gpu_decode_chunks.saturating_add(1);
+        }
+    }
+    let cpu_claimed_chunks: usize = cpu_worker_profiles
+        .iter()
+        .map(|(_, chunks, _)| *chunks)
+        .sum();
+    if profile {
+        eprintln!(
+            "[cozip_pdeflate][timing][decompress-scheduler-claims] cpu_workers={} cpu_claimed_chunks={} gpu_claimed_chunks={} gpu_submitted_chunks={} gpu_fallback_chunks={} gpu_busy_ms={:.3}",
+            cpu_worker_count,
+            cpu_claimed_chunks,
+            gpu_claimed_chunks,
+            prof_gpu_decode_chunks,
+            gpu_claimed_chunks.saturating_sub(prof_gpu_decode_chunks),
+            gpu_worker_busy_ms
+        );
+    }
+    if profile && !cpu_worker_profiles.is_empty() {
+        let mut min_chunks = usize::MAX;
+        let mut max_chunks = 0usize;
+        let mut min_busy_ms = f64::INFINITY;
+        let mut max_busy_ms = 0.0_f64;
+        let mut sum_busy_ms = 0.0_f64;
+        let mut sum_chunks = 0usize;
+        for (_, chunks, busy_ms) in &cpu_worker_profiles {
+            min_chunks = min_chunks.min(*chunks);
+            max_chunks = max_chunks.max(*chunks);
+            min_busy_ms = min_busy_ms.min(*busy_ms);
+            max_busy_ms = max_busy_ms.max(*busy_ms);
+            sum_busy_ms += *busy_ms;
+            sum_chunks = sum_chunks.saturating_add(*chunks);
+        }
+        let avg_busy_ms = sum_busy_ms / (cpu_worker_profiles.len() as f64);
+        let busy_gap_ms = (max_busy_ms - min_busy_ms).max(0.0);
+        eprintln!(
+            "[cozip_pdeflate][timing][decompress-worker-balance] cpu_workers={} cpu_chunks={} chunk_min={} chunk_max={} busy_sum_ms={:.3} busy_avg_ms={:.3} busy_min_ms={:.3} busy_max_ms={:.3} busy_gap_ms={:.3}",
+            cpu_worker_profiles.len(),
+            sum_chunks,
+            if min_chunks == usize::MAX {
+                0
+            } else {
+                min_chunks
+            },
+            max_chunks,
+            sum_busy_ms,
+            avg_busy_ms,
+            if min_busy_ms.is_finite() {
+                min_busy_ms
+            } else {
+                0.0
+            },
+            max_busy_ms,
+            busy_gap_ms
+        );
+        if profile_detail {
+            cpu_worker_profiles.sort_by_key(|(worker_id, _, _)| *worker_id);
+            for (worker_id, chunks, busy_ms) in cpu_worker_profiles {
+                eprintln!(
+                    "[cozip_pdeflate][timing][decompress-worker] id={} chunks={} busy_ms={:.3}",
+                    worker_id, chunks, busy_ms
+                );
+            }
+        }
+    }
+    prof_decode_workers_ms = elapsed_ms(decode_workers_t0);
+
+    let aggregate_stats_t0 = Instant::now();
+    for (chunk_idx, task) in chunk_tasks.iter().copied().enumerate() {
+        let decoded = decoded_chunks[chunk_idx]
+            .take()
+            .ok_or(PDeflateError::InvalidStream("chunk decode result missing"))?;
 
         stats.table_entries_total = stats
             .table_entries_total
@@ -1300,6 +1707,9 @@ pub fn pdeflate_decompress_into_with_stats(
         prof_lit_cmds = prof_lit_cmds.saturating_add(decoded.profile.lit_cmds);
         prof_ref_bytes = prof_ref_bytes.saturating_add(decoded.profile.ref_bytes);
         prof_lit_bytes = prof_lit_bytes.saturating_add(decoded.profile.lit_bytes);
+        if !gpu_decoded_flags[chunk_idx] {
+            prof_cpu_decode_chunks = prof_cpu_decode_chunks.saturating_add(1);
+        }
 
         let emit_chunk_detail =
             profile_detail && profile_detail_should_log_indexed(chunk_idx, chunk_count);
@@ -1307,11 +1717,17 @@ pub fn pdeflate_decompress_into_with_stats(
             prof_chunk_decode_suppressed = prof_chunk_decode_suppressed.saturating_add(1);
         }
         if emit_chunk_detail {
+            let backend = if gpu_decoded_flags[chunk_idx] {
+                "GPU"
+            } else {
+                "CPU"
+            };
             eprintln!(
-                "[cozip_pdeflate][timing][chunk-decode] idx={} in_kib={:.2} out_kib={:.2} sections={} table_entries={} t_table_prepare_ms={:.3} t_section_decode_ms={:.3} cmds={} ref_cmds={} lit_cmds={} ref_bytes={} lit_bytes={} t_ref_copy_ms={:.3} t_lit_copy_ms={:.3}",
+                "[cozip_pdeflate][timing][chunk-decode] idx={} backend={} in_kib={:.2} out_kib={:.2} sections={} table_entries={} t_table_prepare_ms={:.3} t_section_decode_ms={:.3} cmds={} ref_cmds={} lit_cmds={} ref_bytes={} lit_bytes={} t_ref_copy_ms={:.3} t_lit_copy_ms={:.3}",
                 chunk_idx,
-                (chunk_payload.len() as f64) / 1024.0,
-                (chunk_out_len as f64) / 1024.0,
+                backend,
+                (task.payload_len as f64) / 1024.0,
+                (task.out_len as f64) / 1024.0,
                 decoded.section_count,
                 decoded.table_entries,
                 decoded.profile.table_prepare_ms,
@@ -1326,6 +1742,7 @@ pub fn pdeflate_decompress_into_with_stats(
             );
         }
     }
+    prof_aggregate_stats_ms = elapsed_ms(aggregate_stats_t0);
 
     if profile_detail && prof_chunk_decode_suppressed > 0 {
         eprintln!(
@@ -1334,18 +1751,20 @@ pub fn pdeflate_decompress_into_with_stats(
         );
     }
 
-    if out_cursor != original_len {
-        return Err(PDeflateError::InvalidStream("decoded size mismatch"));
-    }
-    if cursor != stream.len() {
-        return Err(PDeflateError::InvalidStream("trailing bytes in stream"));
-    }
-
     stats.output_bytes = u64::try_from(output.len()).map_err(|_| PDeflateError::NumericOverflow)?;
     if profile {
         eprintln!(
-            "[cozip_pdeflate][timing][decompress-total] chunks={} in_mib={:.2} out_mib={:.2} t_table_prepare_ms={:.3} t_section_decode_ms={:.3} cmds={} ref_cmds={} lit_cmds={} ref_bytes={} lit_bytes={} t_ref_copy_ms={:.3} t_lit_copy_ms={:.3}",
+            "[cozip_pdeflate][timing][decompress-phases] chunks={} parse_tasks_ms={:.3} decode_workers_ms={:.3} aggregate_stats_ms={:.3}",
+            chunk_count, prof_parse_tasks_ms, prof_decode_workers_ms, prof_aggregate_stats_ms
+        );
+        eprintln!(
+            "[cozip_pdeflate][timing][decompress-total] chunks={} cpu_decode_workers={} cpu_decode_chunks={} gpu_decode_chunks={} gpu_decompress_enabled={} gpu_decompress_force_gpu={} in_mib={:.2} out_mib={:.2} t_table_prepare_ms={:.3} t_section_decode_ms={:.3} cmds={} ref_cmds={} lit_cmds={} ref_bytes={} lit_bytes={} t_ref_copy_ms={:.3} t_lit_copy_ms={:.3}",
             chunk_count,
+            prof_cpu_decode_workers,
+            prof_cpu_decode_chunks,
+            prof_gpu_decode_chunks,
+            prof_gpu_decompress_enabled,
+            options.gpu_decompress_force_gpu,
             (stream.len() as f64) / (1024.0 * 1024.0),
             (output.len() as f64) / (1024.0 * 1024.0),
             prof_table_prepare_ms,
@@ -2935,7 +3354,8 @@ fn compress_chunks_hybrid(
                                             batch_prof.gpu_pack_host_copy_ms;
                                         prof.gpu_pack_device_copy_plan_ms +=
                                             batch_prof.gpu_pack_device_copy_plan_ms;
-                                        prof.gpu_pack_finalize_ms += batch_prof.gpu_pack_finalize_ms;
+                                        prof.gpu_pack_finalize_ms +=
+                                            batch_prof.gpu_pack_finalize_ms;
                                         prof.gpu_scratch_acquire_ms +=
                                             batch_prof.gpu_scratch_acquire_ms;
                                         prof.gpu_match_table_copy_ms +=
@@ -3440,18 +3860,100 @@ fn unpack_gpu_match(
     Some((id, len))
 }
 
-fn chunk_uncompressed_len(payload: &[u8]) -> Result<usize, PDeflateError> {
+fn preprocess_chunk_for_gpu_decode(payload: &[u8]) -> Result<ChunkDecodePreprocess, PDeflateError> {
     if payload.len() < 12 {
         return Err(PDeflateError::InvalidStream("chunk header truncated"));
     }
-    if payload.get(0..4) != Some(&CHUNK_MAGIC) {
+    if payload.len() < CHUNK_HEADER_SIZE {
+        return Err(PDeflateError::InvalidStream("chunk header truncated"));
+    }
+
+    let mut cursor = 0usize;
+    let magic = read_exact(payload, &mut cursor, 4)?;
+    if magic != CHUNK_MAGIC {
         return Err(PDeflateError::InvalidStream("bad chunk magic"));
     }
-    let version = u16::from_le_bytes([payload[4], payload[5]]);
+    let version = read_u16_le(payload, &mut cursor)?;
     if version != PDEFLATE_VERSION {
         return Err(PDeflateError::InvalidStream("unsupported chunk version"));
     }
-    Ok(u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize)
+
+    let _flags = read_u16_le(payload, &mut cursor)?;
+    let chunk_uncompressed_len = read_u32_le(payload, &mut cursor)? as usize;
+    let table_count = read_u16_le(payload, &mut cursor)? as usize;
+    let section_count = read_u16_le(payload, &mut cursor)? as usize;
+    let table_index_offset = read_u32_le(payload, &mut cursor)? as usize;
+    let table_data_offset = read_u32_le(payload, &mut cursor)? as usize;
+    let section_index_offset = read_u32_le(payload, &mut cursor)? as usize;
+    let section_cmd_offset = read_u32_le(payload, &mut cursor)? as usize;
+
+    if table_count > MAX_TABLE_ID {
+        return Err(PDeflateError::InvalidStream("table_count too large"));
+    }
+    if section_count == 0 {
+        return Err(PDeflateError::InvalidStream("section_count is zero"));
+    }
+
+    if !(table_index_offset <= table_data_offset
+        && table_data_offset <= section_index_offset
+        && section_index_offset <= section_cmd_offset
+        && section_cmd_offset <= payload.len())
+    {
+        return Err(PDeflateError::InvalidStream("invalid chunk offsets"));
+    }
+
+    if table_index_offset != CHUNK_HEADER_SIZE {
+        return Err(PDeflateError::InvalidStream(
+            "unexpected table_index_offset",
+        ));
+    }
+    let table_index = &payload[table_index_offset..table_data_offset];
+    if table_index.len() != table_count {
+        return Err(PDeflateError::InvalidStream("table index length mismatch"));
+    }
+    let section_index = &payload[section_index_offset..section_cmd_offset];
+    let section_cmd = &payload[section_cmd_offset..];
+
+    let mut section_idx_cursor = 0usize;
+    let mut cmd_cursor = 0usize;
+    let mut section_meta = Vec::with_capacity(section_count);
+    for sec in 0..section_count {
+        let sec_cmd_len = read_varint_u32(section_index, &mut section_idx_cursor)? as usize;
+        let sec_cmd_end = cmd_cursor
+            .checked_add(sec_cmd_len)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        if sec_cmd_end > section_cmd.len() {
+            return Err(PDeflateError::InvalidStream(
+                "section cmd range out of bounds",
+            ));
+        }
+
+        let out_start = section_start(sec, section_count, chunk_uncompressed_len);
+        let out_end = section_start(sec + 1, section_count, chunk_uncompressed_len);
+        section_meta.push(gpu::GpuDecodeSectionMeta {
+            cmd_offset: cmd_cursor,
+            cmd_len: sec_cmd_len,
+            out_offset: out_start,
+            out_len: out_end.saturating_sub(out_start),
+        });
+        cmd_cursor = sec_cmd_end;
+    }
+    if section_idx_cursor != section_index.len() {
+        return Err(PDeflateError::InvalidStream(
+            "trailing bytes in section index",
+        ));
+    }
+    if cmd_cursor != section_cmd.len() {
+        return Err(PDeflateError::InvalidStream(
+            "sum(section_cmd_len) != section_cmd size",
+        ));
+    }
+
+    Ok(ChunkDecodePreprocess {
+        table_count,
+        chunk_uncompressed_len,
+        section_meta,
+    })
 }
 
 fn decompress_chunk_into(payload: &[u8], out: &mut [u8]) -> Result<ChunkDecoded, PDeflateError> {
@@ -3556,32 +4058,33 @@ fn decompress_chunk_into(payload: &[u8], out: &mut [u8]) -> Result<ChunkDecoded,
         }
         decode_profile.table_prepare_ms = elapsed_ms(table_t0);
 
-        let sections_t0 = Instant::now();
         let mut section_idx_cursor = 0usize;
         let mut cmd_cursor = 0usize;
+        let mut section_cmd_offsets = Vec::with_capacity(section_count);
+        let mut section_cmd_lens = Vec::with_capacity(section_count);
+        let mut section_out_offsets = Vec::with_capacity(section_count);
+        let mut section_out_lens = Vec::with_capacity(section_count);
         for sec in 0..section_count {
             let sec_cmd_len = read_varint_u32(section_index, &mut section_idx_cursor)? as usize;
             let sec_cmd_end = cmd_cursor
                 .checked_add(sec_cmd_len)
                 .ok_or(PDeflateError::NumericOverflow)?;
-            let sec_cmd =
-                section_cmd
-                    .get(cmd_cursor..sec_cmd_end)
-                    .ok_or(PDeflateError::InvalidStream(
-                        "section cmd range out of bounds",
-                    ))?;
+            if sec_cmd_end > section_cmd.len() {
+                return Err(PDeflateError::InvalidStream(
+                    "section cmd range out of bounds",
+                ));
+            }
             let out_start = section_start(sec, section_count, chunk_uncompressed_len);
             let out_end = section_start(sec + 1, section_count, chunk_uncompressed_len);
             let out_len = out_end - out_start;
-
-            decode_section(
-                sec_cmd,
-                out_len,
-                &scratch.table_repeat,
-                &mut out[out_start..out_end],
-                &mut decode_profile,
-                profile,
-            )?;
+            section_cmd_offsets
+                .push(u32::try_from(cmd_cursor).map_err(|_| PDeflateError::NumericOverflow)?);
+            section_cmd_lens
+                .push(u32::try_from(sec_cmd_len).map_err(|_| PDeflateError::NumericOverflow)?);
+            section_out_offsets
+                .push(u32::try_from(out_start).map_err(|_| PDeflateError::NumericOverflow)?);
+            section_out_lens
+                .push(u32::try_from(out_len).map_err(|_| PDeflateError::NumericOverflow)?);
             cmd_cursor = sec_cmd_end;
         }
         if section_idx_cursor != section_index.len() {
@@ -3593,6 +4096,34 @@ fn decompress_chunk_into(payload: &[u8], out: &mut [u8]) -> Result<ChunkDecoded,
             return Err(PDeflateError::InvalidStream(
                 "sum(section_cmd_len) != section_cmd size",
             ));
+        }
+
+        let sections_t0 = Instant::now();
+        for sec in 0..section_count {
+            let sec_cmd_off = section_cmd_offsets[sec] as usize;
+            let sec_cmd_len = section_cmd_lens[sec] as usize;
+            let sec_cmd_end = sec_cmd_off
+                .checked_add(sec_cmd_len)
+                .ok_or(PDeflateError::NumericOverflow)?;
+            let out_start = section_out_offsets[sec] as usize;
+            let out_len = section_out_lens[sec] as usize;
+            let out_end = out_start
+                .checked_add(out_len)
+                .ok_or(PDeflateError::NumericOverflow)?;
+            let sec_cmd =
+                section_cmd
+                    .get(sec_cmd_off..sec_cmd_end)
+                    .ok_or(PDeflateError::InvalidStream(
+                        "section cmd range out of bounds",
+                    ))?;
+            decode_section(
+                sec_cmd,
+                out_len,
+                &scratch.table_repeat,
+                &mut out[out_start..out_end],
+                &mut decode_profile,
+                profile,
+            )?;
         }
         decode_profile.section_decode_ms = elapsed_ms(sections_t0);
         Ok(())
@@ -4971,6 +5502,8 @@ fn profile_detail_should_log_indexed(index: usize, total: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
 
     fn gen_data(size: usize) -> Vec<u8> {
         let mut out = vec![0u8; size];
@@ -4988,6 +5521,98 @@ mod tests {
             };
         }
         out
+    }
+
+    fn gen_data_seeded(size: usize, seed: u32) -> Vec<u8> {
+        let mut out = vec![0u8; size];
+        let mut x = seed;
+        for b in &mut out {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = (x >> 24) as u8;
+        }
+        out
+    }
+
+    fn decompress_with_options(stream: &[u8], opts: &PDeflateOptions) -> Vec<u8> {
+        let mut out = Vec::new();
+        pdeflate_decompress_into_with_stats_with_options(stream, &mut out, opts)
+            .expect("decompress with options");
+        out
+    }
+
+    fn extract_chunk_payloads(stream: &[u8]) -> Vec<Vec<u8>> {
+        let mut cursor = 0usize;
+        let magic = read_exact(stream, &mut cursor, 4).expect("stream magic");
+        assert_eq!(magic, STREAM_MAGIC);
+        let version = read_u16_le(stream, &mut cursor).expect("version");
+        assert_eq!(version, PDEFLATE_VERSION);
+        let _flags = read_u16_le(stream, &mut cursor).expect("flags");
+        let _chunk_size = read_u32_le(stream, &mut cursor).expect("chunk_size");
+        let _original_len = read_u64_le(stream, &mut cursor).expect("original_len");
+        let chunk_count = read_u32_le(stream, &mut cursor).expect("chunk_count") as usize;
+        let mut payloads = Vec::with_capacity(chunk_count);
+        for _ in 0..chunk_count {
+            let chunk_len = read_u32_le(stream, &mut cursor).expect("chunk_len") as usize;
+            let payload = read_exact(stream, &mut cursor, chunk_len).expect("chunk_payload");
+            payloads.push(payload.to_vec());
+        }
+        assert_eq!(cursor, stream.len(), "no trailing bytes expected");
+        payloads
+    }
+
+    fn compress_single_chunk_payload(input: &[u8], section_count: usize) -> Vec<u8> {
+        let opts = PDeflateOptions {
+            chunk_size: input.len().max(1),
+            section_count,
+            ..PDeflateOptions::default()
+        };
+        let stream = pdeflate_compress(input, &opts).expect("compress single chunk");
+        let payloads = extract_chunk_payloads(&stream);
+        assert_eq!(payloads.len(), 1, "single chunk expected");
+        payloads.into_iter().next().expect("single payload")
+    }
+
+    fn make_gpu_decode_job<'a>(chunk_index: usize, payload: &'a [u8]) -> gpu::GpuDecodeJob<'a> {
+        let preprocess = preprocess_chunk_for_gpu_decode(payload).expect("preprocess");
+        gpu::GpuDecodeJob {
+            chunk_index,
+            payload,
+            table_count: preprocess.table_count,
+            chunk_uncompressed_len: preprocess.chunk_uncompressed_len,
+            out_offset: 0,
+            out_len: preprocess.chunk_uncompressed_len,
+            section_meta: preprocess.section_meta,
+            preferred_slot: None,
+        }
+    }
+
+    fn decode_chunk_payload_cpu(payload: &[u8]) -> Vec<u8> {
+        let preprocess = preprocess_chunk_for_gpu_decode(payload).expect("preprocess");
+        let mut out = vec![0u8; preprocess.chunk_uncompressed_len];
+        decompress_chunk_into(payload, &mut out).expect("cpu decode");
+        out
+    }
+
+    fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("gpu test lock")
+    }
+
+    fn chunk_section_cmd_len(payload: &[u8]) -> usize {
+        let mut cursor = 0usize;
+        let _magic = read_exact(payload, &mut cursor, 4).expect("chunk magic");
+        let _version = read_u16_le(payload, &mut cursor).expect("chunk version");
+        let _flags = read_u16_le(payload, &mut cursor).expect("chunk flags");
+        let _chunk_uncompressed_len = read_u32_le(payload, &mut cursor).expect("chunk out len");
+        let _table_count = read_u16_le(payload, &mut cursor).expect("chunk table count");
+        let _section_count = read_u16_le(payload, &mut cursor).expect("chunk section count");
+        let _table_index_offset = read_u32_le(payload, &mut cursor).expect("table index off");
+        let _table_data_offset = read_u32_le(payload, &mut cursor).expect("table data off");
+        let _section_index_offset = read_u32_le(payload, &mut cursor).expect("section index off");
+        let section_cmd_offset = read_u32_le(payload, &mut cursor).expect("section cmd off");
+        payload.len().saturating_sub(section_cmd_offset as usize)
     }
 
     #[test]
@@ -5018,5 +5643,265 @@ mod tests {
         let compressed = pdeflate_compress(&input, &opts).expect("compress");
         let decoded = pdeflate_decompress(&compressed).expect("decompress");
         assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn gpu_decode_v2_matches_cpu_fixed_seed() {
+        let _guard = gpu_test_lock();
+        if !gpu::is_runtime_available() {
+            return;
+        }
+        gpu::reset_decode_slot_pool_for_test().expect("reset decode slot pool");
+        let input = gen_data_seeded(512 * 1024, 0x1234_5678);
+        let compressed = pdeflate_compress(&input, &PDeflateOptions::default()).expect("compress");
+        let cpu_opts = PDeflateOptions {
+            gpu_decompress_enabled: false,
+            gpu_decompress_force_gpu: false,
+            ..PDeflateOptions::default()
+        };
+        let gpu_opts = PDeflateOptions {
+            gpu_decompress_enabled: true,
+            gpu_decompress_force_gpu: true,
+            ..PDeflateOptions::default()
+        };
+        let cpu_out = decompress_with_options(&compressed, &cpu_opts);
+        let gpu_out = decompress_with_options(&compressed, &gpu_opts);
+        assert_eq!(cpu_out, input);
+        assert_eq!(gpu_out, input);
+        assert_eq!(gpu_out, cpu_out);
+    }
+
+    #[test]
+    fn gpu_decode_v2_matches_cpu_random_inputs() {
+        let _guard = gpu_test_lock();
+        if !gpu::is_runtime_available() {
+            return;
+        }
+        gpu::reset_decode_slot_pool_for_test().expect("reset decode slot pool");
+        let cpu_opts = PDeflateOptions {
+            gpu_decompress_enabled: false,
+            gpu_decompress_force_gpu: false,
+            ..PDeflateOptions::default()
+        };
+        let gpu_opts = PDeflateOptions {
+            gpu_decompress_enabled: true,
+            gpu_decompress_force_gpu: true,
+            ..PDeflateOptions::default()
+        };
+        for (i, seed) in [0x1u32, 0x1020_3040, 0xdead_beef].into_iter().enumerate() {
+            let input = gen_data_seeded(192 * 1024 + i * 37_777, seed);
+            let compressed =
+                pdeflate_compress(&input, &PDeflateOptions::default()).expect("compress random");
+            let cpu_out = decompress_with_options(&compressed, &cpu_opts);
+            let gpu_out = decompress_with_options(&compressed, &gpu_opts);
+            assert_eq!(cpu_out, input);
+            assert_eq!(gpu_out, input);
+            assert_eq!(gpu_out, cpu_out);
+        }
+    }
+
+    #[test]
+    fn gpu_decode_v2_section_boundary_cases() {
+        let cases = [
+            (1usize, 65_537usize, 0x1111_0001u32),
+            (257usize, 131_089usize, 0x2222_0002u32),
+            (128usize, 1_000_003usize, 0x3333_0003u32),
+        ];
+        for (section_count, input_len, seed) in cases {
+            let input = gen_data_seeded(input_len, seed);
+            let payload = compress_single_chunk_payload(&input, section_count);
+            let preprocess = preprocess_chunk_for_gpu_decode(&payload).expect("preprocess");
+            assert_eq!(preprocess.chunk_uncompressed_len, input_len);
+            assert_eq!(preprocess.section_meta.len(), section_count);
+            let mut total_out = 0usize;
+            let mut total_cmd = 0usize;
+            let mut prev_out_end = 0usize;
+            let mut out_len_min = usize::MAX;
+            let mut out_len_max = 0usize;
+            for sec in &preprocess.section_meta {
+                assert_eq!(
+                    sec.out_offset, prev_out_end,
+                    "section out must be contiguous"
+                );
+                total_out = total_out.saturating_add(sec.out_len);
+                total_cmd = total_cmd.saturating_add(sec.cmd_len);
+                prev_out_end = sec.out_offset.saturating_add(sec.out_len);
+                out_len_min = out_len_min.min(sec.out_len);
+                out_len_max = out_len_max.max(sec.out_len);
+            }
+            assert_eq!(total_out, input_len);
+            assert_eq!(prev_out_end, input_len);
+            assert_eq!(total_cmd, chunk_section_cmd_len(&payload));
+            assert!(
+                out_len_max.saturating_sub(out_len_min) <= 1,
+                "section out len balance must be <=1"
+            );
+            if section_count == 1 {
+                assert_eq!(preprocess.section_meta[0].out_offset, 0);
+                assert_eq!(preprocess.section_meta[0].out_len, input_len);
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_decode_v2_uses_normal_and_large_slots() {
+        let _guard = gpu_test_lock();
+        if !gpu::is_runtime_available() {
+            return;
+        }
+        gpu::reset_decode_slot_pool_for_test().expect("reset decode slot pool");
+        let small_input = gen_data_seeded(48 * 1024, 0x4444_0101);
+        let large_input = gen_data_seeded(96 * 1024 + 17, 0x4444_0202);
+        let small_payload = compress_single_chunk_payload(&small_input, 64);
+        let large_payload = compress_single_chunk_payload(&large_input, 64);
+        let jobs = vec![
+            make_gpu_decode_job(0, &small_payload),
+            make_gpu_decode_job(1, &large_payload),
+        ];
+        let decode_opts = PDeflateOptions {
+            gpu_decompress_enabled: true,
+            gpu_decompress_force_gpu: true,
+            chunk_size: 64 * 1024,
+            gpu_slot_count: 4,
+            gpu_submit_chunks: 2,
+            ..PDeflateOptions::default()
+        };
+        let results = gpu::decode_chunks_gpu_v2(&jobs, &decode_opts).expect("decode v2");
+        assert_eq!(results.len(), 2);
+        let small = results
+            .iter()
+            .find(|r| r.chunk_index == 0)
+            .expect("small result");
+        let large = results
+            .iter()
+            .find(|r| r.chunk_index == 1)
+            .expect("large result");
+        assert_eq!(small.disposition, gpu::GpuDecodeDisposition::SubmittedGpu);
+        assert_eq!(large.disposition, gpu::GpuDecodeDisposition::SubmittedGpu);
+        assert_eq!(small.decoded_chunk.as_deref(), Some(small_input.as_slice()));
+        assert_eq!(large.decoded_chunk.as_deref(), Some(large_input.as_slice()));
+        let small_slot = small.slot.expect("small slot");
+        let large_slot = large.slot.expect("large slot");
+        assert!(
+            small_slot.slot_index < (1usize << 30),
+            "small chunk should use normal slot, got {}",
+            small_slot.slot_index
+        );
+        assert!(
+            large_slot.slot_index >= (1usize << 30),
+            "large chunk should use large slot, got {}",
+            large_slot.slot_index
+        );
+    }
+
+    #[test]
+    fn gpu_decode_v2_local_cpu_fallback_on_oversized_chunk() {
+        let _guard = gpu_test_lock();
+        if !gpu::is_runtime_available() {
+            return;
+        }
+        gpu::reset_decode_slot_pool_for_test().expect("reset decode slot pool");
+        let small_input = gen_data_seeded(32 * 1024, 0x5555_0101);
+        let huge_input = gen_data_seeded(300 * 1024 + 13, 0x5555_0202);
+        let small_payload = compress_single_chunk_payload(&small_input, 64);
+        let huge_payload = compress_single_chunk_payload(&huge_input, 64);
+        let mut huge_job = make_gpu_decode_job(1, &huge_payload);
+        if let Some(last) = huge_job.section_meta.last_mut() {
+            // Force only this job to fail GPU-side upload validation:
+            // out_offset + out_len > chunk_uncompressed_len.
+            last.out_offset = huge_job.chunk_uncompressed_len;
+            last.out_len = 1;
+        }
+        let jobs = vec![make_gpu_decode_job(0, &small_payload), huge_job];
+        let decode_opts = PDeflateOptions {
+            gpu_decompress_enabled: true,
+            gpu_decompress_force_gpu: true,
+            chunk_size: 64 * 1024,
+            gpu_slot_count: 4,
+            gpu_submit_chunks: 2,
+            ..PDeflateOptions::default()
+        };
+        let results = gpu::decode_chunks_gpu_v2(&jobs, &decode_opts).expect("decode v2");
+        assert_eq!(results.len(), 2);
+        let small = results
+            .iter()
+            .find(|r| r.chunk_index == 0)
+            .expect("small result");
+        let huge = results
+            .iter()
+            .find(|r| r.chunk_index == 1)
+            .expect("huge result");
+        assert_eq!(small.disposition, gpu::GpuDecodeDisposition::SubmittedGpu);
+        assert_eq!(small.decoded_chunk.as_deref(), Some(small_input.as_slice()));
+        assert_eq!(huge.disposition, gpu::GpuDecodeDisposition::CpuFallback);
+        assert!(huge.decoded_chunk.is_none());
+        let huge_cpu = decode_chunk_payload_cpu(&huge_payload);
+        assert_eq!(huge_cpu, huge_input);
+    }
+
+    #[test]
+    fn gpu_decode_v2_result_order_is_sorted_by_chunk_index() {
+        let _guard = gpu_test_lock();
+        if !gpu::is_runtime_available() {
+            return;
+        }
+        gpu::reset_decode_slot_pool_for_test().expect("reset decode slot pool");
+        let decode_opts = PDeflateOptions {
+            gpu_decompress_enabled: true,
+            gpu_decompress_force_gpu: true,
+            chunk_size: 64 * 1024,
+            gpu_slot_count: 6,
+            gpu_submit_chunks: 4,
+            ..PDeflateOptions::default()
+        };
+        let cases = [
+            (30usize, 48 * 1024 + 11, 0x6000_0001u32),
+            (10usize, 96 * 1024 + 19, 0x6000_0002u32),
+            (40usize, 44 * 1024 + 7, 0x6000_0003u32),
+            (20usize, 72 * 1024 + 5, 0x6000_0004u32),
+        ];
+        let mut payload_by_index = BTreeMap::<usize, Vec<u8>>::new();
+        let mut expected_by_index = BTreeMap::<usize, Vec<u8>>::new();
+        for (idx, len, seed) in cases {
+            let input = gen_data_seeded(len, seed);
+            let payload = compress_single_chunk_payload(&input, 64);
+            payload_by_index.insert(idx, payload);
+            expected_by_index.insert(idx, input);
+        }
+        let submit_order = [40usize, 10, 30, 20];
+        let jobs: Vec<_> = submit_order
+            .iter()
+            .map(|idx| {
+                make_gpu_decode_job(
+                    *idx,
+                    payload_by_index
+                        .get(idx)
+                        .expect("payload by chunk index")
+                        .as_slice(),
+                )
+            })
+            .collect();
+        let results = gpu::decode_chunks_gpu_v2(&jobs, &decode_opts).expect("decode v2");
+        assert_eq!(results.len(), submit_order.len());
+        for w in results.windows(2) {
+            assert!(
+                w[0].chunk_index < w[1].chunk_index,
+                "results must be sorted by chunk_index"
+            );
+        }
+        for result in results {
+            let expected = expected_by_index
+                .get(&result.chunk_index)
+                .expect("expected by chunk index");
+            let actual = if let Some(bytes) = result.decoded_chunk {
+                bytes
+            } else {
+                let payload = payload_by_index
+                    .get(&result.chunk_index)
+                    .expect("payload by chunk index");
+                decode_chunk_payload_cpu(payload)
+            };
+            assert_eq!(actual, *expected, "decoded bytes mismatch");
+        }
     }
 }
