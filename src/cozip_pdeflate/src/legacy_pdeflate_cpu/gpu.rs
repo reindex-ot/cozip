@@ -1,5 +1,5 @@
 use std::sync::mpsc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -1764,6 +1764,9 @@ struct ResolvePackedTableSizesBatchProfile {
     submit_done_wait_ms: f64,
     map_callback_wait_ms: f64,
     map_wait_ms: f64,
+    pre_wait_latest_build_submit_ms: f64,
+    latest_build_submit_seq: u64,
+    readback_submit_seq: u64,
     parse_ms: f64,
     total_ms: f64,
 }
@@ -1929,6 +1932,24 @@ pub(crate) struct GpuBuildTableProfile {
     pub(crate) sample_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct GpuTableBuildBreakdown {
+    pub(crate) total_ms: f64,
+    pub(crate) pre_resource_ms: f64,
+    pub(crate) resource_setup_ms: f64,
+    pub(crate) upload_ms: f64,
+    pub(crate) encode_pass1_ms: f64,
+    pub(crate) submit_pass1_ms: f64,
+    pub(crate) encode_pass2_ms: f64,
+    pub(crate) submit_pass2_ms: f64,
+    pub(crate) stage_probe_submit_ms: f64,
+    pub(crate) stage_probe_wait_ms: f64,
+    pub(crate) stage_probe_parse_ms: f64,
+    pub(crate) stage_gpu_sum_ms: f64,
+    pub(crate) tail_ms: f64,
+    pub(crate) other_ms: f64,
+}
+
 pub(crate) struct GpuPackedTable {
     pub(crate) table_index: Vec<u8>,
     pub(crate) table_data: Vec<u8>,
@@ -1945,6 +1966,10 @@ pub(crate) struct GpuPackedTableDevice {
     pub(crate) sizes_known: bool,
     pub(crate) max_entries: usize,
     pub(crate) table_data_bytes_cap: usize,
+    pub(crate) build_id: u64,
+    pub(crate) build_submit_seq: u64,
+    pub(crate) build_submit_index: Option<wgpu::SubmissionIndex>,
+    pub(crate) build_breakdown: GpuTableBuildBreakdown,
 }
 
 struct GpuMatchRuntime {
@@ -2106,7 +2131,10 @@ static GPU_RUNTIME: OnceLock<Result<GpuMatchRuntime, String>> = OnceLock::new();
 static GPU_SUBMIT_STREAM_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 static BUILD_TABLE_STAGE_PROBE_SEQ: AtomicUsize = AtomicUsize::new(0);
 static BUILD_TABLE_STAGE_PROBE_UNSUPPORTED_LOGGED: OnceLock<()> = OnceLock::new();
+static BUILD_TABLE_BREAKDOWN_SEQ: AtomicUsize = AtomicUsize::new(0);
 static RESOLVE_MAP_WAIT_PROBE_SEQ: AtomicUsize = AtomicUsize::new(0);
+static BUILD_TABLE_DEVICE_SEQ: AtomicU64 = AtomicU64::new(0);
+static GPU_SUBMIT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
@@ -2143,6 +2171,17 @@ fn table_stage_probe_enabled() -> bool {
     })
 }
 
+fn table_build_breakdown_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("COZIP_PDEFLATE_PROFILE_TABLE_BUILD_BREAKDOWN") {
+        Ok(v) => {
+            let s = v.trim();
+            !(s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => env_flag_enabled("COZIP_PDEFLATE_PROFILE"),
+    })
+}
+
 fn resolve_map_wait_probe_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(
@@ -2156,8 +2195,17 @@ fn resolve_map_wait_probe_enabled() -> bool {
     )
 }
 
+fn resolve_wait_attribution_probe_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag_enabled("COZIP_PDEFLATE_PROFILE_RESOLVE_WAIT_ATTRIBUTION"))
+}
+
 fn table_stage_probe_should_log(seq: usize) -> bool {
     seq < 8 || seq % 64 == 0
+}
+
+fn next_gpu_submit_seq() -> u64 {
+    GPU_SUBMIT_SEQ.fetch_add(1, Ordering::Relaxed).saturating_add(1)
 }
 
 fn wait_for_queue_done(queue: &wgpu::Queue, device: &wgpu::Device) -> (f64, u64) {
@@ -6150,6 +6198,10 @@ pub(crate) fn upload_packed_table_device(
         sizes_known: true,
         max_entries: table_count,
         table_data_bytes_cap: table_data.len(),
+        build_id: 0,
+        build_submit_seq: 0,
+        build_submit_index: None,
+        build_breakdown: GpuTableBuildBreakdown::default(),
     })
 }
 
@@ -6162,6 +6214,7 @@ pub(crate) fn build_table_gpu_device(
     hash_history_limit: usize,
     table_sample_stride: usize,
 ) -> Result<(GpuPackedTableDevice, GpuBuildTableProfile), PDeflateError> {
+    let t_total_build = Instant::now();
     let r = runtime()?;
     if chunk.len() < 3 || max_entries == 0 {
         return Ok((
@@ -6187,10 +6240,17 @@ pub(crate) fn build_table_gpu_device(
                 sizes_known: true,
                 max_entries: 0,
                 table_data_bytes_cap: 0,
+                build_id: 0,
+                build_submit_seq: 0,
+                build_submit_index: None,
+                build_breakdown: GpuTableBuildBreakdown::default(),
             },
             GpuBuildTableProfile::default(),
         ));
     }
+    let build_id = BUILD_TABLE_DEVICE_SEQ
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
     let capped_max_entry_len = max_entry_len.min(254).max(3);
     let sample_stride = table_sample_stride.max(1).saturating_mul(8);
     let sample_count = (chunk.len() - 2).div_ceil(sample_stride);
@@ -6282,6 +6342,9 @@ pub(crate) fn build_table_gpu_device(
     }
     let mut stage_gpu_ms = [0.0_f64; BUILD_TABLE_STAGE_COUNT];
     let mut stage_probe_error: Option<String> = None;
+    let mut stage_probe_submit_ms = 0.0_f64;
+    let mut stage_probe_wait_ms = 0.0_f64;
+    let mut stage_probe_parse_ms = 0.0_f64;
     let mut stage_probe_query_set = None;
     let mut stage_probe_resolve_buffer = None;
     let mut stage_probe_readback_buffer = None;
@@ -6306,6 +6369,8 @@ pub(crate) fn build_table_gpu_device(
         }));
     }
 
+    let t_resource_setup = Instant::now();
+    let pre_resource_ms = elapsed_ms(t_total_build);
     let src_buffer = storage_upload_buffer(&r.device, "cozip-pdeflate-bt-src", src_words_bytes);
     let freq_params_buffer = storage_upload_buffer(
         &r.device,
@@ -6547,6 +6612,7 @@ pub(crate) fn build_table_gpu_device(
             },
         ],
     });
+    let resource_setup_ms = elapsed_ms(t_resource_setup);
 
     let t_upload = Instant::now();
     r.queue
@@ -6567,6 +6633,7 @@ pub(crate) fn build_table_gpu_device(
     );
     let upload_ms = elapsed_ms(t_upload);
 
+    let t_encode_pass1 = Instant::now();
     let mut encoder = r
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -6637,10 +6704,15 @@ pub(crate) fn build_table_gpu_device(
         encoder.write_timestamp(query_set, 5);
     }
     candidate_kernel_ms += elapsed_ms(t_bucket_count);
-    r.queue.submit(Some(encoder.finish()));
+    let encode_pass1_ms = elapsed_ms(t_encode_pass1);
+    let t_submit_pass1 = Instant::now();
+    let pass1_submit_seq = next_gpu_submit_seq();
+    let _pass1_submission = r.queue.submit(Some(encoder.finish()));
+    let submit_pass1_ms = elapsed_ms(t_submit_pass1);
 
     let readback_ms = 0.0;
 
+    let t_encode_pass2 = Instant::now();
     let mut encoder2 = r
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -6715,8 +6787,12 @@ pub(crate) fn build_table_gpu_device(
     if let Some(query_set) = stage_probe_query_set.as_ref() {
         encoder2.write_timestamp(query_set, 13);
     }
+    let encode_pass2_ms = elapsed_ms(t_encode_pass2);
     let sort_ms = elapsed_ms(t_finalize_kernel);
-    r.queue.submit(Some(encoder2.finish()));
+    let t_submit_pass2 = Instant::now();
+    let pass2_submit_seq = next_gpu_submit_seq();
+    let pass2_submission = r.queue.submit(Some(encoder2.finish()));
+    let submit_pass2_ms = elapsed_ms(t_submit_pass2);
     if let (Some(query_set), Some(resolve_buffer), Some(readback_buffer)) = (
         stage_probe_query_set.take(),
         stage_probe_resolve_buffer.take(),
@@ -6741,16 +6817,22 @@ pub(crate) fn build_table_gpu_device(
             0,
             ts_bytes.max(8),
         );
+        let t_probe_submit = Instant::now();
+        let _stage_probe_submit_seq = next_gpu_submit_seq();
         let submission = r.queue.submit(Some(ts_encoder.finish()));
+        stage_probe_submit_ms = elapsed_ms(t_probe_submit);
         let t_probe_readback = Instant::now();
+        let t_probe_wait = Instant::now();
         let slice = readback_buffer.slice(..ts_bytes.max(8));
         let (tx, rx) = mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
         r.device.poll(wgpu::Maintain::wait_for(submission));
+        stage_probe_wait_ms = elapsed_ms(t_probe_wait);
         match rx.recv() {
             Ok(Ok(())) => {
+                let t_probe_parse = Instant::now();
                 let mapped = slice.get_mapped_range();
                 let ticks: &[u64] = bytemuck::cast_slice(&mapped);
                 let period_ms = (r.queue.get_timestamp_period() as f64) / 1_000_000.0;
@@ -6767,6 +6849,7 @@ pub(crate) fn build_table_gpu_device(
                 }
                 drop(mapped);
                 readback_buffer.unmap();
+                stage_probe_parse_ms = elapsed_ms(t_probe_parse);
             }
             Ok(Err(e)) => {
                 stage_probe_error = Some(format!("map failed: {e}"));
@@ -6804,6 +6887,47 @@ pub(crate) fn build_table_gpu_device(
             }
         }
     }
+    let stage_sum_ms: f64 = stage_gpu_ms.iter().sum();
+    let total_build_ms = elapsed_ms(t_total_build);
+    let known_ms = pre_resource_ms
+        + resource_setup_ms
+        + upload_ms
+        + encode_pass1_ms
+        + submit_pass1_ms
+        + encode_pass2_ms
+        + submit_pass2_ms
+        + stage_probe_submit_ms
+        + stage_probe_wait_ms
+        + stage_probe_parse_ms;
+    let tail_ms = (total_build_ms - known_ms).max(0.0);
+    let other_ms = pre_resource_ms + tail_ms;
+    if table_build_breakdown_enabled() {
+        let seq = BUILD_TABLE_BREAKDOWN_SEQ.fetch_add(1, Ordering::Relaxed);
+        if table_stage_probe_should_log(seq) {
+            eprintln!(
+                "[cozip_pdeflate][timing][gpu-table-build-breakdown] seq={} build_id={} sample_count={} pass1_submit_seq={} pass2_submit_seq={} total_build_ms={:.3} pre_resource_ms={:.3} resource_setup_ms={:.3} upload_ms={:.3} encode_pass1_ms={:.3} submit_pass1_ms={:.3} encode_pass2_ms={:.3} submit_pass2_ms={:.3} stage_probe_submit_ms={:.3} stage_probe_wait_ms={:.3} stage_probe_parse_ms={:.3} stage_gpu_sum_ms={:.3} tail_ms={:.3} other_ms={:.3}",
+                seq,
+                build_id,
+                sample_count,
+                pass1_submit_seq,
+                pass2_submit_seq,
+                total_build_ms,
+                pre_resource_ms,
+                resource_setup_ms,
+                upload_ms,
+                encode_pass1_ms,
+                submit_pass1_ms,
+                encode_pass2_ms,
+                submit_pass2_ms,
+                stage_probe_submit_ms,
+                stage_probe_wait_ms,
+                stage_probe_parse_ms,
+                stage_sum_ms,
+                tail_ms,
+                other_ms
+            );
+        }
+    }
     Ok((
         GpuPackedTableDevice {
             table_index_buffer,
@@ -6815,6 +6939,25 @@ pub(crate) fn build_table_gpu_device(
             sizes_known: false,
             max_entries,
             table_data_bytes_cap,
+            build_id,
+            build_submit_seq: pass2_submit_seq,
+            build_submit_index: Some(pass2_submission),
+            build_breakdown: GpuTableBuildBreakdown {
+                total_ms: total_build_ms,
+                pre_resource_ms,
+                resource_setup_ms,
+                upload_ms,
+                encode_pass1_ms,
+                submit_pass1_ms,
+                encode_pass2_ms,
+                submit_pass2_ms,
+                stage_probe_submit_ms,
+                stage_probe_wait_ms,
+                stage_probe_parse_ms,
+                stage_gpu_sum_ms: stage_sum_ms,
+                tail_ms,
+                other_ms,
+            },
         },
         GpuBuildTableProfile {
             upload_ms,
@@ -6875,6 +7018,61 @@ fn resolve_packed_table_sizes_batch(
         profile.total_ms = elapsed_ms(t_total);
         return Ok((out, profile));
     }
+    let mut prebuild_total_ms = 0.0_f64;
+    let mut prebuild_pre_resource_ms = 0.0_f64;
+    let mut prebuild_resource_setup_ms = 0.0_f64;
+    let mut prebuild_upload_ms = 0.0_f64;
+    let mut prebuild_encode_pass1_ms = 0.0_f64;
+    let mut prebuild_submit_pass1_ms = 0.0_f64;
+    let mut prebuild_encode_pass2_ms = 0.0_f64;
+    let mut prebuild_submit_pass2_ms = 0.0_f64;
+    let mut prebuild_stage_probe_submit_ms = 0.0_f64;
+    let mut prebuild_stage_probe_wait_ms = 0.0_f64;
+    let mut prebuild_stage_probe_parse_ms = 0.0_f64;
+    let mut prebuild_stage_gpu_sum_ms = 0.0_f64;
+    let mut prebuild_tail_ms = 0.0_f64;
+    let mut prebuild_other_ms = 0.0_f64;
+    let mut prebuild_build_id_min = u64::MAX;
+    let mut prebuild_build_id_max = 0u64;
+    let mut prebuild_submit_seq_min = u64::MAX;
+    let mut prebuild_submit_seq_max = 0u64;
+    let mut latest_build_submit: Option<(u64, u64, wgpu::SubmissionIndex)> = None;
+    let mut unresolved_build_ids = Vec::<u64>::with_capacity(unresolved.len());
+    for (_, packed) in unresolved.iter().copied() {
+        let b = packed.build_breakdown;
+        prebuild_total_ms += b.total_ms;
+        prebuild_pre_resource_ms += b.pre_resource_ms;
+        prebuild_resource_setup_ms += b.resource_setup_ms;
+        prebuild_upload_ms += b.upload_ms;
+        prebuild_encode_pass1_ms += b.encode_pass1_ms;
+        prebuild_submit_pass1_ms += b.submit_pass1_ms;
+        prebuild_encode_pass2_ms += b.encode_pass2_ms;
+        prebuild_submit_pass2_ms += b.submit_pass2_ms;
+        prebuild_stage_probe_submit_ms += b.stage_probe_submit_ms;
+        prebuild_stage_probe_wait_ms += b.stage_probe_wait_ms;
+        prebuild_stage_probe_parse_ms += b.stage_probe_parse_ms;
+        prebuild_stage_gpu_sum_ms += b.stage_gpu_sum_ms;
+        prebuild_tail_ms += b.tail_ms;
+        prebuild_other_ms += b.other_ms;
+        if packed.build_id != 0 {
+            prebuild_build_id_min = prebuild_build_id_min.min(packed.build_id);
+            prebuild_build_id_max = prebuild_build_id_max.max(packed.build_id);
+            unresolved_build_ids.push(packed.build_id);
+        }
+        if packed.build_submit_seq != 0 {
+            prebuild_submit_seq_min = prebuild_submit_seq_min.min(packed.build_submit_seq);
+            prebuild_submit_seq_max = prebuild_submit_seq_max.max(packed.build_submit_seq);
+        }
+        if let Some(submit_index) = packed.build_submit_index.clone() {
+            let should_replace = latest_build_submit
+                .as_ref()
+                .map(|(seq, _, _)| packed.build_submit_seq > *seq)
+                .unwrap_or(true);
+            if should_replace {
+                latest_build_submit = Some((packed.build_submit_seq, packed.build_id, submit_index));
+            }
+        }
+    }
 
     let r = runtime()?;
     let t_setup = Instant::now();
@@ -6916,8 +7114,19 @@ fn resolve_packed_table_sizes_batch(
         );
     }
     profile.readback_setup_ms = elapsed_ms(t_setup);
+    if resolve_wait_attribution_probe_enabled() {
+        if let Some((latest_submit_seq, _, latest_submit_idx)) = latest_build_submit.as_ref() {
+            let t_pre_wait = Instant::now();
+            r.device
+                .poll(wgpu::Maintain::wait_for(latest_submit_idx.clone()));
+            profile.pre_wait_latest_build_submit_ms = elapsed_ms(t_pre_wait);
+            profile.latest_build_submit_seq = *latest_submit_seq;
+        }
+    }
     let t_submit = Instant::now();
+    let readback_submit_seq = next_gpu_submit_seq();
     let submission = r.queue.submit(Some(encoder.finish()));
+    profile.readback_submit_seq = readback_submit_seq;
     profile.submit_ms = elapsed_ms(t_submit);
 
     let t_map_wait = Instant::now();
@@ -6940,15 +7149,76 @@ fn resolve_packed_table_sizes_batch(
     if resolve_map_wait_probe_enabled() {
         let seq = RESOLVE_MAP_WAIT_PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
         if table_stage_probe_should_log(seq) {
+            let build_id_range = if prebuild_build_id_min != u64::MAX {
+                format!("{}..{}", prebuild_build_id_min, prebuild_build_id_max)
+            } else {
+                "none".to_string()
+            };
+            let submit_seq_range = if prebuild_submit_seq_min != u64::MAX {
+                format!("{}..{}", prebuild_submit_seq_min, prebuild_submit_seq_max)
+            } else {
+                "none".to_string()
+            };
+            let build_ids = if unresolved_build_ids.is_empty() {
+                "none".to_string()
+            } else {
+                unresolved_build_ids
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let (latest_submit_seq, latest_build_id) = latest_build_submit
+                .as_ref()
+                .map(|(submit_seq, build_id, _)| (*submit_seq, *build_id))
+                .unwrap_or((0, 0));
             eprintln!(
-                "[cozip_pdeflate][timing][resolve-map-wait-breakdown] seq={} unresolved={} readback_kib={:.1} submit_done_wait_ms={:.3} map_callback_wait_ms={:.3} map_wait_ms={:.3}",
+                "[cozip_pdeflate][timing][resolve-map-wait-breakdown] seq={} unresolved={} readback_kib={:.1} latest_build_submit_seq={} latest_build_id={} readback_submit_seq={} pre_wait_latest_build_submit_ms={:.3} submit_done_wait_ms={:.3} map_callback_wait_ms={:.3} map_wait_ms={:.3}",
                 seq,
                 unresolved.len(),
                 (readback_bytes as f64) / 1024.0,
+                latest_submit_seq,
+                latest_build_id,
+                profile.readback_submit_seq,
+                profile.pre_wait_latest_build_submit_ms,
                 profile.submit_done_wait_ms,
                 profile.map_callback_wait_ms,
                 profile.map_wait_ms,
             );
+            let unresolved_f = unresolved.len() as f64;
+            eprintln!(
+                "[cozip_pdeflate][timing][resolve-preceding-gpu-breakdown] seq={} unresolved={} build_id_range={} submit_seq_range={} build_ids={} prebuild_total_ms={:.3} prebuild_pre_resource_ms={:.3} prebuild_resource_setup_ms={:.3} prebuild_upload_ms={:.3} prebuild_encode_pass1_ms={:.3} prebuild_submit_pass1_ms={:.3} prebuild_encode_pass2_ms={:.3} prebuild_submit_pass2_ms={:.3} prebuild_stage_probe_submit_ms={:.3} prebuild_stage_probe_wait_ms={:.3} prebuild_stage_probe_parse_ms={:.3} prebuild_stage_gpu_sum_ms={:.3} prebuild_tail_ms={:.3} prebuild_other_ms={:.3} prebuild_avg_ms={:.3}",
+                seq,
+                unresolved.len(),
+                build_id_range,
+                submit_seq_range,
+                build_ids,
+                prebuild_total_ms,
+                prebuild_pre_resource_ms,
+                prebuild_resource_setup_ms,
+                prebuild_upload_ms,
+                prebuild_encode_pass1_ms,
+                prebuild_submit_pass1_ms,
+                prebuild_encode_pass2_ms,
+                prebuild_submit_pass2_ms,
+                prebuild_stage_probe_submit_ms,
+                prebuild_stage_probe_wait_ms,
+                prebuild_stage_probe_parse_ms,
+                prebuild_stage_gpu_sum_ms,
+                prebuild_tail_ms,
+                prebuild_other_ms,
+                if unresolved_f > 0.0 { prebuild_total_ms / unresolved_f } else { 0.0 },
+            );
+            if resolve_wait_attribution_probe_enabled() {
+                eprintln!(
+                    "[cozip_pdeflate][timing][resolve-wait-attribution] seq={} unresolved={} pre_wait_latest_build_submit_ms={:.3} submit_done_wait_ms={:.3} map_wait_ms={:.3} note=\"pre_wait captures unresolved build completion; submit_done_wait is residual after readback submit\"",
+                    seq,
+                    unresolved.len(),
+                    profile.pre_wait_latest_build_submit_ms,
+                    profile.submit_done_wait_ms,
+                    profile.map_wait_ms,
+                );
+            }
         }
     }
     let t_parse = Instant::now();
