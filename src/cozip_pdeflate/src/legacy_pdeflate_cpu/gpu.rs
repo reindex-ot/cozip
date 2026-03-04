@@ -18,6 +18,7 @@ const GPU_DECODE_TABLE_REPEAT_STRIDE: usize = 270;
 const GPU_DECODE_SECTION_META_HEADER_WORDS: usize = 4;
 const GPU_DECODE_SECTION_META_WORDS: usize = 4;
 const GPU_DECODE_MAX_TABLE_ID: usize = 0x0fff - 1;
+const GPU_DECODE_V2_WORKGROUP_SIZE: u32 = 64;
 
 const MATCH_SHADER: &str = r#"
 @group(0) @binding(0) var<storage, read> src_words: array<u32>;
@@ -1947,115 +1948,106 @@ fn mark_error(sec: u32, code: u32) {
 }
 
 @compute
-@workgroup_size(1, 1, 1)
+@workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
-    if (gid3.x != 0u || gid3.y != 0u || gid3.z != 0u) {
-        return;
-    }
     let section_count = section_meta_words[0];
     let table_count = section_meta_words[1];
-    if (section_count == 0u) {
+    if (gid3.y != 0u || gid3.z != 0u || gid3.x >= section_count) {
         return;
     }
 
-    var sec: u32 = 0u;
+    let sec = gid3.x;
+    let meta_base = META_HEADER_WORDS + sec * META_WORDS;
+    let cmd_start = section_meta_words[meta_base];
+    let cmd_len = section_meta_words[meta_base + 1u];
+    let out_start = section_meta_words[meta_base + 2u];
+    let out_len = section_meta_words[meta_base + 3u];
+    let cmd_end = cmd_start + cmd_len;
+    let out_end = out_start + out_len;
+
+    var cmd_cursor = cmd_start;
+    var out_cursor = out_start;
+    var err: u32 = 0u;
     loop {
-        if (sec >= section_count) {
+        if (out_cursor >= out_end) {
             break;
         }
-        let meta_base = META_HEADER_WORDS + sec * META_WORDS;
-        let cmd_start = section_meta_words[meta_base];
-        let cmd_len = section_meta_words[meta_base + 1u];
-        let out_start = section_meta_words[meta_base + 2u];
-        let out_len = section_meta_words[meta_base + 3u];
-        let cmd_end = cmd_start + cmd_len;
-        let out_end = out_start + out_len;
+        if (cmd_cursor + 2u > cmd_end) {
+            err = 1u;
+            break;
+        }
+        let cmd = load_cmd_u16(cmd_cursor);
+        cmd_cursor = cmd_cursor + 2u;
 
-        var cmd_cursor = cmd_start;
-        var out_cursor = out_start;
-        var err: u32 = 0u;
-        loop {
-            if (out_cursor >= out_end) {
+        let tag = cmd & 0x0fffu;
+        let len4 = (cmd >> 12u) & 0x0fu;
+        var len = len4;
+        if (len4 == 0x0fu) {
+            if (cmd_cursor >= cmd_end) {
+                err = 2u;
                 break;
             }
-            if (cmd_cursor + 2u > cmd_end) {
-                err = 1u;
-                break;
-            }
-            let cmd = load_cmd_u16(cmd_cursor);
-            cmd_cursor = cmd_cursor + 2u;
+            len = 15u + load_cmd_u8(cmd_cursor);
+            cmd_cursor = cmd_cursor + 1u;
+        }
+        if (len == 0u) {
+            err = 3u;
+            break;
+        }
+        if (len > MAX_CMD_LEN) {
+            err = 4u;
+            break;
+        }
+        if (len > (out_end - out_cursor)) {
+            err = 5u;
+            break;
+        }
 
-            let tag = cmd & 0x0fffu;
-            let len4 = (cmd >> 12u) & 0x0fu;
-            var len = len4;
-            if (len4 == 0x0fu) {
-                if (cmd_cursor >= cmd_end) {
-                    err = 2u;
-                    break;
-                }
-                len = 15u + load_cmd_u8(cmd_cursor);
-                cmd_cursor = cmd_cursor + 1u;
-            }
-            if (len == 0u) {
-                err = 3u;
+        if (tag == LITERAL_TAG) {
+            if (len > (cmd_end - cmd_cursor)) {
+                err = 6u;
                 break;
             }
-            if (len > MAX_CMD_LEN) {
-                err = 4u;
-                break;
-            }
-            if (len > (out_end - out_cursor)) {
-                err = 5u;
-                break;
-            }
-
-            if (tag == LITERAL_TAG) {
-                if (len > (cmd_end - cmd_cursor)) {
-                    err = 6u;
-                    break;
-                }
-                var i = 0u;
-                loop {
-                    if (i >= len) {
-                        break;
-                    }
-                    let b = load_cmd_u8(cmd_cursor + i);
-                    store_out_u8(out_cursor + i, b);
-                    i = i + 1u;
-                }
-                cmd_cursor = cmd_cursor + len;
-                out_cursor = out_cursor + len;
-                continue;
-            }
-
-            if (tag >= table_count) {
-                err = 7u;
-                break;
-            }
-            if (len < 3u) {
-                err = 8u;
-                break;
-            }
-
-            let table_base = tag * TABLE_REPEAT_STRIDE;
-            var j = 0u;
+            var i = 0u;
             loop {
-                if (j >= len) {
+                if (i >= len) {
                     break;
                 }
-                let b = load_table_u8(table_base + j);
-                store_out_u8(out_cursor + j, b);
-                j = j + 1u;
+                let b = load_cmd_u8(cmd_cursor + i);
+                store_out_u8(out_cursor + i, b);
+                i = i + 1u;
             }
+            cmd_cursor = cmd_cursor + len;
             out_cursor = out_cursor + len;
+            continue;
         }
 
-        if (err == 0u && cmd_cursor != cmd_end) {
-            err = 9u;
+        if (tag >= table_count) {
+            err = 7u;
+            break;
         }
-        mark_error(sec, err);
-        sec = sec + 1u;
+        if (len < 3u) {
+            err = 8u;
+            break;
+        }
+
+        let table_base = tag * TABLE_REPEAT_STRIDE;
+        var j = 0u;
+        loop {
+            if (j >= len) {
+                break;
+            }
+            let b = load_table_u8(table_base + j);
+            store_out_u8(out_cursor + j, b);
+            j = j + 1u;
+        }
+        out_cursor = out_cursor + len;
     }
+
+    if (err == 0u && cmd_cursor != cmd_end) {
+        err = 9u;
+    }
+    mark_error(sec, err);
 }
 "#;
 
@@ -8072,7 +8064,10 @@ fn submit_gpu_decode_job_on_slot(
         });
         pass.set_pipeline(&runtime.decode_v2_pipeline);
         pass.set_bind_group(0, &slot.decode_bind_group, &[]);
-        pass.dispatch_workgroups(1, 1, 1);
+        let section_count = u32::try_from(prepared.job.section_meta.len())
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        let groups_x = section_count.div_ceil(GPU_DECODE_V2_WORKGROUP_SIZE).max(1);
+        pass.dispatch_workgroups(groups_x, 1, 1);
     }
     if let (Some(query_set), Some(resolve_buffer), Some(readback_buffer)) = (
         ts_query_set.as_ref(),
@@ -8181,6 +8176,15 @@ fn collect_gpu_decode_job_from_slot(
     result.map(|decoded_chunk| (decoded_chunk, elapsed_ms(t_collect)))
 }
 
+fn gpu_decode_section_boundaries_word_aligned(section_meta: &[GpuDecodeSectionMeta]) -> bool {
+    // decode-v2 section-parallel kernel writes bytes via u32 RMW; internal section boundaries
+    // must be word-aligned to avoid cross-section word races.
+    section_meta
+        .iter()
+        .enumerate()
+        .all(|(idx, sec)| idx == 0 || (sec.out_offset & 3) == 0)
+}
+
 pub(crate) fn decode_chunks_gpu_v2(
     jobs: &[GpuDecodeJob<'_>],
     options: &PDeflateOptions,
@@ -8195,11 +8199,37 @@ pub(crate) fn decode_chunks_gpu_v2(
     }
     let runtime = runtime()?;
 
+    let mut out = Vec::with_capacity(jobs.len());
     let mut prepared_jobs = Vec::with_capacity(jobs.len());
+    let mut pre_fallback_unaligned_count = 0usize;
+    let mut pre_fallback_unaligned_first_chunk = None::<usize>;
     for job in jobs {
+        if !gpu_decode_section_boundaries_word_aligned(&job.section_meta) {
+            pre_fallback_unaligned_count = pre_fallback_unaligned_count.saturating_add(1);
+            pre_fallback_unaligned_first_chunk.get_or_insert(job.chunk_index);
+            out.push(GpuDecodeResult {
+                chunk_index: job.chunk_index,
+                slot: None,
+                disposition: GpuDecodeDisposition::CpuFallback,
+                decoded_chunk: None,
+            });
+            continue;
+        }
         let layout = parse_gpu_decode_payload_layout(job.payload)?;
         let req = build_gpu_decode_slot_requirement(job, layout)?;
         prepared_jobs.push(PreparedGpuDecodeJob { job, req, layout });
+    }
+    if pre_fallback_unaligned_count > 0 {
+        eprintln!(
+            "[cozip_pdeflate][timing][decode-v2-fallback] reason=unaligned_section_boundary chunks={} first_chunk_idx={} gpu_force={} note=\"section out_offset not 4-byte aligned; cpu fallback\"",
+            pre_fallback_unaligned_count,
+            pre_fallback_unaligned_first_chunk.unwrap_or(usize::MAX),
+            options.gpu_decompress_force_gpu
+        );
+    }
+    if prepared_jobs.is_empty() {
+        out.sort_by_key(|r| r.chunk_index);
+        return Ok(out);
     }
 
     let (normal_target_count, large_target_count) = gpu_decode_slot_split(options.gpu_slot_count);
@@ -8263,7 +8293,6 @@ pub(crate) fn decode_chunks_gpu_v2(
     }
     let mut next_submit_idx = 0usize;
     let mut inflight = Vec::<InflightGpuDecodeSubmission<'_>>::new();
-    let mut out = Vec::with_capacity(prepared_jobs.len());
     let mut wait_probe_submit_ms = 0.0_f64;
     let mut wait_probe_submit_done_wait_ms = 0.0_f64;
     let mut wait_probe_map_callback_wait_ms = 0.0_f64;

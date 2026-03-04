@@ -5751,7 +5751,7 @@ mod tests {
         }
         gpu::reset_decode_slot_pool_for_test().expect("reset decode slot pool");
         let small_input = gen_data_seeded(48 * 1024, 0x4444_0101);
-        let large_input = gen_data_seeded(96 * 1024 + 17, 0x4444_0202);
+        let large_input = gen_data_seeded(96 * 1024, 0x4444_0202);
         let small_payload = compress_single_chunk_payload(&small_input, 64);
         let large_payload = compress_single_chunk_payload(&large_input, 64);
         let jobs = vec![
