@@ -397,6 +397,18 @@ const BUILD_TABLE_FINALIZE_SHADER: &str = r#"
 @group(0) @binding(5) var<storage, read_write> out_meta: array<u32>;
 @group(0) @binding(6) var<storage, read_write> out_data: array<u32>;
 
+const FINALIZE_SHARDS: u32 = 128u;
+
+var<workgroup> shard_pos_0: array<u32, 128>;
+var<workgroup> shard_len_0: array<u32, 128>;
+var<workgroup> shard_score_0: array<u32, 128>;
+var<workgroup> shard_pos_1: array<u32, 128>;
+var<workgroup> shard_len_1: array<u32, 128>;
+var<workgroup> shard_score_1: array<u32, 128>;
+var<workgroup> shard_pos_2: array<u32, 128>;
+var<workgroup> shard_len_2: array<u32, 128>;
+var<workgroup> shard_score_2: array<u32, 128>;
+
 fn load_src(idx: u32) -> u32 {
     let w = src_words[idx >> 2u];
     let shift = (idx & 3u) * 8u;
@@ -417,13 +429,35 @@ fn store_out_data(idx: u32, value: u32) {
     out_data[wi] = (prev & (~mask)) | ((value & 0xffu) << shift);
 }
 
-@compute
-@workgroup_size(1, 1, 1)
-fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
-    if (gid3.x != 0u || gid3.y != 0u || gid3.z != 0u) {
-        return;
+fn better_candidate(
+    score: u32,
+    len: u32,
+    pos: u32,
+    best_score: u32,
+    best_len: u32,
+    best_pos: u32,
+) -> bool {
+    if (score > best_score) {
+        return true;
     }
+    if (score < best_score) {
+        return false;
+    }
+    if (len > best_len) {
+        return true;
+    }
+    if (len < best_len) {
+        return false;
+    }
+    return pos < best_pos;
+}
 
+@compute
+@workgroup_size(128, 1, 1)
+fn main(
+    @builtin(global_invocation_id) gid3: vec3<u32>,
+    @builtin(local_invocation_id) lid3: vec3<u32>,
+) {
     let total_len = params[0];
     let sample_count = params[1];
     let sorted_count = params[2];
@@ -432,6 +466,78 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
     let literal_limit = params[5];
     let min_literal_freq = params[6];
     let max_data_bytes = params[7];
+
+    let lane = lid3.x;
+
+    var top_score_0 = 0u;
+    var top_len_0 = 0u;
+    var top_pos_0 = 0u;
+    var top_score_1 = 0u;
+    var top_len_1 = 0u;
+    var top_pos_1 = 0u;
+    var top_score_2 = 0u;
+    var top_len_2 = 0u;
+    var top_pos_2 = 0u;
+
+    var sid_i = lane;
+    loop {
+        if (sid_i >= sorted_count) {
+            break;
+        }
+        let sid = sorted_indices[sid_i];
+        sid_i = sid_i + FINALIZE_SHARDS;
+        if (sid >= sample_count) {
+            continue;
+        }
+        let base = sid * 4u;
+        let score = cand_words[base + 0u];
+        if (score == 0u) {
+            continue;
+        }
+        let pos = cand_words[base + 1u];
+        let len = cand_words[base + 2u];
+        if (len == 0u || len > max_entry_len || pos + len > total_len) {
+            continue;
+        }
+
+        if (better_candidate(score, len, pos, top_score_0, top_len_0, top_pos_0)) {
+            top_score_2 = top_score_1;
+            top_len_2 = top_len_1;
+            top_pos_2 = top_pos_1;
+            top_score_1 = top_score_0;
+            top_len_1 = top_len_0;
+            top_pos_1 = top_pos_0;
+            top_score_0 = score;
+            top_len_0 = len;
+            top_pos_0 = pos;
+        } else if (better_candidate(score, len, pos, top_score_1, top_len_1, top_pos_1)) {
+            top_score_2 = top_score_1;
+            top_len_2 = top_len_1;
+            top_pos_2 = top_pos_1;
+            top_score_1 = score;
+            top_len_1 = len;
+            top_pos_1 = pos;
+        } else if (better_candidate(score, len, pos, top_score_2, top_len_2, top_pos_2)) {
+            top_score_2 = score;
+            top_len_2 = len;
+            top_pos_2 = pos;
+        }
+    }
+
+    shard_pos_0[lane] = top_pos_0;
+    shard_len_0[lane] = top_len_0;
+    shard_score_0[lane] = top_score_0;
+    shard_pos_1[lane] = top_pos_1;
+    shard_len_1[lane] = top_len_1;
+    shard_score_1[lane] = top_score_1;
+    shard_pos_2[lane] = top_pos_2;
+    shard_len_2[lane] = top_len_2;
+    shard_score_2[lane] = top_score_2;
+    workgroupBarrier();
+
+    if (gid3.x != 0u || gid3.y != 0u || gid3.z != 0u || lane != 0u) {
+        return;
+    }
 
     var taken_literals: array<u32, 256>;
     var b_init = 0u;
@@ -486,74 +592,89 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
         lit_rank = lit_rank + 1u;
     }
 
-    var sid_i = 0u;
+    var rank = 0u;
     loop {
-        if (sid_i >= sorted_count || out_count >= max_entries) {
+        if (rank >= 3u || out_count >= max_entries) {
             break;
         }
-        let sid = sorted_indices[sid_i];
-        sid_i = sid_i + 1u;
-        if (sid >= sample_count) {
-            continue;
-        }
-        let base = sid * 4u;
-        let score = cand_words[base + 0u];
-        if (score == 0u) {
-            continue;
-        }
-        let pos = cand_words[base + 1u];
-        let len = cand_words[base + 2u];
-        if (len == 0u || len > max_entry_len || pos + len > total_len) {
-            continue;
-        }
-        if (data_cursor + len > max_data_bytes) {
-            break;
-        }
-
-        var is_dup = 0u;
-        var e = 0u;
+        var shard = 0u;
         loop {
-            if (e >= out_count) {
+            if (shard >= FINALIZE_SHARDS || out_count >= max_entries) {
                 break;
             }
-            let e_off = out_meta[1u + e * 2u];
-            let e_len = out_meta[2u + e * 2u];
-            if (e_len == len) {
-                var same = 1u;
-                var j = 0u;
-                loop {
-                    if (j >= len) {
-                        break;
-                    }
-                    if (load_src(pos + j) != load_out_data(e_off + j)) {
-                        same = 0u;
-                        break;
-                    }
-                    j = j + 1u;
-                }
-                if (same == 1u) {
-                    is_dup = 1u;
+            var score = 0u;
+            var pos = 0u;
+            var len = 0u;
+            if (rank == 0u) {
+                score = shard_score_0[shard];
+                pos = shard_pos_0[shard];
+                len = shard_len_0[shard];
+            } else if (rank == 1u) {
+                score = shard_score_1[shard];
+                pos = shard_pos_1[shard];
+                len = shard_len_1[shard];
+            } else {
+                score = shard_score_2[shard];
+                pos = shard_pos_2[shard];
+                len = shard_len_2[shard];
+            }
+            shard = shard + 1u;
+            if (score == 0u) {
+                continue;
+            }
+            if (len == 0u || len > max_entry_len || pos + len > total_len) {
+                continue;
+            }
+            if (data_cursor + len > max_data_bytes) {
+                continue;
+            }
+
+            var is_dup = 0u;
+            var e = 0u;
+            loop {
+                if (e >= out_count) {
                     break;
                 }
+                let e_off = out_meta[1u + e * 2u];
+                let e_len = out_meta[2u + e * 2u];
+                if (e_len == len) {
+                    var same = 1u;
+                    var j = 0u;
+                    loop {
+                        if (j >= len) {
+                            break;
+                        }
+                        if (load_src(pos + j) != load_out_data(e_off + j)) {
+                            same = 0u;
+                            break;
+                        }
+                        j = j + 1u;
+                    }
+                    if (same == 1u) {
+                        is_dup = 1u;
+                        break;
+                    }
+                }
+                e = e + 1u;
             }
-            e = e + 1u;
-        }
-        if (is_dup == 1u) {
-            continue;
-        }
+            if (is_dup == 1u) {
+                continue;
+            }
 
-        out_meta[1u + out_count * 2u] = data_cursor;
-        out_meta[2u + out_count * 2u] = len;
-        var j = 0u;
-        loop {
-            if (j >= len) {
-                break;
+            out_meta[1u + out_count * 2u] = data_cursor;
+            out_meta[2u + out_count * 2u] = len;
+            var j = 0u;
+            loop {
+                if (j >= len) {
+                    break;
+                }
+                store_out_data(data_cursor + j, load_src(pos + j));
+                j = j + 1u;
             }
-            store_out_data(data_cursor + j, load_src(pos + j));
-            j = j + 1u;
+            data_cursor = data_cursor + len;
+            out_count = out_count + 1u;
         }
-        data_cursor = data_cursor + len;
-        out_count = out_count + 1u;
+        rank = rank + 1u;
     }
 
     out_meta[0] = out_count;
@@ -1640,6 +1761,8 @@ struct ResolvePackedTableSizesBatchProfile {
     scan_ms: f64,
     readback_setup_ms: f64,
     submit_ms: f64,
+    submit_done_wait_ms: f64,
+    map_callback_wait_ms: f64,
     map_wait_ms: f64,
     parse_ms: f64,
     total_ms: f64,
@@ -1983,6 +2106,7 @@ static GPU_RUNTIME: OnceLock<Result<GpuMatchRuntime, String>> = OnceLock::new();
 static GPU_SUBMIT_STREAM_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 static BUILD_TABLE_STAGE_PROBE_SEQ: AtomicUsize = AtomicUsize::new(0);
 static BUILD_TABLE_STAGE_PROBE_UNSUPPORTED_LOGGED: OnceLock<()> = OnceLock::new();
+static RESOLVE_MAP_WAIT_PROBE_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
@@ -2017,6 +2141,19 @@ fn table_stage_probe_enabled() -> bool {
         }
         Err(_) => env_flag_enabled("COZIP_PDEFLATE_PROFILE"),
     })
+}
+
+fn resolve_map_wait_probe_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(
+        || match std::env::var("COZIP_PDEFLATE_PROFILE_RESOLVE_MAP_WAIT_PROBE") {
+            Ok(v) => {
+                let s = v.trim();
+                !(s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false"))
+            }
+            Err(_) => env_flag_enabled("COZIP_PDEFLATE_PROFILE"),
+        },
+    )
 }
 
 fn table_stage_probe_should_log(seq: usize) -> bool {
@@ -6789,13 +6926,31 @@ fn resolve_packed_table_sizes_batch(
     slice.map_async(wgpu::MapMode::Read, move |res| {
         let _ = tx.send(res);
     });
+    let t_submit_done_wait = Instant::now();
     r.device.poll(wgpu::Maintain::wait_for(submission));
+    profile.submit_done_wait_ms = elapsed_ms(t_submit_done_wait);
+    let t_map_callback_wait = Instant::now();
     rx.recv()
         .map_err(|_| {
             PDeflateError::Gpu("gpu build-table batch size map channel closed".to_string())
         })?
         .map_err(|e| PDeflateError::Gpu(format!("gpu build-table batch size map failed: {e}")))?;
+    profile.map_callback_wait_ms = elapsed_ms(t_map_callback_wait);
     profile.map_wait_ms = elapsed_ms(t_map_wait);
+    if resolve_map_wait_probe_enabled() {
+        let seq = RESOLVE_MAP_WAIT_PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+        if table_stage_probe_should_log(seq) {
+            eprintln!(
+                "[cozip_pdeflate][timing][resolve-map-wait-breakdown] seq={} unresolved={} readback_kib={:.1} submit_done_wait_ms={:.3} map_callback_wait_ms={:.3} map_wait_ms={:.3}",
+                seq,
+                unresolved.len(),
+                (readback_bytes as f64) / 1024.0,
+                profile.submit_done_wait_ms,
+                profile.map_callback_wait_ms,
+                profile.map_wait_ms,
+            );
+        }
+    }
     let t_parse = Instant::now();
     let mapped = slice.get_mapped_range();
     let words: &[u32] = bytemuck::cast_slice(&mapped);

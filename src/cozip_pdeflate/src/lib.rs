@@ -2843,6 +2843,52 @@ fn read_chunk_from_stream<R: Read>(
     Ok(Some(buffer))
 }
 
+fn preload_all_stream_tasks<R: Read>(
+    reader: &mut R,
+    options: &HybridOptions,
+    queue_state: &Arc<(Mutex<StreamTaskQueueState>, Condvar)>,
+    total_tasks: &Arc<AtomicUsize>,
+) -> Result<(u64, u32, usize, usize), CozipDeflateError> {
+    let mut local_crc = crc32fast::Hasher::new();
+    let mut local_input_bytes = 0_u64;
+    let mut local_gpu_eligible_chunks = 0_usize;
+    let mut produced_chunks = 0_usize;
+
+    loop {
+        let Some(raw) = read_chunk_from_stream(reader, options.chunk_size)? else {
+            break;
+        };
+        local_crc.update(&raw);
+        local_input_bytes =
+            local_input_bytes.saturating_add(u64::try_from(raw.len()).unwrap_or(u64::MAX));
+        let task = ChunkTask {
+            index: produced_chunks,
+            raw,
+        };
+        if stream_task_is_gpu_eligible(&task, options) {
+            local_gpu_eligible_chunks = local_gpu_eligible_chunks.saturating_add(1);
+        }
+        let (queue_lock, _) = &**queue_state;
+        let mut state = lock(queue_lock)?;
+        state.queued_bytes = state.queued_bytes.saturating_add(task.raw.len());
+        state.queue.push_back(task);
+        produced_chunks = produced_chunks.saturating_add(1);
+    }
+
+    total_tasks.store(produced_chunks, Ordering::Relaxed);
+    let (queue_lock, queue_cv) = &**queue_state;
+    let mut state = lock(queue_lock)?;
+    state.closed = true;
+    queue_cv.notify_all();
+
+    Ok((
+        local_input_bytes,
+        local_crc.finalize(),
+        local_gpu_eligible_chunks,
+        produced_chunks,
+    ))
+}
+
 fn compression_mode_from_level(level: u32) -> CompressionMode {
     match level.clamp(0, 9) {
         0..=3 => CompressionMode::Speed,
@@ -2956,105 +3002,11 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<
     } else {
         cpu_worker_count(gpu_enabled)
     };
-    const ASYNC_STREAM_QUEUE_CAP_CHUNKS: usize = 64;
-    const ASYNC_STREAM_QUEUE_LOW_WATER_CHUNKS: usize = 16;
-
     let mut next_write_index = 0usize;
     let producer_stats = std::thread::scope(
         |scope| -> Result<(u64, u32, usize, usize), CozipDeflateError> {
-            let queue_ref = Arc::clone(&queue_state);
-            let err_ref = Arc::clone(&error);
-            let opts = options.clone();
-            let total_tasks_ref = Arc::clone(&total_tasks);
-            let producer_handle = scope.spawn(
-                move || -> Result<(u64, u32, usize, usize), CozipDeflateError> {
-                    let mut local_crc = crc32fast::Hasher::new();
-                    let mut local_input_bytes = 0_u64;
-                    let mut local_gpu_eligible_chunks = 0_usize;
-                    let mut produced_chunks = 0_usize;
-
-                    'producer: loop {
-                        if has_error(&err_ref) {
-                            break 'producer;
-                        }
-
-                        {
-                            let (queue_lock, queue_cv) = &*queue_ref;
-                            let mut state = lock(queue_lock)?;
-                            while state.queue.len() > ASYNC_STREAM_QUEUE_LOW_WATER_CHUNKS
-                                && !state.closed
-                                && !has_error(&err_ref)
-                            {
-                                state = wait_on_condvar(queue_cv, state)?;
-                            }
-                            if state.closed || has_error(&err_ref) {
-                                break 'producer;
-                            }
-                        }
-
-                        loop {
-                            let queue_len = {
-                                let (queue_lock, _) = &*queue_ref;
-                                let state = lock(queue_lock)?;
-                                if state.closed {
-                                    break 'producer;
-                                }
-                                state.queue.len()
-                            };
-                            if queue_len >= ASYNC_STREAM_QUEUE_CAP_CHUNKS {
-                                break;
-                            }
-
-                            let Some(raw) = read_chunk_from_stream(reader, opts.chunk_size)? else {
-                                let (queue_lock, queue_cv) = &*queue_ref;
-                                let mut state = lock(queue_lock)?;
-                                state.closed = true;
-                                queue_cv.notify_all();
-                                return Ok((
-                                    local_input_bytes,
-                                    local_crc.finalize(),
-                                    local_gpu_eligible_chunks,
-                                    produced_chunks,
-                                ));
-                            };
-
-                            local_crc.update(&raw);
-                            local_input_bytes = local_input_bytes
-                                .saturating_add(u64::try_from(raw.len()).unwrap_or(u64::MAX));
-                            let task = ChunkTask {
-                                index: produced_chunks,
-                                raw,
-                            };
-                            if stream_task_is_gpu_eligible(&task, &opts) {
-                                local_gpu_eligible_chunks =
-                                    local_gpu_eligible_chunks.saturating_add(1);
-                            }
-
-                            let (queue_lock, queue_cv) = &*queue_ref;
-                            let mut state = lock(queue_lock)?;
-                            if state.closed {
-                                break 'producer;
-                            }
-                            state.queued_bytes = state.queued_bytes.saturating_add(task.raw.len());
-                            state.queue.push_back(task);
-                            produced_chunks = produced_chunks.saturating_add(1);
-                            total_tasks_ref.store(produced_chunks, Ordering::Relaxed);
-                            queue_cv.notify_one();
-                        }
-                    }
-
-                    let (queue_lock, queue_cv) = &*queue_ref;
-                    let mut state = lock(queue_lock)?;
-                    state.closed = true;
-                    queue_cv.notify_all();
-                    Ok((
-                        local_input_bytes,
-                        local_crc.finalize(),
-                        local_gpu_eligible_chunks,
-                        produced_chunks,
-                    ))
-                },
-            );
+            let producer_stats =
+                preload_all_stream_tasks(reader, options, &queue_state, &total_tasks)?;
 
             let mut worker_handles = Vec::new();
             for _ in 0..cpu_workers {
@@ -3230,9 +3182,7 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<
                 let _ = handle.join();
             }
 
-            producer_handle
-                .join()
-                .map_err(|_| CozipDeflateError::Internal("async stream producer panicked"))?
+            Ok(producer_stats)
         },
     )?;
 
@@ -3378,9 +3328,6 @@ fn pdeflate_compress_stream_hybrid_payload_with_context<R: Read + Send, W: Write
     } else {
         cpu_worker_count(gpu_enabled)
     };
-    const ASYNC_STREAM_QUEUE_CAP_CHUNKS: usize = 64;
-    const ASYNC_STREAM_QUEUE_LOW_WATER_CHUNKS: usize = 16;
-
     let mut next_write_index = 0usize;
     let mut ordered_payloads = Vec::<Vec<u8>>::new();
 
@@ -3391,99 +3338,8 @@ fn pdeflate_compress_stream_hybrid_payload_with_context<R: Read + Send, W: Write
 
     let producer_stats = std::thread::scope(
         |scope| -> Result<(u64, u32, usize, usize), CozipDeflateError> {
-            let queue_ref = Arc::clone(&queue_state);
-            let err_ref = Arc::clone(&error);
-            let opts = options.clone();
-            let total_tasks_ref = Arc::clone(&total_tasks);
-            let producer_handle = scope.spawn(
-                move || -> Result<(u64, u32, usize, usize), CozipDeflateError> {
-                    let mut local_crc = crc32fast::Hasher::new();
-                    let mut local_input_bytes = 0_u64;
-                    let mut local_gpu_eligible_chunks = 0_usize;
-                    let mut produced_chunks = 0_usize;
-
-                    'producer: loop {
-                        if has_error(&err_ref) {
-                            break 'producer;
-                        }
-
-                        {
-                            let (queue_lock, queue_cv) = &*queue_ref;
-                            let mut state = lock(queue_lock)?;
-                            while state.queue.len() > ASYNC_STREAM_QUEUE_LOW_WATER_CHUNKS
-                                && !state.closed
-                                && !has_error(&err_ref)
-                            {
-                                state = wait_on_condvar(queue_cv, state)?;
-                            }
-                            if state.closed || has_error(&err_ref) {
-                                break 'producer;
-                            }
-                        }
-
-                        loop {
-                            let queue_len = {
-                                let (queue_lock, _) = &*queue_ref;
-                                let state = lock(queue_lock)?;
-                                if state.closed {
-                                    break 'producer;
-                                }
-                                state.queue.len()
-                            };
-                            if queue_len >= ASYNC_STREAM_QUEUE_CAP_CHUNKS {
-                                break;
-                            }
-
-                            let Some(raw) = read_chunk_from_stream(reader, opts.chunk_size)? else {
-                                let (queue_lock, queue_cv) = &*queue_ref;
-                                let mut state = lock(queue_lock)?;
-                                state.closed = true;
-                                queue_cv.notify_all();
-                                return Ok((
-                                    local_input_bytes,
-                                    local_crc.finalize(),
-                                    local_gpu_eligible_chunks,
-                                    produced_chunks,
-                                ));
-                            };
-
-                            local_crc.update(&raw);
-                            local_input_bytes = local_input_bytes
-                                .saturating_add(u64::try_from(raw.len()).unwrap_or(u64::MAX));
-                            let task = ChunkTask {
-                                index: produced_chunks,
-                                raw,
-                            };
-                            if stream_task_is_gpu_eligible(&task, &opts) {
-                                local_gpu_eligible_chunks =
-                                    local_gpu_eligible_chunks.saturating_add(1);
-                            }
-
-                            let (queue_lock, queue_cv) = &*queue_ref;
-                            let mut state = lock(queue_lock)?;
-                            if state.closed {
-                                break 'producer;
-                            }
-                            state.queued_bytes = state.queued_bytes.saturating_add(task.raw.len());
-                            state.queue.push_back(task);
-                            produced_chunks = produced_chunks.saturating_add(1);
-                            total_tasks_ref.store(produced_chunks, Ordering::Relaxed);
-                            queue_cv.notify_one();
-                        }
-                    }
-
-                    let (queue_lock, queue_cv) = &*queue_ref;
-                    let mut state = lock(queue_lock)?;
-                    state.closed = true;
-                    queue_cv.notify_all();
-                    Ok((
-                        local_input_bytes,
-                        local_crc.finalize(),
-                        local_gpu_eligible_chunks,
-                        produced_chunks,
-                    ))
-                },
-            );
+            let producer_stats =
+                preload_all_stream_tasks(reader, options, &queue_state, &total_tasks)?;
 
             let mut worker_handles = Vec::new();
             for _ in 0..cpu_workers {
@@ -3604,9 +3460,7 @@ fn pdeflate_compress_stream_hybrid_payload_with_context<R: Read + Send, W: Write
                 let _ = handle.join();
             }
 
-            producer_handle
-                .join()
-                .map_err(|_| CozipDeflateError::Internal("async stream producer panicked"))?
+            Ok(producer_stats)
         },
     )?;
 
