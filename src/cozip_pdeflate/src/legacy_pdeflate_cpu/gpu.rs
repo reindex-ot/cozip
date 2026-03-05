@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::{PDeflateError, PDeflateOptions};
 
@@ -3306,6 +3306,27 @@ fn gpu_decode_v2_true_batch_jobs(default_jobs: usize) -> usize {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(default_jobs.max(1))
+}
+
+fn gpu_decode_v2_true_batch_copy_jobs(default_jobs: usize) -> usize {
+    let fallback = if default_jobs >= 8 {
+        (default_jobs / 2).max(1)
+    } else {
+        default_jobs.max(1)
+    };
+    std::env::var("COZIP_PDEFLATE_GPU_DECODE_V2_TRUE_BATCH_COPY_JOBS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(fallback)
+}
+
+fn gpu_decode_v2_true_batch_readback_ring(default_depth: usize) -> usize {
+    std::env::var("COZIP_PDEFLATE_GPU_DECODE_V2_TRUE_BATCH_READBACK_RING")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default_depth.max(1))
 }
 
 fn gpu_decode_v2_wait_probe_should_log(seq: usize) -> bool {
@@ -8993,6 +9014,14 @@ fn decode_chunks_gpu_v2_true_batch(
     let batch_jobs = gpu_decode_v2_true_batch_jobs(default_batch_jobs)
         .max(1)
         .min(prepared_jobs.len().max(1));
+    let copy_jobs = gpu_decode_v2_true_batch_copy_jobs(batch_jobs)
+        .max(1)
+        .min(batch_jobs);
+    let readback_ring = gpu_decode_v2_true_batch_readback_ring(target_inflight.max(1))
+        .clamp(1, wait_high_watermark.max(1));
+    let map_timeout_duration = map_timeout_ms
+        .filter(|ms| ms.is_finite() && *ms >= 0.0)
+        .map(|ms| Duration::from_secs_f64(ms / 1000.0));
 
     let mut wait_probe_submit_ms = 0.0_f64;
     let mut wait_probe_submit_done_wait_ms = 0.0_f64;
@@ -9002,7 +9031,6 @@ fn decode_chunks_gpu_v2_true_batch(
     let mut wait_probe_kernel_timestamp_samples = 0usize;
     let mut wait_probe_queue_stall_est_ms = 0.0_f64;
     let mut wait_probe_ready_any_hits = 0usize;
-    let wait_probe_wait_loops = 0usize;
     let mut wait_probe_inflight_batches_sum = 0usize;
     let mut wait_probe_inflight_batches_max = 0usize;
     let mut wait_probe_inflight_samples = 0usize;
@@ -9015,7 +9043,201 @@ fn decode_chunks_gpu_v2_true_batch(
     let mut fallback_collect_error_jobs = 0usize;
     let mut fallback_kernel_error_jobs = 0usize;
 
-    for round in prepared_jobs.chunks(batch_jobs) {
+    struct PendingGpuDecodeTrueBatch<'a> {
+        host_jobs: Vec<GpuDecodeBatchHostJob<'a>>,
+        out_readback: wgpu::Buffer,
+        err_readback: wgpu::Buffer,
+        out_rx: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+        err_rx: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+        ts_readback_buffer: Option<wgpu::Buffer>,
+        ts_map_rx: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+        submit_at: Instant,
+        completion_gate: Arc<AtomicBool>,
+        submission: wgpu::SubmissionIndex,
+    }
+
+    let mut pending_batches = VecDeque::<PendingGpuDecodeTrueBatch<'_>>::new();
+    let wait_probe_wait_loops = 0usize;
+
+    let mut drain_pending = |mut pending: PendingGpuDecodeTrueBatch<'_>,
+                             out: &mut Vec<GpuDecodeResult>| {
+        runtime
+            .device
+            .poll(wgpu::Maintain::wait_for(pending.submission));
+        let submit_done_wait_ms = elapsed_ms(pending.submit_at);
+
+        let t_map_wait = Instant::now();
+        let wait_map = |rx: &mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>| -> (bool, bool) {
+            if let Some(timeout) = map_timeout_duration {
+                match rx.recv_timeout(timeout) {
+                    Ok(Ok(())) => (true, false),
+                    Ok(Err(_)) => (false, false),
+                    Err(mpsc::RecvTimeoutError::Timeout) => (false, true),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => (false, false),
+                }
+            } else {
+                match rx.recv() {
+                    Ok(Ok(())) => (true, false),
+                    Ok(Err(_)) => (false, false),
+                    Err(_) => (false, false),
+                }
+            }
+        };
+        let (out_map_ok, out_map_timed_out) = wait_map(&pending.out_rx);
+        let (err_map_ok, err_map_timed_out) = wait_map(&pending.err_rx);
+        let map_timed_out = out_map_timed_out || err_map_timed_out;
+
+        let mut kernel_timestamp_ms = f64::NAN;
+        if let Some(ts_rx) = pending.ts_map_rx.take() {
+            let ts_ready = if let Some(timeout) = map_timeout_duration {
+                match ts_rx.recv_timeout(timeout) {
+                    Ok(Ok(())) => true,
+                    Ok(Err(_)) => false,
+                    Err(_) => false,
+                }
+            } else {
+                matches!(ts_rx.recv(), Ok(Ok(())))
+            };
+            if ts_ready {
+                if let Some(ts_buffer) = pending.ts_readback_buffer.take() {
+                    let mapped = ts_buffer.slice(..).get_mapped_range();
+                    let ts_words: &[u64] = bytemuck::cast_slice(&mapped);
+                    if ts_words.len() >= 2 && ts_words[1] >= ts_words[0] {
+                        let period_ms = (runtime.queue.get_timestamp_period() as f64) / 1_000_000.0;
+                        kernel_timestamp_ms =
+                            (ts_words[1].saturating_sub(ts_words[0]) as f64) * period_ms;
+                    }
+                    drop(mapped);
+                    ts_buffer.unmap();
+                }
+            }
+        }
+        let map_callback_wait_ms = elapsed_ms(t_map_wait);
+
+        if !out_map_ok || !err_map_ok {
+            if out_map_ok {
+                pending.out_readback.unmap();
+            }
+            if err_map_ok {
+                pending.err_readback.unmap();
+            }
+            if map_timed_out {
+                fallback_map_timeout_jobs =
+                    fallback_map_timeout_jobs.saturating_add(pending.host_jobs.len());
+            } else {
+                fallback_map_error_jobs =
+                    fallback_map_error_jobs.saturating_add(pending.host_jobs.len());
+            }
+            for host in &pending.host_jobs {
+                out.push(GpuDecodeResult {
+                    chunk_index: host.prepared.job.chunk_index,
+                    slot: None,
+                    disposition: GpuDecodeDisposition::CpuFallback,
+                    decoded_chunk: None,
+                });
+            }
+            if wait_probe_enabled {
+                wait_probe_submit_done_wait_ms += submit_done_wait_ms;
+                wait_probe_map_callback_wait_ms += map_callback_wait_ms;
+                let queue_stall_est_ms = if kernel_timestamp_ms.is_finite() {
+                    (submit_done_wait_ms - kernel_timestamp_ms).max(0.0)
+                } else {
+                    submit_done_wait_ms.max(0.0)
+                };
+                wait_probe_queue_stall_est_ms += queue_stall_est_ms;
+                if kernel_timestamp_ms.is_finite() {
+                    wait_probe_kernel_timestamp_ms += kernel_timestamp_ms;
+                    wait_probe_kernel_timestamp_samples =
+                        wait_probe_kernel_timestamp_samples.saturating_add(1);
+                }
+                if pending.completion_gate.load(Ordering::Acquire) {
+                    wait_probe_ready_any_hits = wait_probe_ready_any_hits.saturating_add(1);
+                }
+                wait_probe_completed_jobs =
+                    wait_probe_completed_jobs.saturating_add(pending.host_jobs.len());
+            }
+            return;
+        }
+
+        let t_map_copy = Instant::now();
+        let mapped_out = pending.out_readback.slice(..).get_mapped_range();
+        let mapped_err = pending.err_readback.slice(..).get_mapped_range();
+        let err_words: &[u32] = bytemuck::cast_slice(&mapped_err);
+        for host in &pending.host_jobs {
+            let sec_count = host.prepared.job.section_meta.len();
+            let err_end = host
+                .error_base
+                .saturating_add(host.error_words)
+                .min(err_words.len());
+            let has_error = if sec_count > 0 && host.error_base < err_end {
+                err_words[host.error_base..err_end]
+                    .iter()
+                    .take(sec_count)
+                    .copied()
+                    .any(|v| v != 0)
+            } else {
+                false
+            };
+            if has_error {
+                fallback_kernel_error_jobs = fallback_kernel_error_jobs.saturating_add(1);
+                out.push(GpuDecodeResult {
+                    chunk_index: host.prepared.job.chunk_index,
+                    slot: None,
+                    disposition: GpuDecodeDisposition::CpuFallback,
+                    decoded_chunk: None,
+                });
+                continue;
+            }
+            let end = host.out_base.saturating_add(host.out_len);
+            if end > mapped_out.len() || host.out_base > end {
+                fallback_collect_error_jobs = fallback_collect_error_jobs.saturating_add(1);
+                out.push(GpuDecodeResult {
+                    chunk_index: host.prepared.job.chunk_index,
+                    slot: None,
+                    disposition: GpuDecodeDisposition::CpuFallback,
+                    decoded_chunk: None,
+                });
+                continue;
+            }
+            let mut decoded = vec![0u8; host.out_len];
+            if !decoded.is_empty() {
+                decoded.copy_from_slice(&mapped_out[host.out_base..end]);
+            }
+            out.push(GpuDecodeResult {
+                chunk_index: host.prepared.job.chunk_index,
+                slot: None,
+                disposition: GpuDecodeDisposition::SubmittedGpu,
+                decoded_chunk: Some(decoded),
+            });
+        }
+        drop(mapped_err);
+        drop(mapped_out);
+        pending.err_readback.unmap();
+        pending.out_readback.unmap();
+        let map_copy_ms = elapsed_ms(t_map_copy);
+
+        if wait_probe_enabled {
+            wait_probe_submit_done_wait_ms += submit_done_wait_ms;
+            wait_probe_map_callback_wait_ms += map_callback_wait_ms;
+            wait_probe_map_copy_ms += map_copy_ms;
+            if kernel_timestamp_ms.is_finite() {
+                wait_probe_kernel_timestamp_ms += kernel_timestamp_ms;
+                wait_probe_kernel_timestamp_samples =
+                    wait_probe_kernel_timestamp_samples.saturating_add(1);
+                wait_probe_queue_stall_est_ms +=
+                    (submit_done_wait_ms - kernel_timestamp_ms).max(0.0);
+            } else {
+                wait_probe_queue_stall_est_ms += submit_done_wait_ms.max(0.0);
+            }
+            if pending.completion_gate.load(Ordering::Acquire) {
+                wait_probe_ready_any_hits = wait_probe_ready_any_hits.saturating_add(1);
+            }
+            wait_probe_completed_jobs =
+                wait_probe_completed_jobs.saturating_add(pending.host_jobs.len());
+        }
+    };
+
+    for round in prepared_jobs.chunks(copy_jobs) {
         let mut desc_words = Vec::<u32>::with_capacity(
             1usize.saturating_add(round.len().saturating_mul(GPU_DECODE_V2_BATCH_DESC_WORDS)),
         );
@@ -9466,126 +9688,39 @@ fn decode_chunks_gpu_v2_true_batch(
             ts_map_rx = Some(rx);
         }
 
-        runtime.device.poll(wgpu::Maintain::wait_for(submission));
-        let submit_done_wait_ms = elapsed_ms(submit_at);
-        let t_map_wait = Instant::now();
-        let out_map_ok = out_rx.recv().ok().and_then(Result::ok).is_some();
-        let err_map_ok = err_rx.recv().ok().and_then(Result::ok).is_some();
-        let mut kernel_timestamp_ms = f64::NAN;
-        if let Some(ts_rx) = ts_map_rx.take() {
-            if ts_rx.recv().ok().and_then(Result::ok).is_some() {
-                if let Some(ts_buffer) = ts_readback_buffer.take() {
-                    let mapped = ts_buffer.slice(..).get_mapped_range();
-                    let ts_words: &[u64] = bytemuck::cast_slice(&mapped);
-                    if ts_words.len() >= 2 && ts_words[1] >= ts_words[0] {
-                        let period_ms = (runtime.queue.get_timestamp_period() as f64) / 1_000_000.0;
-                        kernel_timestamp_ms =
-                            (ts_words[1].saturating_sub(ts_words[0]) as f64) * period_ms;
-                    }
-                    drop(mapped);
-                    ts_buffer.unmap();
-                }
-            }
-        }
-        let map_callback_wait_ms = elapsed_ms(t_map_wait);
-
-        if !out_map_ok || !err_map_ok {
-            for prepared in round {
-                out.push(GpuDecodeResult {
-                    chunk_index: prepared.job.chunk_index,
-                    slot: None,
-                    disposition: GpuDecodeDisposition::CpuFallback,
-                    decoded_chunk: None,
-                });
-            }
-            if map_timeout_ms.is_some() {
-                fallback_map_timeout_jobs = fallback_map_timeout_jobs.saturating_add(round.len());
-            } else {
-                fallback_map_error_jobs = fallback_map_error_jobs.saturating_add(round.len());
-            }
-            continue;
-        }
-
-        let t_map_copy = Instant::now();
-        let mapped_out = out_slice.get_mapped_range();
-        let mapped_err = err_slice.get_mapped_range();
-        let err_words: &[u32] = bytemuck::cast_slice(&mapped_err);
-        for host in &host_jobs {
-            let sec_count = host.prepared.job.section_meta.len();
-            let err_end = host
-                .error_base
-                .saturating_add(host.error_words)
-                .min(err_words.len());
-            let has_error = if sec_count > 0 && host.error_base < err_end {
-                err_words[host.error_base..err_end]
-                    .iter()
-                    .take(sec_count)
-                    .copied()
-                    .any(|v| v != 0)
-            } else {
-                false
-            };
-            if has_error {
-                fallback_kernel_error_jobs = fallback_kernel_error_jobs.saturating_add(1);
-                out.push(GpuDecodeResult {
-                    chunk_index: host.prepared.job.chunk_index,
-                    slot: None,
-                    disposition: GpuDecodeDisposition::CpuFallback,
-                    decoded_chunk: None,
-                });
-                continue;
-            }
-            let end = host.out_base.saturating_add(host.out_len);
-            if end > mapped_out.len() || host.out_base > end {
-                fallback_collect_error_jobs = fallback_collect_error_jobs.saturating_add(1);
-                out.push(GpuDecodeResult {
-                    chunk_index: host.prepared.job.chunk_index,
-                    slot: None,
-                    disposition: GpuDecodeDisposition::CpuFallback,
-                    decoded_chunk: None,
-                });
-                continue;
-            }
-            let mut decoded = vec![0u8; host.out_len];
-            if !decoded.is_empty() {
-                decoded.copy_from_slice(&mapped_out[host.out_base..end]);
-            }
-            out.push(GpuDecodeResult {
-                chunk_index: host.prepared.job.chunk_index,
-                slot: None,
-                disposition: GpuDecodeDisposition::SubmittedGpu,
-                decoded_chunk: Some(decoded),
-            });
-        }
-        drop(mapped_err);
-        drop(mapped_out);
-        err_readback.unmap();
-        out_readback.unmap();
-        let map_copy_ms = elapsed_ms(t_map_copy);
+        pending_batches.push_back(PendingGpuDecodeTrueBatch {
+            host_jobs,
+            out_readback,
+            err_readback,
+            out_rx,
+            err_rx,
+            ts_readback_buffer,
+            ts_map_rx,
+            submit_at,
+            completion_gate,
+            submission,
+        });
 
         if wait_probe_enabled {
-            wait_probe_submit_done_wait_ms += submit_done_wait_ms;
-            wait_probe_map_callback_wait_ms += map_callback_wait_ms;
-            wait_probe_map_copy_ms += map_copy_ms;
-            if kernel_timestamp_ms.is_finite() {
-                wait_probe_kernel_timestamp_ms += kernel_timestamp_ms;
-                wait_probe_kernel_timestamp_samples =
-                    wait_probe_kernel_timestamp_samples.saturating_add(1);
-                wait_probe_queue_stall_est_ms +=
-                    (submit_done_wait_ms - kernel_timestamp_ms).max(0.0);
-            } else {
-                wait_probe_queue_stall_est_ms += submit_done_wait_ms.max(0.0);
-            }
-            if completion_gate.load(Ordering::Acquire) {
-                wait_probe_ready_any_hits = wait_probe_ready_any_hits.saturating_add(1);
-            }
             wait_probe_inflight_samples = wait_probe_inflight_samples.saturating_add(1);
             wait_probe_inflight_batches_sum =
-                wait_probe_inflight_batches_sum.saturating_add(host_jobs.len());
-            wait_probe_inflight_batches_max = wait_probe_inflight_batches_max.max(host_jobs.len());
-            wait_probe_completed_jobs = wait_probe_completed_jobs.saturating_add(host_jobs.len());
+                wait_probe_inflight_batches_sum.saturating_add(pending_batches.len());
+            wait_probe_inflight_batches_max =
+                wait_probe_inflight_batches_max.max(pending_batches.len());
+        }
+
+        while pending_batches.len() >= readback_ring {
+            if let Some(pending) = pending_batches.pop_front() {
+                drain_pending(pending, &mut out);
+            }
         }
     }
+
+    while let Some(pending) = pending_batches.pop_front() {
+        drain_pending(pending, &mut out);
+    }
+
+    out.sort_by_key(|r| r.chunk_index);
 
     if wait_probe_enabled {
         let inflight_avg = if wait_probe_inflight_samples > 0 {
