@@ -7,7 +7,7 @@ use super::{PDeflateError, PDeflateOptions};
 
 const WORKGROUP_SIZE: u32 = 128;
 const PREFIX2_TABLE_SIZE: usize = 1 << 16;
-const PACK_CHUNK_HEADER_SIZE: usize = 32;
+const PACK_CHUNK_HEADER_SIZE: usize = 36;
 const PACK_CHUNK_MAGIC: [u8; 4] = *b"PDF0";
 const PACK_CHUNK_VERSION: u16 = 0;
 const BUILD_TABLE_STAGE_COUNT: usize = 7;
@@ -15,7 +15,7 @@ const BUILD_TABLE_STAGE_QUERY_COUNT: u32 = (BUILD_TABLE_STAGE_COUNT as u32) * 2;
 const SPARSE_KERNEL_STAGE_COUNT: usize = 2;
 const SPARSE_KERNEL_STAGE_QUERY_COUNT: u32 = (SPARSE_KERNEL_STAGE_COUNT as u32) * 2;
 const GPU_DECODE_TABLE_REPEAT_STRIDE: usize = 270;
-const GPU_DECODE_SECTION_META_HEADER_WORDS: usize = 4;
+const GPU_DECODE_SECTION_META_HEADER_WORDS: usize = 6;
 const GPU_DECODE_SECTION_META_WORDS: usize = 4;
 const GPU_DECODE_MAX_TABLE_ID: usize = 0x0fff - 1;
 const GPU_DECODE_V2_WORKGROUP_SIZE: u32 = 64;
@@ -1571,6 +1571,7 @@ fn load_header_byte(idx: u32, section_cmd_off: u32) -> u32 {
     let table_index_off = params[3];
     let table_data_off = params[5];
     let section_index_off = params[7];
+    let huff_lut_off = section_index_off;
 
     if (idx == 0u) {
         return 0x50u;
@@ -1603,10 +1604,13 @@ fn load_header_byte(idx: u32, section_cmd_off: u32) -> u32 {
         return low8(table_data_off, (idx - 20u) * 8u);
     }
     if (idx >= 24u && idx < 28u) {
-        return low8(section_index_off, (idx - 24u) * 8u);
+        return low8(huff_lut_off, (idx - 24u) * 8u);
     }
     if (idx >= 28u && idx < 32u) {
-        return low8(section_cmd_off, (idx - 28u) * 8u);
+        return low8(section_index_off, (idx - 28u) * 8u);
+    }
+    if (idx >= 32u && idx < 36u) {
+        return low8(section_cmd_off, (idx - 32u) * 8u);
     }
     return 0u;
 }
@@ -1806,7 +1810,7 @@ fn read_output_byte(pos: u32) -> u32 {
     let section_cmd_len = section_meta_words[0];
     let section_index_len = section_meta_words[1];
     let overflow = section_meta_words[2];
-    let header_len = 32u;
+    let header_len = 36u;
     let table_index_off = params[3];
     let table_index_len = params[4];
     let table_data_off = params[5];
@@ -1964,7 +1968,8 @@ const DECODE_V2_SHADER: &str = r#"
 const LITERAL_TAG: u32 = 0x0fffu;
 const MAX_CMD_LEN: u32 = 270u;
 const TABLE_REPEAT_STRIDE: u32 = 270u;
-const META_HEADER_WORDS: u32 = 4u;
+const HUFF_LUT_HEADER_SIZE: u32 = 12u;
+const META_HEADER_WORDS: u32 = 6u;
 const META_WORDS: u32 = 4u;
 
 @group(0) @binding(0) var<storage, read> cmd_words: array<u32>;
@@ -1985,6 +1990,20 @@ fn load_table_u8(idx: u32) -> u32 {
     return (w >> shift) & 0xffu;
 }
 
+fn load_table_u16(idx: u32) -> u32 {
+    let b0 = load_table_u8(idx);
+    let b1 = load_table_u8(idx + 1u);
+    return b0 | (b1 << 8u);
+}
+
+fn load_table_u32(idx: u32) -> u32 {
+    let b0 = load_table_u8(idx);
+    let b1 = load_table_u8(idx + 1u);
+    let b2 = load_table_u8(idx + 2u);
+    let b3 = load_table_u8(idx + 3u);
+    return b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+}
+
 fn load_cmd_u16(idx: u32) -> u32 {
     let b0 = load_cmd_u8(idx);
     let b1 = load_cmd_u8(idx + 1u);
@@ -2003,12 +2022,122 @@ fn mark_error(sec: u32, code: u32) {
     error_words[sec] = code;
 }
 
+fn read_cmd_bit(bit_pos: u32) -> u32 {
+    let byte = load_cmd_u8(bit_pos >> 3u);
+    let shift = bit_pos & 7u;
+    return (byte >> shift) & 1u;
+}
+
+fn peek_cmd_bits(bit_cursor: u32, bit_end: u32, bit_len: u32) -> u32 {
+    var out = 0u;
+    var i = 0u;
+    loop {
+        if (i >= bit_len) {
+            break;
+        }
+        let p = bit_cursor + i;
+        if (p >= bit_end) {
+            break;
+        }
+        out = out | (read_cmd_bit(p) << i);
+        i = i + 1u;
+    }
+    return out;
+}
+
+struct DecodedSymbol {
+    ok: u32,
+    symbol: u32,
+    next_bit: u32,
+    err: u32,
+};
+
+fn decode_huffman_symbol(
+    bit_cursor: u32,
+    bit_end: u32,
+    huff_lut_off: u32,
+    huff_lut_len: u32,
+) -> DecodedSymbol {
+    if (huff_lut_len < HUFF_LUT_HEADER_SIZE) {
+        return DecodedSymbol(0u, 0u, bit_cursor, 10u);
+    }
+    let lut_end = huff_lut_off + huff_lut_len;
+    let root_bits = load_table_u8(huff_lut_off + 2u);
+    let max_code_bits = load_table_u8(huff_lut_off + 3u);
+    let root_len = load_table_u32(huff_lut_off + 4u);
+    let sub_len = load_table_u32(huff_lut_off + 8u);
+    if (root_bits == 0u || root_bits > max_code_bits || max_code_bits > 31u) {
+        return DecodedSymbol(0u, 0u, bit_cursor, 11u);
+    }
+    let expected_root_len = (1u << root_bits);
+    if (root_len != expected_root_len) {
+        return DecodedSymbol(0u, 0u, bit_cursor, 12u);
+    }
+    let entry_bytes = (root_len + sub_len) * 4u;
+    let entries_off = huff_lut_off + HUFF_LUT_HEADER_SIZE;
+    if (entries_off + entry_bytes > lut_end) {
+        return DecodedSymbol(0u, 0u, bit_cursor, 13u);
+    }
+    if (bit_cursor >= bit_end) {
+        return DecodedSymbol(0u, 0u, bit_cursor, 14u);
+    }
+
+    let root_mask = (1u << root_bits) - 1u;
+    let root_idx = peek_cmd_bits(bit_cursor, bit_end, root_bits) & root_mask;
+    if (root_idx >= root_len) {
+        return DecodedSymbol(0u, 0u, bit_cursor, 15u);
+    }
+    let root_entry = load_table_u32(entries_off + root_idx * 4u);
+    let root_kind = root_entry & 0x3u;
+    if (root_kind == 1u) {
+        let bit_len = (root_entry >> 2u) & 0xffu;
+        let symbol = (root_entry >> 10u) & 0xffffu;
+        if (bit_len == 0u || bit_cursor + bit_len > bit_end || symbol > 255u) {
+            return DecodedSymbol(0u, 0u, bit_cursor, 16u);
+        }
+        return DecodedSymbol(1u, symbol, bit_cursor + bit_len, 0u);
+    }
+    if (root_kind == 2u) {
+        let sub_bits = (root_entry >> 2u) & 0xffu;
+        let sub_off = root_entry >> 10u;
+        if (sub_bits == 0u || root_bits + sub_bits > max_code_bits) {
+            return DecodedSymbol(0u, 0u, bit_cursor, 17u);
+        }
+        let full = peek_cmd_bits(bit_cursor, bit_end, root_bits + sub_bits);
+        let sub_mask = (1u << sub_bits) - 1u;
+        let sub_idx = (full >> root_bits) & sub_mask;
+        let abs_idx = root_len + sub_off + sub_idx;
+        if (abs_idx >= root_len + sub_len) {
+            return DecodedSymbol(0u, 0u, bit_cursor, 18u);
+        }
+        let sub_entry = load_table_u32(entries_off + abs_idx * 4u);
+        let sub_kind = sub_entry & 0x3u;
+        if (sub_kind != 1u) {
+            return DecodedSymbol(0u, 0u, bit_cursor, 19u);
+        }
+        let bit_len = (sub_entry >> 2u) & 0xffu;
+        let symbol = (sub_entry >> 10u) & 0xffffu;
+        if (bit_len == 0u || bit_cursor + bit_len > bit_end || symbol > 255u) {
+            return DecodedSymbol(0u, 0u, bit_cursor, 20u);
+        }
+        return DecodedSymbol(1u, symbol, bit_cursor + bit_len, 0u);
+    }
+    return DecodedSymbol(0u, 0u, bit_cursor, 21u);
+}
+
 @compute
 @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
     let section_count = section_meta_words[0];
     let table_count = section_meta_words[1];
+    let table_repeat_stride = section_meta_words[2];
+    let huff_lut_off = section_meta_words[3];
+    let huff_lut_len = section_meta_words[4];
     if (gid3.y != 0u || gid3.z != 0u || gid3.x >= section_count) {
+        return;
+    }
+    if (table_repeat_stride == 0u) {
+        mark_error(gid3.x, 22u);
         return;
     }
 
@@ -2019,32 +2148,40 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
     let out_start = section_meta_words[meta_base + 2u];
     let out_len = section_meta_words[meta_base + 3u];
     let cmd_end = cmd_start + cmd_len;
+    let bit_end = cmd_end * 8u;
     let out_end = out_start + out_len;
 
-    var cmd_cursor = cmd_start;
+    var bit_cursor = cmd_start * 8u;
     var out_cursor = out_start;
     var err: u32 = 0u;
     loop {
         if (out_cursor >= out_end) {
             break;
         }
-        if (cmd_cursor + 2u > cmd_end) {
-            err = 1u;
+        let sym0 = decode_huffman_symbol(bit_cursor, bit_end, huff_lut_off, huff_lut_len);
+        if (sym0.ok == 0u) {
+            err = 1u + sym0.err;
             break;
         }
-        let cmd = load_cmd_u16(cmd_cursor);
-        cmd_cursor = cmd_cursor + 2u;
+        let sym1 = decode_huffman_symbol(sym0.next_bit, bit_end, huff_lut_off, huff_lut_len);
+        if (sym1.ok == 0u) {
+            err = 1u + sym1.err;
+            break;
+        }
+        bit_cursor = sym1.next_bit;
+        let cmd = sym0.symbol | (sym1.symbol << 8u);
 
         let tag = cmd & 0x0fffu;
         let len4 = (cmd >> 12u) & 0x0fu;
         var len = len4;
         if (len4 == 0x0fu) {
-            if (cmd_cursor >= cmd_end) {
-                err = 2u;
+            let ext_sym = decode_huffman_symbol(bit_cursor, bit_end, huff_lut_off, huff_lut_len);
+            if (ext_sym.ok == 0u) {
+                err = 2u + ext_sym.err;
                 break;
             }
-            len = 15u + load_cmd_u8(cmd_cursor);
-            cmd_cursor = cmd_cursor + 1u;
+            len = 15u + ext_sym.symbol;
+            bit_cursor = ext_sym.next_bit;
         }
         if (len == 0u) {
             err = 3u;
@@ -2060,20 +2197,24 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
         }
 
         if (tag == LITERAL_TAG) {
-            if (len > (cmd_end - cmd_cursor)) {
-                err = 6u;
-                break;
-            }
             var i = 0u;
             loop {
                 if (i >= len) {
                     break;
                 }
-                let b = load_cmd_u8(cmd_cursor + i);
-                store_out_u8(out_cursor + i, b);
+                let lit_sym =
+                    decode_huffman_symbol(bit_cursor, bit_end, huff_lut_off, huff_lut_len);
+                if (lit_sym.ok == 0u) {
+                    err = 6u + lit_sym.err;
+                    break;
+                }
+                store_out_u8(out_cursor + i, lit_sym.symbol);
+                bit_cursor = lit_sym.next_bit;
                 i = i + 1u;
             }
-            cmd_cursor = cmd_cursor + len;
+            if (err != 0u) {
+                break;
+            }
             out_cursor = out_cursor + len;
             continue;
         }
@@ -2087,7 +2228,7 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
             break;
         }
 
-        let table_base = tag * TABLE_REPEAT_STRIDE;
+        let table_base = tag * table_repeat_stride;
         var j = 0u;
         loop {
             if (j >= len) {
@@ -2100,7 +2241,7 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
         out_cursor = out_cursor + len;
     }
 
-    if (err == 0u && cmd_cursor != cmd_end) {
+    if (err == 0u && bit_cursor != bit_end) {
         err = 9u;
     }
     mark_error(sec, err);
@@ -2597,7 +2738,9 @@ struct GpuDecodePayloadLayout {
     table_count: usize,
     table_index_start: usize,
     table_data_start: usize,
-    table_end: usize,
+    table_data_end: usize,
+    huff_lut_start: usize,
+    huff_lut_end: usize,
     cmd_start: usize,
 }
 
@@ -5600,13 +5743,15 @@ pub(crate) fn pack_chunk_payload(
     let table_data_offset = table_index_offset
         .checked_add(table_index.len())
         .ok_or(PDeflateError::NumericOverflow)?;
-    let section_index_offset = table_data_offset
+    let huff_lut_offset = table_data_offset
         .checked_add(table_data.len())
         .ok_or(PDeflateError::NumericOverflow)?;
-    let section_cmd_offset = section_index_offset
+    // T01: reserve LUT area in header. Actual bytes are added in T03.
+    let section_index_offset = huff_lut_offset;
+    let section_bitstream_offset = section_index_offset
         .checked_add(section_index.len())
         .ok_or(PDeflateError::NumericOverflow)?;
-    let total_len = section_cmd_offset
+    let total_len = section_bitstream_offset
         .checked_add(section_cmd.len())
         .ok_or(PDeflateError::NumericOverflow)?;
 
@@ -5618,10 +5763,12 @@ pub(crate) fn pack_chunk_payload(
         u32::try_from(table_index_offset).map_err(|_| PDeflateError::NumericOverflow)?;
     let table_data_offset_u32 =
         u32::try_from(table_data_offset).map_err(|_| PDeflateError::NumericOverflow)?;
+    let huff_lut_offset_u32 =
+        u32::try_from(huff_lut_offset).map_err(|_| PDeflateError::NumericOverflow)?;
     let section_index_offset_u32 =
         u32::try_from(section_index_offset).map_err(|_| PDeflateError::NumericOverflow)?;
-    let section_cmd_offset_u32 =
-        u32::try_from(section_cmd_offset).map_err(|_| PDeflateError::NumericOverflow)?;
+    let section_bitstream_offset_u32 =
+        u32::try_from(section_bitstream_offset).map_err(|_| PDeflateError::NumericOverflow)?;
 
     let mut header = [0u8; PACK_CHUNK_HEADER_SIZE];
     header[0..4].copy_from_slice(&PACK_CHUNK_MAGIC);
@@ -5632,8 +5779,9 @@ pub(crate) fn pack_chunk_payload(
     write_u16_le_fixed(&mut header, 14, section_count_u16);
     write_u32_le_fixed(&mut header, 16, table_index_offset_u32);
     write_u32_le_fixed(&mut header, 20, table_data_offset_u32);
-    write_u32_le_fixed(&mut header, 24, section_index_offset_u32);
-    write_u32_le_fixed(&mut header, 28, section_cmd_offset_u32);
+    write_u32_le_fixed(&mut header, 24, huff_lut_offset_u32);
+    write_u32_le_fixed(&mut header, 28, section_index_offset_u32);
+    write_u32_le_fixed(&mut header, 32, section_bitstream_offset_u32);
 
     let header_words = pack_bytes_to_words(&header);
     let table_index_words = pack_bytes_to_words(table_index);
@@ -5653,7 +5801,7 @@ pub(crate) fn pack_chunk_payload(
         u32::try_from(table_data.len()).map_err(|_| PDeflateError::NumericOverflow)?,
         section_index_offset_u32,
         u32::try_from(section_index.len()).map_err(|_| PDeflateError::NumericOverflow)?,
-        section_cmd_offset_u32,
+        section_bitstream_offset_u32,
         u32::try_from(section_cmd.len()).map_err(|_| PDeflateError::NumericOverflow)?,
         total_words_u32,
     ];
@@ -7511,14 +7659,17 @@ fn parse_gpu_decode_payload_layout(
         .map_err(|_| PDeflateError::NumericOverflow)?;
     let table_data_offset = usize::try_from(read_le_u32_at(payload, 20)?)
         .map_err(|_| PDeflateError::NumericOverflow)?;
-    let section_index_offset = usize::try_from(read_le_u32_at(payload, 24)?)
+    let huff_lut_offset = usize::try_from(read_le_u32_at(payload, 24)?)
         .map_err(|_| PDeflateError::NumericOverflow)?;
-    let section_cmd_offset = usize::try_from(read_le_u32_at(payload, 28)?)
+    let section_index_offset = usize::try_from(read_le_u32_at(payload, 28)?)
+        .map_err(|_| PDeflateError::NumericOverflow)?;
+    let section_bitstream_offset = usize::try_from(read_le_u32_at(payload, 32)?)
         .map_err(|_| PDeflateError::NumericOverflow)?;
     if !(table_index_offset <= table_data_offset
-        && table_data_offset <= section_index_offset
-        && section_index_offset <= section_cmd_offset
-        && section_cmd_offset <= payload.len())
+        && table_data_offset <= huff_lut_offset
+        && huff_lut_offset <= section_index_offset
+        && section_index_offset <= section_bitstream_offset
+        && section_bitstream_offset <= payload.len())
     {
         return Err(PDeflateError::InvalidStream(
             "gpu decode chunk offsets invalid",
@@ -7535,12 +7686,19 @@ fn parse_gpu_decode_payload_layout(
             "gpu decode table index length mismatch",
         ));
     }
+    if huff_lut_offset == section_index_offset {
+        return Err(PDeflateError::InvalidStream(
+            "gpu decode huffman lut block is empty",
+        ));
+    }
     Ok(GpuDecodePayloadLayout {
         table_count,
         table_index_start: table_index_offset,
         table_data_start: table_data_offset,
-        table_end: section_index_offset,
-        cmd_start: section_cmd_offset,
+        table_data_end: huff_lut_offset,
+        huff_lut_start: huff_lut_offset,
+        huff_lut_end: section_index_offset,
+        cmd_start: section_bitstream_offset,
     })
 }
 
@@ -7589,7 +7747,10 @@ fn build_gpu_decode_slot_requirement(
             "gpu decode table_count mismatch",
         ));
     }
-    if layout.cmd_start > job.payload.len() || layout.table_end > job.payload.len() {
+    if layout.cmd_start > job.payload.len()
+        || layout.table_data_end > job.payload.len()
+        || layout.huff_lut_end > job.payload.len()
+    {
         return Err(PDeflateError::InvalidStream(
             "gpu decode payload layout out of bounds",
         ));
@@ -7600,8 +7761,13 @@ fn build_gpu_decode_slot_requirement(
         .table_count
         .checked_mul(GPU_DECODE_TABLE_REPEAT_STRIDE)
         .ok_or(PDeflateError::NumericOverflow)?;
-    let table_bytes =
-        u64::try_from(table_repeat_bytes).map_err(|_| PDeflateError::NumericOverflow)?;
+    let lut_bytes = layout.huff_lut_end.saturating_sub(layout.huff_lut_start);
+    let table_bytes = u64::try_from(
+        table_repeat_bytes
+            .checked_add(lut_bytes)
+            .ok_or(PDeflateError::NumericOverflow)?,
+    )
+    .map_err(|_| PDeflateError::NumericOverflow)?;
     let out_bytes =
         u64::try_from(job.chunk_uncompressed_len).map_err(|_| PDeflateError::NumericOverflow)?;
     Ok(GpuDecodeSlotRequirement {
@@ -7915,7 +8081,7 @@ fn try_acquire_gpu_decode_slot_for_job(
     None
 }
 
-fn build_gpu_decode_table_repeat_bytes(
+fn build_gpu_decode_table_buffer_bytes(
     payload: &[u8],
     layout: GpuDecodePayloadLayout,
 ) -> Result<Vec<u8>, PDeflateError> {
@@ -7930,10 +8096,20 @@ fn build_gpu_decode_table_repeat_bytes(
         ));
     }
     let table_data = payload
-        .get(layout.table_data_start..layout.table_end)
+        .get(layout.table_data_start..layout.table_data_end)
         .ok_or(PDeflateError::InvalidStream(
             "gpu decode table data slice out of bounds",
         ))?;
+    let huff_lut = payload
+        .get(layout.huff_lut_start..layout.huff_lut_end)
+        .ok_or(PDeflateError::InvalidStream(
+            "gpu decode huffman lut slice out of bounds",
+        ))?;
+    if huff_lut.is_empty() {
+        return Err(PDeflateError::InvalidStream(
+            "gpu decode huffman lut is empty",
+        ));
+    }
     let mut table_offsets = Vec::with_capacity(layout.table_count.saturating_add(1));
     table_offsets.push(0usize);
     for &entry_len_u8 in table_index {
@@ -7975,7 +8151,9 @@ fn build_gpu_decode_table_repeat_bytes(
             dst[i] = entry[i % entry.len()];
         }
     }
-    Ok(table_repeat)
+    let mut table_bytes = table_repeat;
+    table_bytes.extend_from_slice(huff_lut);
+    Ok(table_bytes)
 }
 
 fn upload_gpu_decode_job_to_slot(
@@ -7983,8 +8161,7 @@ fn upload_gpu_decode_job_to_slot(
     slot: &GpuDecodeSlotEntry,
     prepared: PreparedGpuDecodeJob<'_>,
 ) -> Result<(), PDeflateError> {
-    let table_repeat_bytes =
-        build_gpu_decode_table_repeat_bytes(prepared.job.payload, prepared.layout)?;
+    let table_bytes = build_gpu_decode_table_buffer_bytes(prepared.job.payload, prepared.layout)?;
     let cmd_bytes = prepared
         .job
         .payload
@@ -8006,6 +8183,24 @@ fn upload_gpu_decode_job_to_slot(
     section_meta_words.push(
         u32::try_from(GPU_DECODE_TABLE_REPEAT_STRIDE)
             .map_err(|_| PDeflateError::NumericOverflow)?,
+    );
+    section_meta_words.push(
+        u32::try_from(
+            prepared
+                .layout
+                .table_count
+                .saturating_mul(GPU_DECODE_TABLE_REPEAT_STRIDE),
+        )
+        .map_err(|_| PDeflateError::NumericOverflow)?,
+    );
+    section_meta_words.push(
+        u32::try_from(
+            prepared
+                .layout
+                .huff_lut_end
+                .saturating_sub(prepared.layout.huff_lut_start),
+        )
+        .map_err(|_| PDeflateError::NumericOverflow)?,
     );
     section_meta_words.push(0u32);
     for section in &prepared.job.section_meta {
@@ -8044,8 +8239,8 @@ fn upload_gpu_decode_job_to_slot(
             bytemuck::cast_slice(&cmd_words),
         );
     }
-    if !table_repeat_bytes.is_empty() {
-        let table_words = pack_bytes_to_words(&table_repeat_bytes);
+    if !table_bytes.is_empty() {
+        let table_words = pack_bytes_to_words(&table_bytes);
         runtime.queue.write_buffer(
             &slot.buffers.table_buffer,
             0,

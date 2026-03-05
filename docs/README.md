@@ -18,6 +18,10 @@
 - `zip-compatible-hybrid-deflate-design.md`: CZDF実装を活かしつつZIP互換を満たすハイブリッド圧縮の実装設計
 - `hybrid-decompress-with-zip-metadata-design.md`: CoZipDeflateのCPU+GPU解凍をZIPメタデータ連携で段階導入する設計
 - `gdeflate-hybrid-cpu-gpu-design.md`: 独自GDeflate形式でCPU+GPUが実処理に参加するハイブリッド設計
+- `pdeflate-v0-spec.md`: 現行PDeflate v0仕様（唯一の仕様ソース）
+- `pdeflate-v0-baseline.md`: 比較用ベンチコマンドとベースライン結果
+- `pdeflate-gpu-decompress-design.md`: PDeflate GPU解凍設計
+- `tasks/pdeflate-v0-huffman-lut-tasks.md`: PDeflate v0実装タスク分解
 - `context-log.md`: 作業ログ・決定事項・未決事項
 
 ## 運用ルール

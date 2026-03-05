@@ -1,10 +1,6 @@
 # Tasks
 
-このディレクトリは、設計書を「実装順の作業項目」に分解したタスク管理用ドキュメントを置く。
+- `pdeflate-v0-huffman-lut-tasks.md`
+  - 元仕様: `docs/pdeflate-v0-spec.md`
+  - 目的: PDeflate v0（チャンク共有 Huffman LUT、CPU=チャンク並列、GPU=チャンク+セクション並列）の実装タスク分解
 
-## 一覧
-
-- `pdeflate-gpu-decompress-rebuild-tasks.md`
-  - 元設計: `docs/pdeflate-gpu-decompress-design.md`
-  - 目的: PDeflate GPU解凍の再実装タスク分解
-  - 方針: 既存GPU解凍実装を一度削除し、固定長スロット + in-flight + ready-any 回収で再構築

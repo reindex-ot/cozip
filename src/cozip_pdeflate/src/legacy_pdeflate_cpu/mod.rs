@@ -1,5 +1,6 @@
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
 use std::ptr;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,7 +17,7 @@ const CHUNK_MAGIC: [u8; 4] = *b"PDF0";
 const PDEFLATE_VERSION: u16 = 0;
 const LITERAL_TAG: u16 = 0x0fff;
 const MAX_TABLE_ID: usize = (LITERAL_TAG as usize) - 1;
-const CHUNK_HEADER_SIZE: usize = 32;
+const CHUNK_HEADER_SIZE: usize = 36;
 const MAX_INLINE_LEN: usize = 14;
 const EXT_LEN_BASE: usize = 15;
 const EXT_LEN_MAX: usize = 255;
@@ -141,6 +142,7 @@ struct FinalizeScratch {
     table_index: Vec<u8>,
     table_data: Vec<u8>,
     section_index: Vec<u8>,
+    section_bitstream: Vec<u8>,
 }
 
 #[derive(Debug, Default)]
@@ -2029,6 +2031,7 @@ fn pack_chunk_payload_cpu(
     section_count: usize,
     table_index: &[u8],
     table_data: &[u8],
+    huff_lut: &[u8],
     section_index: &[u8],
     section_cmd: &[u8],
 ) -> Result<Vec<u8>, PDeflateError> {
@@ -2036,13 +2039,16 @@ fn pack_chunk_payload_cpu(
     let table_data_offset = table_index_offset
         .checked_add(table_index.len())
         .ok_or(PDeflateError::NumericOverflow)?;
-    let section_index_offset = table_data_offset
+    let huff_lut_offset = table_data_offset
         .checked_add(table_data.len())
         .ok_or(PDeflateError::NumericOverflow)?;
-    let section_cmd_offset = section_index_offset
+    let section_index_offset = huff_lut_offset
+        .checked_add(huff_lut.len())
+        .ok_or(PDeflateError::NumericOverflow)?;
+    let section_bitstream_offset = section_index_offset
         .checked_add(section_index.len())
         .ok_or(PDeflateError::NumericOverflow)?;
-    let total_len = section_cmd_offset
+    let total_len = section_bitstream_offset
         .checked_add(section_cmd.len())
         .ok_or(PDeflateError::NumericOverflow)?;
 
@@ -2072,11 +2078,15 @@ fn pack_chunk_payload_cpu(
     );
     write_u32_le(
         &mut payload,
+        u32::try_from(huff_lut_offset).map_err(|_| PDeflateError::NumericOverflow)?,
+    );
+    write_u32_le(
+        &mut payload,
         u32::try_from(section_index_offset).map_err(|_| PDeflateError::NumericOverflow)?,
     );
     write_u32_le(
         &mut payload,
-        u32::try_from(section_cmd_offset).map_err(|_| PDeflateError::NumericOverflow)?,
+        u32::try_from(section_bitstream_offset).map_err(|_| PDeflateError::NumericOverflow)?,
     );
 
     if payload.len() != CHUNK_HEADER_SIZE {
@@ -2085,6 +2095,7 @@ fn pack_chunk_payload_cpu(
 
     payload.extend_from_slice(table_index);
     payload.extend_from_slice(table_data);
+    payload.extend_from_slice(huff_lut);
     payload.extend_from_slice(section_index);
     payload.extend_from_slice(section_cmd);
     Ok(payload)
@@ -2096,6 +2107,7 @@ fn pack_chunk_payload(
     section_count: usize,
     table_index: &[u8],
     table_data: &[u8],
+    huff_lut: &[u8],
     section_index: &[u8],
     section_cmd: &[u8],
     _prefer_gpu: bool,
@@ -2107,10 +2119,25 @@ fn pack_chunk_payload(
         section_count,
         table_index,
         table_data,
+        huff_lut,
         section_index,
         section_cmd,
     )?;
     Ok((payload, elapsed_ms(t0)))
+}
+
+fn build_identity_huffman_lut_block() -> Result<Vec<u8>, PDeflateError> {
+    let root = (0u16..=255u16)
+        .map(|symbol| HuffmanLutEntry::Symbol { symbol, bit_len: 8 })
+        .collect::<Vec<_>>();
+    let lut = HuffmanLut {
+        symbol_count: 256,
+        root_bits: 8,
+        max_code_bits: 8,
+        root,
+        subtables: Vec::new(),
+    };
+    serialize_huffman_lut(&lut)
 }
 
 fn finalize_chunk_from_table(
@@ -2222,8 +2249,29 @@ fn finalize_chunk_from_table(
         FINALIZE_SCRATCH.with(|scratch| -> Result<(Vec<u8>, f64), PDeflateError> {
             let mut scratch = scratch.borrow_mut();
             scratch.section_index.clear();
-            for &len in &section_cmd_lens {
-                write_varint_u32(&mut scratch.section_index, len);
+            scratch.section_bitstream.clear();
+            let mut section_cmd_cursor = 0usize;
+            for &len_u32 in &section_cmd_lens {
+                let sec_cmd_len =
+                    usize::try_from(len_u32).map_err(|_| PDeflateError::NumericOverflow)?;
+                let sec_cmd_end = section_cmd_cursor
+                    .checked_add(sec_cmd_len)
+                    .ok_or(PDeflateError::NumericOverflow)?;
+                let sec_cmd = section_cmd.get(section_cmd_cursor..sec_cmd_end).ok_or(
+                    PDeflateError::InvalidStream(
+                        "section command range out of bounds during bitstream encode",
+                    ),
+                )?;
+                let symbols = logical_commands_to_huffman_symbols(sec_cmd);
+                let bit_len =
+                    encode_huffman_symbols_to_bitstream(symbols, &mut scratch.section_bitstream)?;
+                write_varint_u32(&mut scratch.section_index, bit_len);
+                section_cmd_cursor = sec_cmd_end;
+            }
+            if section_cmd_cursor != section_cmd.len() {
+                return Err(PDeflateError::InvalidStream(
+                    "sum(section command len) != section command stream size",
+                ));
             }
 
             let (table_index, table_data): (&[u8], &[u8]) = if let (Some(idx), Some(data)) =
@@ -2250,8 +2298,9 @@ fn finalize_chunk_from_table(
                 section_count,
                 table_index,
                 table_data,
+                &build_identity_huffman_lut_block()?,
                 &scratch.section_index,
-                &section_cmd,
+                &scratch.section_bitstream,
                 gpu_used,
             )
         })?;
@@ -3884,8 +3933,9 @@ fn preprocess_chunk_for_gpu_decode(payload: &[u8]) -> Result<ChunkDecodePreproce
     let section_count = read_u16_le(payload, &mut cursor)? as usize;
     let table_index_offset = read_u32_le(payload, &mut cursor)? as usize;
     let table_data_offset = read_u32_le(payload, &mut cursor)? as usize;
+    let huff_lut_offset = read_u32_le(payload, &mut cursor)? as usize;
     let section_index_offset = read_u32_le(payload, &mut cursor)? as usize;
-    let section_cmd_offset = read_u32_le(payload, &mut cursor)? as usize;
+    let section_bitstream_offset = read_u32_le(payload, &mut cursor)? as usize;
 
     if table_count > MAX_TABLE_ID {
         return Err(PDeflateError::InvalidStream("table_count too large"));
@@ -3895,9 +3945,10 @@ fn preprocess_chunk_for_gpu_decode(payload: &[u8]) -> Result<ChunkDecodePreproce
     }
 
     if !(table_index_offset <= table_data_offset
-        && table_data_offset <= section_index_offset
-        && section_index_offset <= section_cmd_offset
-        && section_cmd_offset <= payload.len())
+        && table_data_offset <= huff_lut_offset
+        && huff_lut_offset <= section_index_offset
+        && section_index_offset <= section_bitstream_offset
+        && section_bitstream_offset <= payload.len())
     {
         return Err(PDeflateError::InvalidStream("invalid chunk offsets"));
     }
@@ -3911,14 +3962,18 @@ fn preprocess_chunk_for_gpu_decode(payload: &[u8]) -> Result<ChunkDecodePreproce
     if table_index.len() != table_count {
         return Err(PDeflateError::InvalidStream("table index length mismatch"));
     }
-    let section_index = &payload[section_index_offset..section_cmd_offset];
-    let section_cmd = &payload[section_cmd_offset..];
+    let section_index = &payload[section_index_offset..section_bitstream_offset];
+    let _huff_lut = deserialize_huffman_lut(&payload[huff_lut_offset..section_index_offset])?;
+    let section_cmd = &payload[section_bitstream_offset..];
 
     let mut section_idx_cursor = 0usize;
     let mut cmd_cursor = 0usize;
     let mut section_meta = Vec::with_capacity(section_count);
     for sec in 0..section_count {
-        let sec_cmd_len = read_varint_u32(section_index, &mut section_idx_cursor)? as usize;
+        let sec_bit_len_u32 = read_varint_u32(section_index, &mut section_idx_cursor)?;
+        let sec_bit_len =
+            usize::try_from(sec_bit_len_u32).map_err(|_| PDeflateError::NumericOverflow)?;
+        let sec_cmd_len = section_bit_len_to_byte_len(sec_bit_len)?;
         let sec_cmd_end = cmd_cursor
             .checked_add(sec_cmd_len)
             .ok_or(PDeflateError::NumericOverflow)?;
@@ -3945,7 +4000,7 @@ fn preprocess_chunk_for_gpu_decode(payload: &[u8]) -> Result<ChunkDecodePreproce
     }
     if cmd_cursor != section_cmd.len() {
         return Err(PDeflateError::InvalidStream(
-            "sum(section_cmd_len) != section_cmd size",
+            "sum(section_bit_len) != section_bitstream size",
         ));
     }
 
@@ -3977,8 +4032,9 @@ fn decompress_chunk_into(payload: &[u8], out: &mut [u8]) -> Result<ChunkDecoded,
     let section_count = read_u16_le(payload, &mut cursor)? as usize;
     let table_index_offset = read_u32_le(payload, &mut cursor)? as usize;
     let table_data_offset = read_u32_le(payload, &mut cursor)? as usize;
+    let huff_lut_offset = read_u32_le(payload, &mut cursor)? as usize;
     let section_index_offset = read_u32_le(payload, &mut cursor)? as usize;
-    let section_cmd_offset = read_u32_le(payload, &mut cursor)? as usize;
+    let section_bitstream_offset = read_u32_le(payload, &mut cursor)? as usize;
 
     if table_count > MAX_TABLE_ID {
         return Err(PDeflateError::InvalidStream("table_count too large"));
@@ -3988,9 +4044,10 @@ fn decompress_chunk_into(payload: &[u8], out: &mut [u8]) -> Result<ChunkDecoded,
     }
 
     if !(table_index_offset <= table_data_offset
-        && table_data_offset <= section_index_offset
-        && section_index_offset <= section_cmd_offset
-        && section_cmd_offset <= payload.len())
+        && table_data_offset <= huff_lut_offset
+        && huff_lut_offset <= section_index_offset
+        && section_index_offset <= section_bitstream_offset
+        && section_bitstream_offset <= payload.len())
     {
         return Err(PDeflateError::InvalidStream("invalid chunk offsets"));
     }
@@ -4012,9 +4069,10 @@ fn decompress_chunk_into(payload: &[u8], out: &mut [u8]) -> Result<ChunkDecoded,
     let profile = profile_enabled();
     let mut decode_profile = ChunkDecodeProfile::default();
     let table_t0 = Instant::now();
-    let table_data = &payload[table_data_offset..section_index_offset];
-    let section_index = &payload[section_index_offset..section_cmd_offset];
-    let section_cmd = &payload[section_cmd_offset..];
+    let table_data = &payload[table_data_offset..huff_lut_offset];
+    let huff_lut = deserialize_huffman_lut(&payload[huff_lut_offset..section_index_offset])?;
+    let section_index = &payload[section_index_offset..section_bitstream_offset];
+    let section_cmd = &payload[section_bitstream_offset..];
     DECODE_SCRATCH.with(|scratch| -> Result<(), PDeflateError> {
         let mut scratch = scratch.borrow_mut();
         scratch.table_offsets.clear();
@@ -4060,12 +4118,16 @@ fn decompress_chunk_into(payload: &[u8], out: &mut [u8]) -> Result<ChunkDecoded,
 
         let mut section_idx_cursor = 0usize;
         let mut cmd_cursor = 0usize;
+        let mut section_bit_lens = Vec::with_capacity(section_count);
         let mut section_cmd_offsets = Vec::with_capacity(section_count);
         let mut section_cmd_lens = Vec::with_capacity(section_count);
         let mut section_out_offsets = Vec::with_capacity(section_count);
         let mut section_out_lens = Vec::with_capacity(section_count);
         for sec in 0..section_count {
-            let sec_cmd_len = read_varint_u32(section_index, &mut section_idx_cursor)? as usize;
+            let sec_bit_len_u32 = read_varint_u32(section_index, &mut section_idx_cursor)?;
+            let sec_bit_len =
+                usize::try_from(sec_bit_len_u32).map_err(|_| PDeflateError::NumericOverflow)?;
+            let sec_cmd_len = section_bit_len_to_byte_len(sec_bit_len)?;
             let sec_cmd_end = cmd_cursor
                 .checked_add(sec_cmd_len)
                 .ok_or(PDeflateError::NumericOverflow)?;
@@ -4077,6 +4139,8 @@ fn decompress_chunk_into(payload: &[u8], out: &mut [u8]) -> Result<ChunkDecoded,
             let out_start = section_start(sec, section_count, chunk_uncompressed_len);
             let out_end = section_start(sec + 1, section_count, chunk_uncompressed_len);
             let out_len = out_end - out_start;
+            section_bit_lens
+                .push(u32::try_from(sec_bit_len).map_err(|_| PDeflateError::NumericOverflow)?);
             section_cmd_offsets
                 .push(u32::try_from(cmd_cursor).map_err(|_| PDeflateError::NumericOverflow)?);
             section_cmd_lens
@@ -4094,7 +4158,7 @@ fn decompress_chunk_into(payload: &[u8], out: &mut [u8]) -> Result<ChunkDecoded,
         }
         if cmd_cursor != section_cmd.len() {
             return Err(PDeflateError::InvalidStream(
-                "sum(section_cmd_len) != section_cmd size",
+                "sum(section_bit_len) != section_bitstream size",
             ));
         }
 
@@ -4116,8 +4180,14 @@ fn decompress_chunk_into(payload: &[u8], out: &mut [u8]) -> Result<ChunkDecoded,
                     .ok_or(PDeflateError::InvalidStream(
                         "section cmd range out of bounds",
                     ))?;
-            decode_section(
+            let sec_symbols = decode_section_bitstream_to_huffman_symbols_with_lut(
                 sec_cmd,
+                section_bit_lens[sec] as usize,
+                &huff_lut,
+            )?;
+            let sec_logical_cmd = huffman_symbols_to_logical_commands(sec_symbols);
+            decode_section(
+                &sec_logical_cmd,
                 out_len,
                 &scratch.table_repeat,
                 &mut out[out_start..out_end],
@@ -5327,6 +5397,10 @@ fn read_exact<'a>(
     Ok(slice)
 }
 
+fn write_u8(dst: &mut Vec<u8>, v: u8) {
+    dst.push(v);
+}
+
 fn write_u16_le(dst: &mut Vec<u8>, v: u16) {
     dst.extend_from_slice(&v.to_le_bytes());
 }
@@ -5342,6 +5416,12 @@ fn write_u64_le(dst: &mut Vec<u8>, v: u64) {
 fn read_u16_le(src: &[u8], cursor: &mut usize) -> Result<u16, PDeflateError> {
     let bytes = read_exact(src, cursor, 2)?;
     Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_u8(src: &[u8], cursor: &mut usize) -> Result<u8, PDeflateError> {
+    Ok(*read_exact(src, cursor, 1)?
+        .first()
+        .ok_or(PDeflateError::InvalidStream("unexpected eof"))?)
 }
 
 fn read_u32_le(src: &[u8], cursor: &mut usize) -> Result<u32, PDeflateError> {
@@ -5380,6 +5460,897 @@ fn read_varint_u32(src: &[u8], cursor: &mut usize) -> Result<u32, PDeflateError>
         }
         shift += 7;
     }
+}
+
+const HUFF_MAX_CODE_BITS: u8 = 15;
+const HUFF_LUT_ROOT_BITS_DEFAULT: u8 = 9;
+const HUFF_LUT_ENTRY_KIND_INVALID: u32 = 0;
+const HUFF_LUT_ENTRY_KIND_SYMBOL: u32 = 1;
+const HUFF_LUT_ENTRY_KIND_SUBTABLE: u32 = 2;
+const HUFF_LUT_HEADER_SIZE: usize = 12;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HuffmanSymbolCode {
+    code_lsb: u32,
+    bit_len: u8,
+}
+
+#[derive(Debug, Clone)]
+struct HuffmanCanonicalCodebook {
+    symbol_count: usize,
+    max_code_bits: u8,
+    codes: Vec<Option<HuffmanSymbolCode>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HuffmanLutEntry {
+    Invalid,
+    Symbol { symbol: u16, bit_len: u8 },
+    Subtable { offset: u32, sub_bits: u8 },
+}
+
+#[derive(Debug, Clone)]
+struct HuffmanLut {
+    symbol_count: usize,
+    root_bits: u8,
+    max_code_bits: u8,
+    root: Vec<HuffmanLutEntry>,
+    subtables: Vec<HuffmanLutEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct HuffmanDecodeTreeNode {
+    left: Option<usize>,
+    right: Option<usize>,
+    symbol: Option<u16>,
+}
+
+impl Default for HuffmanDecodeTreeNode {
+    fn default() -> Self {
+        Self {
+            left: None,
+            right: None,
+            symbol: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BitReaderLsb<'a> {
+    src: &'a [u8],
+    bit_len: usize,
+    bit_cursor: usize,
+}
+
+impl<'a> BitReaderLsb<'a> {
+    fn new(src: &'a [u8], bit_len: usize) -> Result<Self, PDeflateError> {
+        let max_bits = src
+            .len()
+            .checked_mul(8)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        if bit_len > max_bits {
+            return Err(PDeflateError::InvalidStream(
+                "huffman bit_len exceeds input buffer",
+            ));
+        }
+        Ok(Self {
+            src,
+            bit_len,
+            bit_cursor: 0,
+        })
+    }
+
+    fn remaining_bits(&self) -> usize {
+        self.bit_len.saturating_sub(self.bit_cursor)
+    }
+
+    fn read_bit(&mut self) -> Result<u8, PDeflateError> {
+        if self.bit_cursor >= self.bit_len {
+            return Err(PDeflateError::InvalidStream(
+                "unexpected eof in huffman bitstream",
+            ));
+        }
+        let pos = self.bit_cursor;
+        self.bit_cursor = self.bit_cursor.saturating_add(1);
+        let byte = self.src[pos / 8];
+        Ok((byte >> (pos & 7)) & 1)
+    }
+
+    fn consume(&mut self, bit_len: u8) -> Result<(), PDeflateError> {
+        let n = bit_len as usize;
+        if n > self.remaining_bits() {
+            return Err(PDeflateError::InvalidStream(
+                "huffman code exceeds remaining bits",
+            ));
+        }
+        self.bit_cursor = self.bit_cursor.saturating_add(n);
+        Ok(())
+    }
+
+    fn peek_bits_padded(&self, bit_len: u8) -> u32 {
+        let mut out = 0u32;
+        for i in 0..bit_len {
+            let pos = self.bit_cursor + (i as usize);
+            if pos >= self.bit_len {
+                break;
+            }
+            let byte = self.src[pos / 8];
+            let bit = (byte >> (pos & 7)) & 1;
+            out |= u32::from(bit) << i;
+        }
+        out
+    }
+}
+
+#[inline]
+fn reverse_low_bits(mut value: u32, bit_len: u8) -> u32 {
+    let mut out = 0u32;
+    for _ in 0..bit_len {
+        out = (out << 1) | (value & 1);
+        value >>= 1;
+    }
+    out
+}
+
+fn build_huffman_code_lengths_from_frequencies(
+    frequencies: &[u32],
+    max_code_bits: u8,
+) -> Result<Vec<u8>, PDeflateError> {
+    if frequencies.is_empty() {
+        return Err(PDeflateError::InvalidOptions(
+            "huffman symbol alphabet must not be empty",
+        ));
+    }
+    if max_code_bits == 0 || max_code_bits > 31 {
+        return Err(PDeflateError::InvalidOptions(
+            "huffman max_code_bits must be in 1..=31",
+        ));
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct HuffNode {
+        parent: Option<usize>,
+        symbol: Option<usize>,
+    }
+
+    let mut nodes = Vec::<HuffNode>::new();
+    let mut leaf_node_by_symbol = vec![None; frequencies.len()];
+    let mut heap = BinaryHeap::<Reverse<(u64, usize, usize)>>::new();
+    let mut seq = 0usize;
+
+    for (symbol, &freq_u32) in frequencies.iter().enumerate() {
+        if freq_u32 == 0 {
+            continue;
+        }
+        let node_index = nodes.len();
+        nodes.push(HuffNode {
+            parent: None,
+            symbol: Some(symbol),
+        });
+        leaf_node_by_symbol[symbol] = Some(node_index);
+        heap.push(Reverse((u64::from(freq_u32), seq, node_index)));
+        seq = seq.saturating_add(1);
+    }
+
+    if heap.is_empty() {
+        let mut lengths = vec![0u8; frequencies.len()];
+        lengths[0] = 1;
+        return Ok(lengths);
+    }
+
+    if heap.len() == 1 {
+        let mut lengths = vec![0u8; frequencies.len()];
+        let only = heap.pop().ok_or(PDeflateError::NumericOverflow)?.0.2;
+        let symbol = nodes[only].symbol.ok_or(PDeflateError::InvalidStream(
+            "huffman leaf node missing symbol",
+        ))?;
+        lengths[symbol] = 1;
+        return Ok(lengths);
+    }
+
+    while heap.len() > 1 {
+        let left = heap.pop().ok_or(PDeflateError::NumericOverflow)?.0;
+        let right = heap.pop().ok_or(PDeflateError::NumericOverflow)?.0;
+        let parent_freq = left
+            .0
+            .checked_add(right.0)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        let parent_index = nodes.len();
+        nodes.push(HuffNode {
+            parent: None,
+            symbol: None,
+        });
+        nodes[left.2].parent = Some(parent_index);
+        nodes[right.2].parent = Some(parent_index);
+        heap.push(Reverse((parent_freq, seq, parent_index)));
+        seq = seq.saturating_add(1);
+    }
+
+    let mut lengths = vec![0u8; frequencies.len()];
+    for (symbol, &leaf_node) in leaf_node_by_symbol.iter().enumerate() {
+        let Some(mut node_index) = leaf_node else {
+            continue;
+        };
+        let mut depth = 0usize;
+        while let Some(parent) = nodes[node_index].parent {
+            depth = depth.saturating_add(1);
+            node_index = parent;
+        }
+        if depth == 0 {
+            depth = 1;
+        }
+        if depth > usize::from(max_code_bits) {
+            return Err(PDeflateError::InvalidOptions(
+                "huffman code length exceeds max_code_bits",
+            ));
+        }
+        lengths[symbol] = u8::try_from(depth).map_err(|_| PDeflateError::NumericOverflow)?;
+    }
+    Ok(lengths)
+}
+
+fn build_canonical_huffman_codebook_from_lengths(
+    code_lengths: &[u8],
+    max_code_bits: u8,
+) -> Result<HuffmanCanonicalCodebook, PDeflateError> {
+    if code_lengths.is_empty() {
+        return Err(PDeflateError::InvalidOptions(
+            "huffman symbol alphabet must not be empty",
+        ));
+    }
+    if max_code_bits == 0 || max_code_bits > 31 {
+        return Err(PDeflateError::InvalidOptions(
+            "huffman max_code_bits must be in 1..=31",
+        ));
+    }
+
+    let mut max_len_seen = 0u8;
+    let mut any_symbol = false;
+    let mut bl_count = vec![0u32; usize::from(max_code_bits) + 1];
+    for &len in code_lengths {
+        if len == 0 {
+            continue;
+        }
+        if len > max_code_bits {
+            return Err(PDeflateError::InvalidOptions(
+                "huffman code length exceeds max_code_bits",
+            ));
+        }
+        any_symbol = true;
+        max_len_seen = max_len_seen.max(len);
+        bl_count[len as usize] = bl_count[len as usize].saturating_add(1);
+    }
+    if !any_symbol {
+        return Err(PDeflateError::InvalidOptions(
+            "huffman code lengths contain no symbols",
+        ));
+    }
+
+    let mut next_code = vec![0u32; usize::from(max_code_bits) + 1];
+    let mut code = 0u32;
+    for bits in 1..=usize::from(max_code_bits) {
+        code = (code
+            .checked_add(bl_count[bits - 1])
+            .ok_or(PDeflateError::NumericOverflow)?)
+            << 1;
+        next_code[bits] = code;
+    }
+
+    let mut codes = vec![None; code_lengths.len()];
+    for (symbol, &len) in code_lengths.iter().enumerate() {
+        if len == 0 {
+            continue;
+        }
+        let len_idx = len as usize;
+        let code_msb = next_code[len_idx];
+        let limit = 1u32
+            .checked_shl(u32::from(len))
+            .ok_or(PDeflateError::NumericOverflow)?;
+        if code_msb >= limit {
+            return Err(PDeflateError::InvalidOptions(
+                "invalid canonical huffman code lengths (oversubscribed)",
+            ));
+        }
+        next_code[len_idx] = next_code[len_idx].saturating_add(1);
+        let code_lsb = reverse_low_bits(code_msb, len);
+        codes[symbol] = Some(HuffmanSymbolCode {
+            code_lsb,
+            bit_len: len,
+        });
+    }
+
+    Ok(HuffmanCanonicalCodebook {
+        symbol_count: code_lengths.len(),
+        max_code_bits: max_len_seen,
+        codes,
+    })
+}
+
+fn build_canonical_huffman_codebook_from_frequencies(
+    frequencies: &[u32],
+    max_code_bits: u8,
+) -> Result<HuffmanCanonicalCodebook, PDeflateError> {
+    let lengths = build_huffman_code_lengths_from_frequencies(frequencies, max_code_bits)?;
+    build_canonical_huffman_codebook_from_lengths(&lengths, max_code_bits)
+}
+
+fn build_huffman_lut(
+    codebook: &HuffmanCanonicalCodebook,
+    root_bits: u8,
+) -> Result<HuffmanLut, PDeflateError> {
+    if root_bits == 0 {
+        return Err(PDeflateError::InvalidOptions(
+            "huffman root_bits must be > 0",
+        ));
+    }
+    if root_bits > codebook.max_code_bits {
+        return Err(PDeflateError::InvalidOptions(
+            "huffman root_bits exceeds max code bits",
+        ));
+    }
+    if root_bits > 24 {
+        return Err(PDeflateError::InvalidOptions(
+            "huffman root_bits must be <= 24",
+        ));
+    }
+
+    let root_size = 1usize
+        .checked_shl(u32::from(root_bits))
+        .ok_or(PDeflateError::NumericOverflow)?;
+    let mut root = vec![HuffmanLutEntry::Invalid; root_size];
+    let mut max_sub_bits_by_prefix = vec![0u8; root_size];
+    let root_mask = (1u32 << u32::from(root_bits)) - 1;
+
+    for (symbol, code_opt) in codebook.codes.iter().enumerate() {
+        let Some(code) = *code_opt else {
+            continue;
+        };
+        if code.bit_len <= root_bits {
+            let repeat = 1usize
+                .checked_shl(u32::from(root_bits - code.bit_len))
+                .ok_or(PDeflateError::NumericOverflow)?;
+            let sym_u16 = u16::try_from(symbol).map_err(|_| PDeflateError::NumericOverflow)?;
+            for suffix in 0..repeat {
+                let idx = ((suffix as u32) << u32::from(code.bit_len)) | code.code_lsb;
+                let idx = usize::try_from(idx).map_err(|_| PDeflateError::NumericOverflow)?;
+                let entry = HuffmanLutEntry::Symbol {
+                    symbol: sym_u16,
+                    bit_len: code.bit_len,
+                };
+                match root[idx] {
+                    HuffmanLutEntry::Invalid => root[idx] = entry,
+                    v if v == entry => {}
+                    _ => {
+                        return Err(PDeflateError::InvalidOptions(
+                            "huffman root table collision",
+                        ));
+                    }
+                }
+            }
+            continue;
+        }
+        let prefix = (code.code_lsb & root_mask) as usize;
+        let sub_bits = code.bit_len - root_bits;
+        max_sub_bits_by_prefix[prefix] = max_sub_bits_by_prefix[prefix].max(sub_bits);
+    }
+
+    let mut subtables = Vec::<HuffmanLutEntry>::new();
+    let mut sub_offset_by_prefix = vec![None; root_size];
+    for prefix in 0..root_size {
+        let sub_bits = max_sub_bits_by_prefix[prefix];
+        if sub_bits == 0 {
+            continue;
+        }
+        let sub_size = 1usize
+            .checked_shl(u32::from(sub_bits))
+            .ok_or(PDeflateError::NumericOverflow)?;
+        let offset = subtables.len();
+        let offset_u32 = u32::try_from(offset).map_err(|_| PDeflateError::NumericOverflow)?;
+        subtables.resize(offset + sub_size, HuffmanLutEntry::Invalid);
+        sub_offset_by_prefix[prefix] = Some(offset_u32);
+        root[prefix] = HuffmanLutEntry::Subtable {
+            offset: offset_u32,
+            sub_bits,
+        };
+    }
+
+    for (symbol, code_opt) in codebook.codes.iter().enumerate() {
+        let Some(code) = *code_opt else {
+            continue;
+        };
+        if code.bit_len <= root_bits {
+            continue;
+        }
+        let prefix = (code.code_lsb & root_mask) as usize;
+        let sub_offset = sub_offset_by_prefix[prefix].ok_or(PDeflateError::InvalidOptions(
+            "huffman subtable offset missing",
+        ))? as usize;
+        let sub_bits = max_sub_bits_by_prefix[prefix];
+        let rem_len = code.bit_len - root_bits;
+        let rem_code = code.code_lsb >> u32::from(root_bits);
+        let repeat = 1usize
+            .checked_shl(u32::from(sub_bits - rem_len))
+            .ok_or(PDeflateError::NumericOverflow)?;
+        let sym_u16 = u16::try_from(symbol).map_err(|_| PDeflateError::NumericOverflow)?;
+        for suffix in 0..repeat {
+            let sub_idx = ((suffix as u32) << u32::from(rem_len)) | rem_code;
+            let lut_idx = sub_offset
+                .checked_add(usize::try_from(sub_idx).map_err(|_| PDeflateError::NumericOverflow)?)
+                .ok_or(PDeflateError::NumericOverflow)?;
+            let entry = HuffmanLutEntry::Symbol {
+                symbol: sym_u16,
+                bit_len: code.bit_len,
+            };
+            match subtables[lut_idx] {
+                HuffmanLutEntry::Invalid => subtables[lut_idx] = entry,
+                v if v == entry => {}
+                _ => {
+                    return Err(PDeflateError::InvalidOptions("huffman subtable collision"));
+                }
+            }
+        }
+    }
+
+    Ok(HuffmanLut {
+        symbol_count: codebook.symbol_count,
+        root_bits,
+        max_code_bits: codebook.max_code_bits,
+        root,
+        subtables,
+    })
+}
+
+fn pack_huffman_lut_entry(entry: HuffmanLutEntry) -> Result<u32, PDeflateError> {
+    let packed = match entry {
+        HuffmanLutEntry::Invalid => HUFF_LUT_ENTRY_KIND_INVALID,
+        HuffmanLutEntry::Symbol { symbol, bit_len } => {
+            HUFF_LUT_ENTRY_KIND_SYMBOL | (u32::from(bit_len) << 2) | (u32::from(symbol) << 10)
+        }
+        HuffmanLutEntry::Subtable { offset, sub_bits } => {
+            HUFF_LUT_ENTRY_KIND_SUBTABLE | (u32::from(sub_bits) << 2) | (offset << 10)
+        }
+    };
+    Ok(packed)
+}
+
+fn unpack_huffman_lut_entry(packed: u32) -> Result<HuffmanLutEntry, PDeflateError> {
+    let kind = packed & 0x3;
+    let bits = ((packed >> 2) & 0xff) as u8;
+    match kind {
+        HUFF_LUT_ENTRY_KIND_INVALID => Ok(HuffmanLutEntry::Invalid),
+        HUFF_LUT_ENTRY_KIND_SYMBOL => {
+            let symbol = ((packed >> 10) & 0xffff) as u16;
+            Ok(HuffmanLutEntry::Symbol {
+                symbol,
+                bit_len: bits,
+            })
+        }
+        HUFF_LUT_ENTRY_KIND_SUBTABLE => {
+            let offset = packed >> 10;
+            Ok(HuffmanLutEntry::Subtable {
+                offset,
+                sub_bits: bits,
+            })
+        }
+        _ => Err(PDeflateError::InvalidStream(
+            "huffman lut entry kind invalid",
+        )),
+    }
+}
+
+fn serialize_huffman_lut(lut: &HuffmanLut) -> Result<Vec<u8>, PDeflateError> {
+    let mut out = Vec::with_capacity(
+        HUFF_LUT_HEADER_SIZE
+            + lut
+                .root
+                .len()
+                .saturating_add(lut.subtables.len())
+                .saturating_mul(4),
+    );
+    write_u16_le(
+        &mut out,
+        u16::try_from(lut.symbol_count).map_err(|_| PDeflateError::NumericOverflow)?,
+    );
+    write_u8(&mut out, lut.root_bits);
+    write_u8(&mut out, lut.max_code_bits);
+    write_u32_le(
+        &mut out,
+        u32::try_from(lut.root.len()).map_err(|_| PDeflateError::NumericOverflow)?,
+    );
+    write_u32_le(
+        &mut out,
+        u32::try_from(lut.subtables.len()).map_err(|_| PDeflateError::NumericOverflow)?,
+    );
+    for &entry in &lut.root {
+        write_u32_le(&mut out, pack_huffman_lut_entry(entry)?);
+    }
+    for &entry in &lut.subtables {
+        write_u32_le(&mut out, pack_huffman_lut_entry(entry)?);
+    }
+    Ok(out)
+}
+
+fn deserialize_huffman_lut(src: &[u8]) -> Result<HuffmanLut, PDeflateError> {
+    let mut cursor = 0usize;
+    if src.len() < HUFF_LUT_HEADER_SIZE {
+        return Err(PDeflateError::InvalidStream("huffman lut header truncated"));
+    }
+    let symbol_count = read_u16_le(src, &mut cursor)? as usize;
+    if symbol_count == 0 {
+        return Err(PDeflateError::InvalidStream(
+            "huffman lut symbol_count is zero",
+        ));
+    }
+    let root_bits = read_u8(src, &mut cursor)?;
+    let max_code_bits = read_u8(src, &mut cursor)?;
+    if root_bits == 0 || root_bits > max_code_bits || max_code_bits > 31 {
+        return Err(PDeflateError::InvalidStream(
+            "huffman lut bit width is invalid",
+        ));
+    }
+    let root_len = read_u32_le(src, &mut cursor)? as usize;
+    let sub_len = read_u32_le(src, &mut cursor)? as usize;
+    let expected_root_len = 1usize
+        .checked_shl(u32::from(root_bits))
+        .ok_or(PDeflateError::NumericOverflow)?;
+    if root_len != expected_root_len {
+        return Err(PDeflateError::InvalidStream(
+            "huffman lut root length mismatch",
+        ));
+    }
+
+    let total_entry_count = root_len
+        .checked_add(sub_len)
+        .ok_or(PDeflateError::NumericOverflow)?;
+    let expected_bytes = HUFF_LUT_HEADER_SIZE
+        .checked_add(
+            total_entry_count
+                .checked_mul(4)
+                .ok_or(PDeflateError::NumericOverflow)?,
+        )
+        .ok_or(PDeflateError::NumericOverflow)?;
+    if src.len() != expected_bytes {
+        return Err(PDeflateError::InvalidStream(
+            "huffman lut payload length mismatch",
+        ));
+    }
+
+    let mut root = Vec::with_capacity(root_len);
+    for _ in 0..root_len {
+        root.push(unpack_huffman_lut_entry(read_u32_le(src, &mut cursor)?)?);
+    }
+    let mut subtables = Vec::with_capacity(sub_len);
+    for _ in 0..sub_len {
+        subtables.push(unpack_huffman_lut_entry(read_u32_le(src, &mut cursor)?)?);
+    }
+    if cursor != src.len() {
+        return Err(PDeflateError::InvalidStream(
+            "trailing bytes in huffman lut payload",
+        ));
+    }
+
+    for &entry in &root {
+        match entry {
+            HuffmanLutEntry::Invalid => {}
+            HuffmanLutEntry::Symbol { symbol, bit_len } => {
+                if bit_len == 0 || bit_len > root_bits {
+                    return Err(PDeflateError::InvalidStream(
+                        "huffman lut root symbol bit_len invalid",
+                    ));
+                }
+                if usize::from(symbol) >= symbol_count {
+                    return Err(PDeflateError::InvalidStream(
+                        "huffman lut root symbol out of range",
+                    ));
+                }
+            }
+            HuffmanLutEntry::Subtable { offset, sub_bits } => {
+                if sub_bits == 0 {
+                    return Err(PDeflateError::InvalidStream(
+                        "huffman lut subtable bit width is zero",
+                    ));
+                }
+                let total_bits = root_bits
+                    .checked_add(sub_bits)
+                    .ok_or(PDeflateError::NumericOverflow)?;
+                if total_bits > max_code_bits {
+                    return Err(PDeflateError::InvalidStream(
+                        "huffman lut subtable exceeds max bits",
+                    ));
+                }
+                let span = 1usize
+                    .checked_shl(u32::from(sub_bits))
+                    .ok_or(PDeflateError::NumericOverflow)?;
+                let end = (offset as usize)
+                    .checked_add(span)
+                    .ok_or(PDeflateError::NumericOverflow)?;
+                if end > sub_len {
+                    return Err(PDeflateError::InvalidStream(
+                        "huffman lut subtable range out of bounds",
+                    ));
+                }
+            }
+        }
+    }
+
+    for &entry in &subtables {
+        match entry {
+            HuffmanLutEntry::Symbol { symbol, bit_len } => {
+                if bit_len <= root_bits || bit_len > max_code_bits {
+                    return Err(PDeflateError::InvalidStream(
+                        "huffman lut subtable symbol bit_len invalid",
+                    ));
+                }
+                if usize::from(symbol) >= symbol_count {
+                    return Err(PDeflateError::InvalidStream(
+                        "huffman lut subtable symbol out of range",
+                    ));
+                }
+            }
+            HuffmanLutEntry::Invalid => {
+                return Err(PDeflateError::InvalidStream(
+                    "huffman lut subtable has invalid hole",
+                ));
+            }
+            HuffmanLutEntry::Subtable { .. } => {
+                return Err(PDeflateError::InvalidStream(
+                    "huffman lut subtable entry is not terminal symbol",
+                ));
+            }
+        }
+    }
+
+    Ok(HuffmanLut {
+        symbol_count,
+        root_bits,
+        max_code_bits,
+        root,
+        subtables,
+    })
+}
+
+fn write_bits_lsb(
+    dst: &mut Vec<u8>,
+    bit_cursor: &mut usize,
+    mut bits: u32,
+    mut bit_len: u8,
+) -> Result<(), PDeflateError> {
+    while bit_len > 0 {
+        let byte_index = *bit_cursor / 8;
+        let bit_index = (*bit_cursor & 7) as u8;
+        if byte_index == dst.len() {
+            dst.push(0);
+        }
+        let room = 8 - bit_index;
+        let take = room.min(bit_len);
+        let mask = (1u32 << u32::from(take)) - 1;
+        let chunk = (bits & mask) as u8;
+        dst[byte_index] |= chunk << bit_index;
+        *bit_cursor = bit_cursor.saturating_add(take as usize);
+        bits >>= take;
+        bit_len -= take;
+    }
+    Ok(())
+}
+
+fn encode_symbols_with_huffman_codebook(
+    symbols: &[u8],
+    codebook: &HuffmanCanonicalCodebook,
+) -> Result<(Vec<u8>, usize), PDeflateError> {
+    let mut out = Vec::new();
+    let mut bit_cursor = 0usize;
+    for &symbol in symbols {
+        let sym = symbol as usize;
+        if sym >= codebook.codes.len() {
+            return Err(PDeflateError::InvalidStream(
+                "huffman symbol out of codebook range",
+            ));
+        }
+        let code = codebook.codes[sym].ok_or(PDeflateError::InvalidStream(
+            "huffman symbol has no assigned code",
+        ))?;
+        write_bits_lsb(&mut out, &mut bit_cursor, code.code_lsb, code.bit_len)?;
+    }
+    Ok((out, bit_cursor))
+}
+
+fn build_decode_tree_from_codebook(
+    codebook: &HuffmanCanonicalCodebook,
+) -> Result<Vec<HuffmanDecodeTreeNode>, PDeflateError> {
+    let mut tree = vec![HuffmanDecodeTreeNode::default()];
+    for (symbol, code_opt) in codebook.codes.iter().enumerate() {
+        let Some(code) = *code_opt else {
+            continue;
+        };
+        let sym_u16 = u16::try_from(symbol).map_err(|_| PDeflateError::NumericOverflow)?;
+        let mut node = 0usize;
+        for bit_index in 0..code.bit_len {
+            if tree[node].symbol.is_some() {
+                return Err(PDeflateError::InvalidOptions(
+                    "huffman decode tree prefix conflict",
+                ));
+            }
+            let is_last = bit_index + 1 == code.bit_len;
+            let bit = ((code.code_lsb >> u32::from(bit_index)) & 1) as u8;
+            let current_next = if bit == 0 {
+                tree[node].left
+            } else {
+                tree[node].right
+            };
+            if is_last {
+                if let Some(child) = current_next {
+                    if tree[child].symbol != Some(sym_u16)
+                        || tree[child].left.is_some()
+                        || tree[child].right.is_some()
+                    {
+                        return Err(PDeflateError::InvalidOptions(
+                            "huffman decode tree leaf conflict",
+                        ));
+                    }
+                } else {
+                    tree.push(HuffmanDecodeTreeNode {
+                        left: None,
+                        right: None,
+                        symbol: Some(sym_u16),
+                    });
+                    let created = tree.len() - 1;
+                    if bit == 0 {
+                        tree[node].left = Some(created);
+                    } else {
+                        tree[node].right = Some(created);
+                    }
+                }
+            } else {
+                let child = if let Some(existing) = current_next {
+                    existing
+                } else {
+                    tree.push(HuffmanDecodeTreeNode::default());
+                    let created = tree.len() - 1;
+                    if bit == 0 {
+                        tree[node].left = Some(created);
+                    } else {
+                        tree[node].right = Some(created);
+                    }
+                    created
+                };
+                node = child;
+            }
+        }
+    }
+    Ok(tree)
+}
+
+fn decode_huffman_symbols_with_tree(
+    bitstream: &[u8],
+    bit_len: usize,
+    codebook: &HuffmanCanonicalCodebook,
+) -> Result<Vec<u8>, PDeflateError> {
+    let tree = build_decode_tree_from_codebook(codebook)?;
+    let mut reader = BitReaderLsb::new(bitstream, bit_len)?;
+    let mut out = Vec::new();
+    while reader.remaining_bits() > 0 {
+        let mut node = 0usize;
+        loop {
+            if let Some(symbol) = tree[node].symbol {
+                out.push(u8::try_from(symbol).map_err(|_| PDeflateError::NumericOverflow)?);
+                break;
+            }
+            let bit = reader.read_bit()?;
+            let next = if bit == 0 {
+                tree[node].left
+            } else {
+                tree[node].right
+            }
+            .ok_or(PDeflateError::InvalidStream(
+                "huffman tree decode reached invalid edge",
+            ))?;
+            node = next;
+        }
+    }
+    Ok(out)
+}
+
+fn decode_huffman_symbols_with_lut(
+    bitstream: &[u8],
+    bit_len: usize,
+    lut: &HuffmanLut,
+) -> Result<Vec<u8>, PDeflateError> {
+    let mut reader = BitReaderLsb::new(bitstream, bit_len)?;
+    let root_mask = (1u32 << u32::from(lut.root_bits)) - 1;
+    let mut out = Vec::new();
+    while reader.remaining_bits() > 0 {
+        let root_idx = (reader.peek_bits_padded(lut.root_bits) & root_mask) as usize;
+        let root_entry = *lut.root.get(root_idx).ok_or(PDeflateError::InvalidStream(
+            "huffman lut root index out of bounds",
+        ))?;
+        match root_entry {
+            HuffmanLutEntry::Symbol { symbol, bit_len } => {
+                reader.consume(bit_len)?;
+                out.push(u8::try_from(symbol).map_err(|_| PDeflateError::NumericOverflow)?);
+            }
+            HuffmanLutEntry::Subtable { offset, sub_bits } => {
+                let full = reader.peek_bits_padded(lut.root_bits + sub_bits);
+                let sub_idx = ((full >> u32::from(lut.root_bits))
+                    & ((1u32 << u32::from(sub_bits)) - 1)) as usize;
+                let entry = *lut
+                    .subtables
+                    .get((offset as usize).saturating_add(sub_idx))
+                    .ok_or(PDeflateError::InvalidStream(
+                        "huffman lut subtable index out of bounds",
+                    ))?;
+                let HuffmanLutEntry::Symbol { symbol, bit_len } = entry else {
+                    return Err(PDeflateError::InvalidStream(
+                        "huffman lut subtable entry is not terminal symbol",
+                    ));
+                };
+                reader.consume(bit_len)?;
+                out.push(u8::try_from(symbol).map_err(|_| PDeflateError::NumericOverflow)?);
+            }
+            HuffmanLutEntry::Invalid => {
+                return Err(PDeflateError::InvalidStream(
+                    "huffman lut decode hit invalid root entry",
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[inline]
+fn logical_commands_to_huffman_symbols(section_cmd: &[u8]) -> &[u8] {
+    // T02: introduce a dedicated symbol layer before Huffman.
+    // At this stage, each command byte maps to one symbol (identity).
+    section_cmd
+}
+
+fn encode_huffman_symbols_to_bitstream(
+    symbols: &[u8],
+    section_bitstream: &mut Vec<u8>,
+) -> Result<u32, PDeflateError> {
+    section_bitstream.extend_from_slice(symbols);
+    let bit_len = symbols
+        .len()
+        .checked_mul(8)
+        .ok_or(PDeflateError::NumericOverflow)?;
+    u32::try_from(bit_len).map_err(|_| PDeflateError::NumericOverflow)
+}
+
+fn section_bit_len_to_byte_len(section_bit_len: usize) -> Result<usize, PDeflateError> {
+    if (section_bit_len & 7) != 0 {
+        return Err(PDeflateError::InvalidStream(
+            "section bit_len is not byte-aligned",
+        ));
+    }
+    Ok(section_bit_len / 8)
+}
+
+fn decode_section_bitstream_to_huffman_symbols(
+    section_bits: &[u8],
+    section_bit_len: usize,
+) -> Result<Vec<u8>, PDeflateError> {
+    let lut = &build_identity_huffman_lut_block()
+        .and_then(|payload| deserialize_huffman_lut(&payload))?;
+    decode_section_bitstream_to_huffman_symbols_with_lut(section_bits, section_bit_len, lut)
+}
+
+fn decode_section_bitstream_to_huffman_symbols_with_lut(
+    section_bits: &[u8],
+    section_bit_len: usize,
+    huff_lut: &HuffmanLut,
+) -> Result<Vec<u8>, PDeflateError> {
+    let byte_len = section_bit_len_to_byte_len(section_bit_len)?;
+    if byte_len != section_bits.len() {
+        return Err(PDeflateError::InvalidStream(
+            "section bitstream length mismatch",
+        ));
+    }
+    decode_huffman_symbols_with_lut(section_bits, section_bit_len, huff_lut)
+}
+
+#[inline]
+fn huffman_symbols_to_logical_commands(symbols: Vec<u8>) -> Vec<u8> {
+    // T02: inverse of logical_commands_to_huffman_symbols (identity for now).
+    symbols
 }
 
 fn elapsed_ms(start: Instant) -> f64 {
@@ -5617,9 +6588,41 @@ mod tests {
         let _section_count = read_u16_le(payload, &mut cursor).expect("chunk section count");
         let _table_index_offset = read_u32_le(payload, &mut cursor).expect("table index off");
         let _table_data_offset = read_u32_le(payload, &mut cursor).expect("table data off");
+        let _huff_lut_offset = read_u32_le(payload, &mut cursor).expect("huff lut off");
         let _section_index_offset = read_u32_le(payload, &mut cursor).expect("section index off");
-        let section_cmd_offset = read_u32_le(payload, &mut cursor).expect("section cmd off");
-        payload.len().saturating_sub(section_cmd_offset as usize)
+        let section_bitstream_offset =
+            read_u32_le(payload, &mut cursor).expect("section bitstream off");
+        payload
+            .len()
+            .saturating_sub(section_bitstream_offset as usize)
+    }
+
+    fn chunk_offsets(payload: &[u8]) -> (usize, usize, usize, usize, usize) {
+        let mut cursor = 0usize;
+        let _magic = read_exact(payload, &mut cursor, 4).expect("chunk magic");
+        let _version = read_u16_le(payload, &mut cursor).expect("chunk version");
+        let _flags = read_u16_le(payload, &mut cursor).expect("chunk flags");
+        let _chunk_uncompressed_len = read_u32_le(payload, &mut cursor).expect("chunk out len");
+        let _table_count = read_u16_le(payload, &mut cursor).expect("chunk table count");
+        let _section_count = read_u16_le(payload, &mut cursor).expect("chunk section count");
+        let table_index_offset = read_u32_le(payload, &mut cursor).expect("table index off");
+        let table_data_offset = read_u32_le(payload, &mut cursor).expect("table data off");
+        let huff_lut_offset = read_u32_le(payload, &mut cursor).expect("huff lut off");
+        let section_index_offset = read_u32_le(payload, &mut cursor).expect("section index off");
+        let section_bitstream_offset =
+            read_u32_le(payload, &mut cursor).expect("section bitstream off");
+        (
+            table_index_offset as usize,
+            table_data_offset as usize,
+            huff_lut_offset as usize,
+            section_index_offset as usize,
+            section_bitstream_offset as usize,
+        )
+    }
+
+    fn write_u32_le_at(dst: &mut [u8], offset: usize, value: u32) {
+        let bytes = value.to_le_bytes();
+        dst[offset..offset + 4].copy_from_slice(&bytes);
     }
 
     #[test]
@@ -5650,6 +6653,312 @@ mod tests {
         let compressed = pdeflate_compress(&input, &opts).expect("compress");
         let decoded = pdeflate_decompress(&compressed).expect("decompress");
         assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn reject_corrupted_chunk_offsets_v0_header() {
+        let input = b"AAABBBCCCDDDEEEFFF".to_vec();
+        let mut payload = compress_single_chunk_payload(&input, 1);
+        let bad_section_bitstream_offset = u32::try_from(payload.len() + 1).expect("fits u32");
+        // v0 header: section_bitstream_offset is at byte offset 32.
+        write_u32_le_at(&mut payload, 32, bad_section_bitstream_offset);
+
+        let preprocess_err = preprocess_chunk_for_gpu_decode(&payload).expect_err("must fail");
+        assert!(
+            matches!(
+                preprocess_err,
+                PDeflateError::InvalidStream("invalid chunk offsets")
+            ),
+            "unexpected preprocess error: {preprocess_err}"
+        );
+
+        let mut out = vec![0u8; input.len()];
+        let decode_err = decompress_chunk_into(&payload, &mut out).expect_err("must fail");
+        assert!(
+            matches!(
+                decode_err,
+                PDeflateError::InvalidStream("invalid chunk offsets")
+            ),
+            "unexpected decode error: {decode_err}"
+        );
+    }
+
+    #[test]
+    fn reject_non_byte_aligned_section_bit_len() {
+        let input = b"ABABABABABABABAB".to_vec();
+        let mut payload = compress_single_chunk_payload(&input, 1);
+        let section_index_offset = u32::from_le_bytes(
+            payload[28..32]
+                .try_into()
+                .expect("section_index_offset bytes"),
+        ) as usize;
+        payload[section_index_offset] = payload[section_index_offset].wrapping_add(1);
+
+        let preprocess_err = preprocess_chunk_for_gpu_decode(&payload).expect_err("must fail");
+        assert!(
+            matches!(
+                preprocess_err,
+                PDeflateError::InvalidStream("section bit_len is not byte-aligned")
+            ),
+            "unexpected preprocess error: {preprocess_err}"
+        );
+    }
+
+    #[test]
+    fn chunk_contains_identity_huffman_lut_block() {
+        let input = b"ABABABABABABABAB".to_vec();
+        let payload = compress_single_chunk_payload(&input, 1);
+        let (
+            table_index_offset,
+            table_data_offset,
+            huff_lut_offset,
+            section_index_offset,
+            section_bitstream_offset,
+        ) = chunk_offsets(&payload);
+        assert_eq!(table_index_offset, CHUNK_HEADER_SIZE);
+        assert!(table_index_offset <= table_data_offset);
+        assert!(table_data_offset <= huff_lut_offset);
+        assert!(huff_lut_offset < section_index_offset);
+        assert!(section_index_offset <= section_bitstream_offset);
+
+        let huff_lut = &payload[huff_lut_offset..section_index_offset];
+        assert!(!huff_lut.is_empty());
+        let lut = deserialize_huffman_lut(huff_lut).expect("deserialize chunk lut");
+        assert_eq!(lut.symbol_count, 256);
+        assert_eq!(lut.root_bits, 8);
+        assert_eq!(lut.max_code_bits, 8);
+        assert_eq!(lut.root.len(), 256);
+        assert!(lut.subtables.is_empty());
+        for (idx, entry) in lut.root.iter().copied().enumerate() {
+            match entry {
+                HuffmanLutEntry::Symbol { symbol, bit_len } => {
+                    assert_eq!(usize::from(symbol), idx);
+                    assert_eq!(bit_len, 8);
+                }
+                _ => panic!("identity lut root must contain direct symbols"),
+            }
+        }
+    }
+
+    #[test]
+    fn reject_corrupted_chunk_huffman_lut_block() {
+        let input = b"ABABABABABABABAB".to_vec();
+        let mut payload = compress_single_chunk_payload(&input, 1);
+        let (_table_index_offset, _table_data_offset, huff_lut_offset, _section_index_offset, _) =
+            chunk_offsets(&payload);
+        // huff lut header: [symbol_count:u16][root_bits:u8][max_code_bits:u8][root_len:u32]...
+        write_u32_le_at(&mut payload, huff_lut_offset + 4, 1);
+
+        let preprocess_err = preprocess_chunk_for_gpu_decode(&payload).expect_err("must fail");
+        assert!(
+            matches!(
+                preprocess_err,
+                PDeflateError::InvalidStream("huffman lut root length mismatch")
+            ),
+            "unexpected preprocess error: {preprocess_err}"
+        );
+
+        let mut out = vec![0u8; input.len()];
+        let decode_err = decompress_chunk_into(&payload, &mut out).expect_err("must fail");
+        assert!(
+            matches!(
+                decode_err,
+                PDeflateError::InvalidStream("huffman lut root length mismatch")
+            ),
+            "unexpected decode error: {decode_err}"
+        );
+    }
+
+    #[test]
+    fn logical_command_bitstream_identity_roundtrip() {
+        let section_cmd_lens = [3u32, 0u32, 7u32, 2u32];
+        let logical_cmd_stream: Vec<u8> = vec![
+            0x01, 0x02, 0x03, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0xaa, 0xbb,
+        ];
+        assert_eq!(
+            logical_cmd_stream.len(),
+            section_cmd_lens
+                .iter()
+                .fold(0usize, |acc, &v| acc.saturating_add(v as usize))
+        );
+
+        let mut section_index = Vec::new();
+        let mut section_bitstream = Vec::new();
+        let mut src_cursor = 0usize;
+        for &len_u32 in &section_cmd_lens {
+            let len = usize::try_from(len_u32).expect("len fits usize");
+            let end = src_cursor.saturating_add(len);
+            let sec_cmd = &logical_cmd_stream[src_cursor..end];
+            let symbols = logical_commands_to_huffman_symbols(sec_cmd);
+            let bit_len = encode_huffman_symbols_to_bitstream(symbols, &mut section_bitstream)
+                .expect("encode symbols");
+            write_varint_u32(&mut section_index, bit_len);
+            src_cursor = end;
+        }
+        assert_eq!(src_cursor, logical_cmd_stream.len());
+
+        let mut decoded_cmd_stream = Vec::new();
+        let mut index_cursor = 0usize;
+        let mut bit_cursor = 0usize;
+        for _ in 0..section_cmd_lens.len() {
+            let sec_bit_len_u32 =
+                read_varint_u32(&section_index, &mut index_cursor).expect("read bit len");
+            let sec_bit_len = usize::try_from(sec_bit_len_u32).expect("fits usize");
+            let sec_byte_len = section_bit_len_to_byte_len(sec_bit_len).expect("byte aligned");
+            let sec_end = bit_cursor.saturating_add(sec_byte_len);
+            let sec_bits = &section_bitstream[bit_cursor..sec_end];
+            let symbols = decode_section_bitstream_to_huffman_symbols(sec_bits, sec_bit_len)
+                .expect("decode symbols");
+            let logical = huffman_symbols_to_logical_commands(symbols);
+            decoded_cmd_stream.extend_from_slice(&logical);
+            bit_cursor = sec_end;
+        }
+        assert_eq!(index_cursor, section_index.len());
+        assert_eq!(bit_cursor, section_bitstream.len());
+        assert_eq!(decoded_cmd_stream, logical_cmd_stream);
+    }
+
+    #[test]
+    fn reject_section_bitstream_length_mismatch() {
+        let err = decode_section_bitstream_to_huffman_symbols(&[0x12u8], 16)
+            .expect_err("must reject mismatched section bitstream length");
+        assert!(
+            matches!(
+                err,
+                PDeflateError::InvalidStream("section bitstream length mismatch")
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn huffman_lut_decode_matches_tree_decode() {
+        let mut symbols = Vec::new();
+        for i in 0..4096usize {
+            symbols.push((i % 7) as u8);
+            if (i % 3) == 0 {
+                symbols.push(((i / 5) % 11) as u8);
+            }
+            if (i % 17) == 0 {
+                symbols.push(31u8);
+            }
+        }
+
+        let mut frequencies = vec![0u32; 256];
+        for &s in &symbols {
+            frequencies[s as usize] = frequencies[s as usize].saturating_add(1);
+        }
+
+        let codebook =
+            build_canonical_huffman_codebook_from_frequencies(&frequencies, HUFF_MAX_CODE_BITS)
+                .expect("build canonical codebook");
+        let root_bits = HUFF_LUT_ROOT_BITS_DEFAULT
+            .min(codebook.max_code_bits)
+            .max(1);
+        let lut = build_huffman_lut(&codebook, root_bits).expect("build huffman lut");
+        let serialized = serialize_huffman_lut(&lut).expect("serialize huffman lut");
+        let parsed_lut = deserialize_huffman_lut(&serialized).expect("deserialize huffman lut");
+        let (bitstream, bit_len) =
+            encode_symbols_with_huffman_codebook(&symbols, &codebook).expect("encode symbols");
+
+        let decoded_tree =
+            decode_huffman_symbols_with_tree(&bitstream, bit_len, &codebook).expect("tree decode");
+        let decoded_lut =
+            decode_huffman_symbols_with_lut(&bitstream, bit_len, &parsed_lut).expect("lut decode");
+
+        assert_eq!(decoded_tree, symbols);
+        assert_eq!(decoded_lut, symbols);
+        assert_eq!(decoded_lut, decoded_tree);
+    }
+
+    #[test]
+    fn reject_huffman_lut_subtable_out_of_range() {
+        let lut = HuffmanLut {
+            symbol_count: 4,
+            root_bits: 1,
+            max_code_bits: 2,
+            root: vec![
+                HuffmanLutEntry::Subtable {
+                    offset: 0,
+                    sub_bits: 1,
+                },
+                HuffmanLutEntry::Symbol {
+                    symbol: 0,
+                    bit_len: 1,
+                },
+            ],
+            subtables: vec![
+                HuffmanLutEntry::Symbol {
+                    symbol: 1,
+                    bit_len: 2,
+                },
+                HuffmanLutEntry::Symbol {
+                    symbol: 2,
+                    bit_len: 2,
+                },
+            ],
+        };
+        let mut payload = serialize_huffman_lut(&lut).expect("serialize huffman lut");
+        let bad = pack_huffman_lut_entry(HuffmanLutEntry::Subtable {
+            offset: 3,
+            sub_bits: 1,
+        })
+        .expect("pack bad lut entry");
+        write_u32_le_at(&mut payload, HUFF_LUT_HEADER_SIZE, bad);
+        let err = deserialize_huffman_lut(&payload).expect_err("must reject out-of-range subtable");
+        assert!(
+            matches!(
+                err,
+                PDeflateError::InvalidStream("huffman lut subtable range out of bounds")
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_huffman_lut_subtable_entry_that_points_to_subtable() {
+        let lut = HuffmanLut {
+            symbol_count: 4,
+            root_bits: 1,
+            max_code_bits: 2,
+            root: vec![
+                HuffmanLutEntry::Subtable {
+                    offset: 0,
+                    sub_bits: 1,
+                },
+                HuffmanLutEntry::Symbol {
+                    symbol: 0,
+                    bit_len: 1,
+                },
+            ],
+            subtables: vec![
+                HuffmanLutEntry::Symbol {
+                    symbol: 1,
+                    bit_len: 2,
+                },
+                HuffmanLutEntry::Symbol {
+                    symbol: 2,
+                    bit_len: 2,
+                },
+            ],
+        };
+        let mut payload = serialize_huffman_lut(&lut).expect("serialize huffman lut");
+        let subtable_offset = HUFF_LUT_HEADER_SIZE + lut.root.len().saturating_mul(4);
+        let bad = pack_huffman_lut_entry(HuffmanLutEntry::Subtable {
+            offset: 0,
+            sub_bits: 1,
+        })
+        .expect("pack bad lut entry");
+        write_u32_le_at(&mut payload, subtable_offset, bad);
+        let err =
+            deserialize_huffman_lut(&payload).expect_err("must reject subtable chain/cycle shape");
+        assert!(
+            matches!(
+                err,
+                PDeflateError::InvalidStream("huffman lut subtable entry is not terminal symbol")
+            ),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

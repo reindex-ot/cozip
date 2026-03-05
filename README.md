@@ -111,3 +111,5 @@ Notes:
 
 - [`docs/context-log.md`](./docs/context-log.md): implementation history and experiment notes.
 - [`docs/gpu-deflate-chunk-pipeline.md`](./docs/gpu-deflate-chunk-pipeline.md): GPU deflate pipeline notes.
+- [`docs/pdeflate-v0-spec.md`](./docs/pdeflate-v0-spec.md): single source of truth for the current PDeflate v0 format.
+- [`docs/pdeflate-v0-baseline.md`](./docs/pdeflate-v0-baseline.md): fixed benchmark command and implementation baseline metrics.

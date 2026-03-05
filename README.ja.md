@@ -111,3 +111,5 @@ let _ = cozip
 
 - [`docs/context-log.md`](./docs/context-log.md): 実装履歴・検証ログ
 - [`docs/gpu-deflate-chunk-pipeline.md`](./docs/gpu-deflate-chunk-pipeline.md): GPU deflate パイプラインのメモ
+- [`docs/pdeflate-v0-spec.md`](./docs/pdeflate-v0-spec.md): 現行 PDeflate v0 フォーマットの唯一の仕様ソース
+- [`docs/pdeflate-v0-baseline.md`](./docs/pdeflate-v0-baseline.md): 比較用ベンチコマンドと実装前ベースライン

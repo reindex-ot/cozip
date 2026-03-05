@@ -8,19 +8,23 @@
 ## 1.1 Deflateとの関係（重要）
 - PDeflateは「Deflate系」の設計思想を継承する。
 - 差し替える主対象は LZ77 の参照モデル（距離参照 -> 辞書テーブル参照）。
-- エントロピー符号化は Deflate と同様に Huffman 符号化（fixed/dynamic）を使う前提とする。
-- したがって、PDeflateは「DeflateのうちLZ段を置換した派生形式」である。
+- エントロピー符号化は Huffman を用いる。
+- 本仕様では、**チャンクごとに高速LUT復号テーブル（root table + subtable）を保持**し、各セクションは同一チャンク内LUTを参照して復号する。
 
 ## 2. 設計方針
-- 各チャンクに `read-only` のグローバル辞書テーブルを持つ。
-- 本文は「参照命令」と「非参照リテラル命令」の列で表現する。
-- チャンクを固定数セクション（デフォルト 128）に分割し、各セクションは独立して解凍可能にする。
+- 各チャンクに `read-only` のグローバル辞書テーブル（TABLE_REF用）を持つ。
+- 各チャンクに `read-only` の Huffman LUT 群（root table + subtable）を持つ。
+- 本文は「参照命令」と「非参照リテラル命令」の論理列で表現する。
+- チャンクを固定数セクション（既定 128）に分割し、各セクションは独立して解凍可能にする。
 - 参照は「過去出力位置」ではなく「辞書テーブルID」を引く（LZ77距離参照を直接使わない）。
 
 ## 3. 用語
 - チャンク: 圧縮/解凍の最小独立単位（既定 4 MiB）。
 - テーブルエントリ: 辞書テーブル中のバイト列。
 - セクション: チャンク内の独立解凍単位（既定 128 分割）。
+- Huffman LUT:
+  - root table: 先頭 `R` bit（例: 9-11bit）で直接引くテーブル
+  - subtable: 長符号語用の2段目テーブル
 
 ## 4. チャンクフォーマット（v0）
 
@@ -32,39 +36,45 @@
 - `version: u16 = 0`
 - `flags: u16`
 - `chunk_uncompressed_len: u32`
-- `table_count: u16`  
+- `table_count: u16`
   - 有効範囲: `0..=0x0FFF - 1`（最大 4095 エントリ）
 - `section_count: u16`（既定 128）
 - `table_index_offset: u32`
 - `table_data_offset: u32`
+- `huff_lut_offset: u32`
 - `section_index_offset: u32`
-- `section_cmd_offset: u32`
+- `section_bitstream_offset: u32`
 
 注: 実装時は `u64` オフセット拡張を検討可（v0 は `u32` 想定）。
 
-### 4.3 テーブルインデックス
+### 4.3 辞書テーブルインデックス（TABLE_REF用）
 - 配列長: `table_count`
 - 各要素:
   - `entry_len: u8`（v0 上限 254、0 は無効）
 - `entry_offset` は圧縮ストリームに保持しない。
 - 解凍時に前処理として `entry_len` の累積和から `entry_offset` を生成する。
-- 目的:
-  - 圧縮データ側のメタデータを削減する。
-  - 解凍実行前にランダムアクセス用オフセット表を構築し、線形探索を避ける。
 
-### 4.4 テーブル本体
+### 4.4 辞書テーブル本体（TABLE_REF用）
 - テーブルエントリの生バイト列を連結配置。
 - v0 制約:
-  - エントリは「生バイト列のみ」。
+  - エントリは生バイト列のみ。
   - エントリ同士の参照は禁止（再帰依存禁止）。
 
-### 4.5 セクションインデックス
+### 4.5 Huffman LUT ブロック（チャンク共有）
+- `huff_lut_offset..section_index_offset` に配置。
+- チャンク復号に必要な LUT 群を格納する。
+- v0 要件:
+  - 復号時に木構築を行わず、LUT参照のみで復号できること。
+  - `root table + subtable` の2段参照方式を前提とする。
+  - セクションは本ブロックを共有参照する（read-only）。
+
+### 4.6 セクションインデックス
 - 配列長: `section_count`
 - 各要素:
-  - `cmd_len: varint`（ULEB128）
-- `cmd_offset` / `out_offset` は圧縮ストリームに保持しない。
+  - `bit_len: varint`（ULEB128）
+- `bit_offset` / `out_offset` は圧縮ストリームに保持しない。
 - 解凍時に前処理として:
-  - `cmd_offset`: `cmd_len` の累積和で生成
+  - `bit_offset`: `bit_len` の累積和で生成
   - `out_offset` / `out_len`: `chunk_uncompressed_len` と `section_count` から決定的に生成
     - `raw_offset(i) = floor(i * chunk_uncompressed_len / section_count)`
     - `align_down4(x) = x & ~3`
@@ -73,13 +83,16 @@
     - `out_offset(section_count) = chunk_uncompressed_len`
     - `out_len(i) = out_offset(i+1) - out_offset(i)`
   - 注意:
-    - 内部セクション境界（`i in [1, section_count-1]`）は必ず4-byte境界となる。
+    - 内部セクション境界（`i in [1, section_count-1]`）は必ず4-byte境界。
     - 末尾境界 `out_offset(section_count)` は `chunk_uncompressed_len` を優先し、4-byte境界でなくてもよい。
-    - 端数（0..3 byte）は末尾側セクション長に集約される。
+    - 端数（0..3 byte）は末尾側セクション長に集約。
 
-この前処理で各セクションをランダムアクセスし、独立解凍できる。
+### 4.7 セクションビットストリーム
+- `section_bitstream_offset..chunk_end` に配置。
+- 各セクションのビット列は `bit_offset/bit_len` で切り出して解釈する。
+- セクション間でビット列は論理的に独立し、相互参照しない。
 
-## 5. 命令エンコード
+## 5. 論理命令エンコード
 
 ### 5.1 命令ヘッダ（2バイト）
 - `cmd16: u16`（Little Endian）
@@ -96,49 +109,45 @@
   - **TABLE_REF**
   - `ref_or_tag` をテーブルIDとして参照。
   - `table[id]` の内容を繰り返し利用し、`len` バイト出力する。
-  - LZ77方針に合わせ、参照命令の `len` は `>= 3` を必須とする。
+  - 参照命令の `len` は `>= 3` を必須とする。
 - `ref_or_tag == 0x0FFF`:
   - **LITERAL_RUN**
-  - 後続に `len` バイトの非圧縮リテラルをそのまま格納。
+  - 後続に `len` バイトの非圧縮リテラルを格納。
 
-例:
-- `[0xFF, 0xF1, 0x00]`
-  - `cmd16=0xF1FF`
-  - `ref_or_tag=0xFFF`（LITERAL_RUN）
-  - `len4=1`（len=1）
-  - 後続1バイト `0x00` を出力
+注: 上記は論理命令列であり、実ストリームでは Huffman 符号化されたビット列として格納される。
 
-### 5.4 Huffman符号化レイヤー
-- 本節の命令表現は「論理命令列」の定義である。
-- 実バイトストリーム化では、Deflate同様に Huffman（fixed/dynamic）で符号化する。
-- v0ではまず命令意味論を固定し、符号語割当（シンボル設計）は別節/別版で厳密化する。
+## 6. 解凍アルゴリズム
 
-## 6. 解凍アルゴリズム（セクション単位）
 1. チャンクヘッダ検証。
-2. テーブルインデックス読み込み（必要ならGPU前処理バッファ化）。
-3. セクションインデックス（`cmd_len` 列）から `cmd_offset` を再構築し、同時に `out_offset/out_len` を算出。
-4. セクション命令列を先頭から順に実行し、`out_offset..out_offset+out_len` へ出力。
-5. セクションごとに独立実行（CPU/GPUどちらでも可）。
+2. 辞書テーブル（TABLE_REF）前処理。
+3. Huffman LUT ブロックを読み込み（またはGPU用バッファへ転送）。
+4. セクションインデックス（`bit_len` 列）から `bit_offset` を再構築し、同時に `out_offset/out_len` を算出。
+5. 各セクションを独立復号し、`out_offset..out_offset+out_len` へ出力。
 
-GPU実行モデル:
-- 1セクション = 1ワーカー（または1 workgroup）を基本単位。
-- セクション間同期は不要（チャンク完了同期のみ）。
+### 6.1 実行モデル（本仕様の必須方針）
+- **CPU:** チャンク並列（chunk-level parallel）
+- **GPU:** チャンク + セクション並列（chunk-level + section-level parallel）
+- LUT はチャンク共有 read-only とし、セクション間同期は不要（チャンク完了同期のみ）。
 
 ## 7. エンコード制約（重要）
 - セクション独立性を壊す命令は禁止。
   - 他セクションの出力を参照する命令は存在しない。
 - 参照命令は必ず有効なテーブルIDを指す。
-- 参照命令で `len < 3` は生成しない（LZ77方針）。
+- 参照命令で `len < 3` は生成しない。
 - セクション出力長 `out_len` と実際の命令展開長が一致すること。
+- セクション境界は 4-byte ルール（内部境界）に従うこと。
 
 ## 8. バリデーション/安全制約
 - `table_count <= 4095`
 - `entry_len in [1, 254]`
 - `sum(entry_len)` が `table_data` 実長と一致すること
 - `section_count > 0`
+- `sum(section_bit_len)` が `section_bitstream` 実ビット長と一致すること
+- `section_bit_len` の varint 列が正しく終端し、過長/オーバーフローしないこと
 - 内部セクション境界 `out_offset(i)`（`1 <= i < section_count`）が4-byte境界であること
-- `sum(section_cmd_len)` が `section_cmd` 実長と一致すること
-- `section_cmd_len` の varint 列が正しく終端し、過長/オーバーフローしないこと
+- Huffman LUT の整合性:
+  - root/subtable 参照が範囲外にならないこと
+  - 無効シンボル/無限ループを誘発しないこと
 - 解凍時:
   - `max_expand_ratio`（例: 64x）
   - `max_ops_per_section`
@@ -152,14 +161,18 @@ GPU実行モデル:
 - table_count upper bound: 4095
 - entry_len upper bound: 254
 - len拡張: `len = 0xF + ext8`（`ext8` は 0..255）
+- Huffman LUT: `root table + subtable`（チャンク共有）
 
 ## 10. 実装メモ
-- 命令デコードは分岐を減らすため `TABLE_REF` と `LITERAL_RUN` の2命令に限定。
-- テーブルオフセットは解凍前処理で再構築する（prefix-sum）。
-- セクションの `cmd_offset` は varint `cmd_len` の prefix-sum で再構築する。
-- セクションの `out_offset/out_len` は `chunk_uncompressed_len` と `section_count` から算出し、内部境界は4-byte整列にする。
+- 命令デコードは `TABLE_REF` と `LITERAL_RUN` の2命令に限定。
+- 辞書テーブルオフセットは解凍前処理で再構築（prefix-sum）。
+- セクション `bit_offset` は varint `bit_len` の prefix-sum で再構築。
+- セクション `out_offset/out_len` は `chunk_uncompressed_len` と `section_count` から算出し、内部境界は4-byte整列。
+- Huffman 復号は木走査ではなく LUT 参照（root + subtable）を使う。
 - まず CPU 実装でフォーマット妥当性を固定し、その後 GPU 解凍へ展開する。
-- 将来拡張:
-  - 長さの多段拡張（varint）
-  - 追加オペコード（RLE系など）
-  - チャンクヘッダの 64bit オフセット化
+
+## 11. 互換性ポリシー（v0開発フェーズ）
+- v0 は **新形式専用** とする。
+- 旧PDeflateチャンク形式の読み取り互換は v0 の必須要件に含めない。
+- 旧形式データを入力した場合は、サイレントフォールバックせず明示エラーを返す。
+- 互換読み取りが必要になった場合は、将来の別タスク（互換モード）で `version/flags` 分岐として導入する。
