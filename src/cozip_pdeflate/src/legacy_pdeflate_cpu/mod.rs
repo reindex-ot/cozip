@@ -6317,6 +6317,11 @@ fn encode_huffman_symbols_to_bitstream(
 
 fn section_bit_len_to_byte_len(section_bit_len: usize) -> Result<usize, PDeflateError> {
     if (section_bit_len & 7) != 0 {
+        eprintln!(
+            "[cozip_pdeflate][error][section-bit-len] bit_len={} low3={} (expected byte aligned)",
+            section_bit_len,
+            section_bit_len & 7
+        );
         return Err(PDeflateError::InvalidStream(
             "section bit_len is not byte-aligned",
         ));

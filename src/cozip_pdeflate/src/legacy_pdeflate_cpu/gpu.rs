@@ -1422,7 +1422,13 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
         }
         section_prefix[sec] = total_cmd_len;
         total_cmd_len = total_cmd_len + len;
-        section_index_len = append_varint(section_index_len, len);
+        // section index stores bit_len (not byte_len) for each section.
+        if (len > 0x1fffffffu) {
+            overflow = 1u;
+            break;
+        }
+        let bit_len = len << 3u;
+        section_index_len = append_varint(section_index_len, bit_len);
         sec = sec + 1u;
     }
     if (overflow != 0u) {
@@ -5727,6 +5733,78 @@ fn write_u32_le_fixed(dst: &mut [u8], off: usize, v: u32) {
     dst[off..off + 4].copy_from_slice(&b);
 }
 
+fn build_identity_huff_lut_block_for_pack() -> Vec<u8> {
+    // Keep this in sync with decode-v2 packed entry format:
+    // kind(2b) | bit_len(8b, <<2) | symbol(22b, <<10)
+    const SYMBOL_COUNT: usize = 256;
+    const ROOT_BITS: u8 = 8;
+    const MAX_CODE_BITS: u8 = 8;
+    const ENTRY_KIND_SYMBOL: u32 = 1;
+
+    let mut out = Vec::with_capacity(12 + SYMBOL_COUNT * 4);
+    out.extend_from_slice(&(SYMBOL_COUNT as u16).to_le_bytes());
+    out.push(ROOT_BITS);
+    out.push(MAX_CODE_BITS);
+    out.extend_from_slice(&(SYMBOL_COUNT as u32).to_le_bytes()); // root_len
+    out.extend_from_slice(&0u32.to_le_bytes()); // sub_len
+    for symbol in 0..SYMBOL_COUNT {
+        let packed = ENTRY_KIND_SYMBOL | (u32::from(ROOT_BITS) << 2) | ((symbol as u32) << 10);
+        out.extend_from_slice(&packed.to_le_bytes());
+    }
+    out
+}
+
+fn ensure_sparse_packed_chunk_huff_lut(payload: &mut Vec<u8>) -> Result<(), PDeflateError> {
+    if payload.len() < PACK_CHUNK_HEADER_SIZE {
+        return Err(PDeflateError::InvalidStream(
+            "gpu sparse packed chunk header truncated",
+        ));
+    }
+    let table_data_offset = usize::try_from(read_le_u32_at(payload, 20)?)
+        .map_err(|_| PDeflateError::NumericOverflow)?;
+    let huff_lut_offset = usize::try_from(read_le_u32_at(payload, 24)?)
+        .map_err(|_| PDeflateError::NumericOverflow)?;
+    let section_index_offset = usize::try_from(read_le_u32_at(payload, 28)?)
+        .map_err(|_| PDeflateError::NumericOverflow)?;
+    let section_bitstream_offset = usize::try_from(read_le_u32_at(payload, 32)?)
+        .map_err(|_| PDeflateError::NumericOverflow)?;
+    if !(table_data_offset <= huff_lut_offset
+        && huff_lut_offset <= section_index_offset
+        && section_index_offset <= section_bitstream_offset
+        && section_bitstream_offset <= payload.len())
+    {
+        return Err(PDeflateError::InvalidStream(
+            "gpu sparse packed chunk offsets invalid",
+        ));
+    }
+
+    // Already has LUT payload.
+    if huff_lut_offset < section_index_offset {
+        return Ok(());
+    }
+
+    let lut = build_identity_huff_lut_block_for_pack();
+    let lut_len = lut.len();
+    payload.splice(huff_lut_offset..huff_lut_offset, lut);
+    let new_section_index_offset = section_index_offset
+        .checked_add(lut_len)
+        .ok_or(PDeflateError::NumericOverflow)?;
+    let new_section_bitstream_offset = section_bitstream_offset
+        .checked_add(lut_len)
+        .ok_or(PDeflateError::NumericOverflow)?;
+    write_u32_le_fixed(
+        payload,
+        28,
+        u32::try_from(new_section_index_offset).map_err(|_| PDeflateError::NumericOverflow)?,
+    );
+    write_u32_le_fixed(
+        payload,
+        32,
+        u32::try_from(new_section_bitstream_offset).map_err(|_| PDeflateError::NumericOverflow)?,
+    );
+    Ok(())
+}
+
 pub(crate) fn pack_chunk_payload(
     chunk_len: usize,
     table_count: usize,
@@ -7022,6 +7100,7 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
         payload.copy_from_slice(&mapped[..payload_len]);
         drop(mapped);
         dispatch.scratch.readback_buffer.unmap();
+        ensure_sparse_packed_chunk_huff_lut(&mut payload)?;
         out.push(GpuSparsePackChunkOutput {
             payload,
             table_count: payload_table_counts[idx],
