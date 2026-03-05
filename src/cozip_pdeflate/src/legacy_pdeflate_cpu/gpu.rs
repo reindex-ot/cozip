@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -2254,6 +2255,333 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
 }
 "#;
 
+const DECODE_V2_BATCH_SHADER: &str = r#"
+const LITERAL_TAG: u32 = 0x0fffu;
+const MAX_CMD_LEN: u32 = 270u;
+const HUFF_LUT_HEADER_SIZE: u32 = 12u;
+const BATCH_DESC_WORDS: u32 = 12u;
+
+@group(0) @binding(0) var<storage, read> batch_desc_words: array<u32>;
+@group(0) @binding(1) var<storage, read> section_meta_words: array<u32>;
+@group(0) @binding(2) var<storage, read> cmd_words: array<u32>;
+@group(0) @binding(3) var<storage, read> table_words: array<u32>;
+@group(0) @binding(4) var<storage, read_write> out_words: array<u32>;
+@group(0) @binding(5) var<storage, read_write> error_words: array<u32>;
+
+fn load_cmd_u8(cmd_base: u32, idx: u32) -> u32 {
+    let abs_idx = cmd_base + idx;
+    let w = cmd_words[abs_idx >> 2u];
+    let shift = (abs_idx & 3u) * 8u;
+    return (w >> shift) & 0xffu;
+}
+
+fn load_table_u8(table_base: u32, idx: u32) -> u32 {
+    let abs_idx = table_base + idx;
+    let w = table_words[abs_idx >> 2u];
+    let shift = (abs_idx & 3u) * 8u;
+    return (w >> shift) & 0xffu;
+}
+
+fn load_table_u32(table_base: u32, idx: u32) -> u32 {
+    let b0 = load_table_u8(table_base, idx);
+    let b1 = load_table_u8(table_base, idx + 1u);
+    let b2 = load_table_u8(table_base, idx + 2u);
+    let b3 = load_table_u8(table_base, idx + 3u);
+    return b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+}
+
+fn store_out_u8(out_base: u32, idx: u32, value: u32) {
+    let abs_idx = out_base + idx;
+    let word_idx = abs_idx >> 2u;
+    let shift = (abs_idx & 3u) * 8u;
+    let mask = ~(0xffu << shift);
+    let cur = out_words[word_idx];
+    out_words[word_idx] = (cur & mask) | ((value & 0xffu) << shift);
+}
+
+fn mark_error(error_base: u32, sec: u32, code: u32) {
+    error_words[error_base + sec] = code;
+}
+
+fn read_cmd_bit(cmd_base: u32, bit_pos: u32) -> u32 {
+    let byte = load_cmd_u8(cmd_base, bit_pos >> 3u);
+    let shift = bit_pos & 7u;
+    return (byte >> shift) & 1u;
+}
+
+fn peek_cmd_bits(cmd_base: u32, bit_cursor: u32, bit_end: u32, bit_len: u32) -> u32 {
+    var out = 0u;
+    var i = 0u;
+    loop {
+        if (i >= bit_len) {
+            break;
+        }
+        let p = bit_cursor + i;
+        if (p >= bit_end) {
+            break;
+        }
+        out = out | (read_cmd_bit(cmd_base, p) << i);
+        i = i + 1u;
+    }
+    return out;
+}
+
+struct DecodedSymbol {
+    ok: u32,
+    symbol: u32,
+    next_bit: u32,
+    err: u32,
+};
+
+fn decode_huffman_symbol(
+    cmd_base: u32,
+    bit_cursor: u32,
+    bit_end: u32,
+    table_base: u32,
+    huff_lut_off: u32,
+    huff_lut_len: u32,
+) -> DecodedSymbol {
+    if (huff_lut_len < HUFF_LUT_HEADER_SIZE) {
+        return DecodedSymbol(0u, 0u, bit_cursor, 10u);
+    }
+    let lut_end = huff_lut_off + huff_lut_len;
+    let root_bits = load_table_u8(table_base, huff_lut_off + 2u);
+    let max_code_bits = load_table_u8(table_base, huff_lut_off + 3u);
+    let root_len = load_table_u32(table_base, huff_lut_off + 4u);
+    let sub_len = load_table_u32(table_base, huff_lut_off + 8u);
+    if (root_bits == 0u || root_bits > max_code_bits || max_code_bits > 31u) {
+        return DecodedSymbol(0u, 0u, bit_cursor, 11u);
+    }
+    let expected_root_len = (1u << root_bits);
+    if (root_len != expected_root_len) {
+        return DecodedSymbol(0u, 0u, bit_cursor, 12u);
+    }
+    let entry_bytes = (root_len + sub_len) * 4u;
+    let entries_off = huff_lut_off + HUFF_LUT_HEADER_SIZE;
+    if (entries_off + entry_bytes > lut_end) {
+        return DecodedSymbol(0u, 0u, bit_cursor, 13u);
+    }
+    if (bit_cursor >= bit_end) {
+        return DecodedSymbol(0u, 0u, bit_cursor, 14u);
+    }
+
+    let root_mask = (1u << root_bits) - 1u;
+    let root_idx = peek_cmd_bits(cmd_base, bit_cursor, bit_end, root_bits) & root_mask;
+    if (root_idx >= root_len) {
+        return DecodedSymbol(0u, 0u, bit_cursor, 15u);
+    }
+    let root_entry = load_table_u32(table_base, entries_off + root_idx * 4u);
+    let root_kind = root_entry & 0x3u;
+    if (root_kind == 1u) {
+        let bit_len = (root_entry >> 2u) & 0xffu;
+        let symbol = (root_entry >> 10u) & 0xffffu;
+        if (bit_len == 0u || bit_cursor + bit_len > bit_end || symbol > 255u) {
+            return DecodedSymbol(0u, 0u, bit_cursor, 16u);
+        }
+        return DecodedSymbol(1u, symbol, bit_cursor + bit_len, 0u);
+    }
+    if (root_kind == 2u) {
+        let sub_bits = (root_entry >> 2u) & 0xffu;
+        let sub_off = root_entry >> 10u;
+        if (sub_bits == 0u || root_bits + sub_bits > max_code_bits) {
+            return DecodedSymbol(0u, 0u, bit_cursor, 17u);
+        }
+        let full = peek_cmd_bits(cmd_base, bit_cursor, bit_end, root_bits + sub_bits);
+        let sub_mask = (1u << sub_bits) - 1u;
+        let sub_idx = (full >> root_bits) & sub_mask;
+        let abs_idx = root_len + sub_off + sub_idx;
+        if (abs_idx >= root_len + sub_len) {
+            return DecodedSymbol(0u, 0u, bit_cursor, 18u);
+        }
+        let sub_entry = load_table_u32(table_base, entries_off + abs_idx * 4u);
+        let sub_kind = sub_entry & 0x3u;
+        if (sub_kind != 1u) {
+            return DecodedSymbol(0u, 0u, bit_cursor, 19u);
+        }
+        let bit_len = (sub_entry >> 2u) & 0xffu;
+        let symbol = (sub_entry >> 10u) & 0xffffu;
+        if (bit_len == 0u || bit_cursor + bit_len > bit_end || symbol > 255u) {
+            return DecodedSymbol(0u, 0u, bit_cursor, 20u);
+        }
+        return DecodedSymbol(1u, symbol, bit_cursor + bit_len, 0u);
+    }
+    return DecodedSymbol(0u, 0u, bit_cursor, 21u);
+}
+
+@compute
+@workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    if (gid3.z != 0u) {
+        return;
+    }
+    let job_count = batch_desc_words[0];
+    let job = gid3.y;
+    if (job >= job_count) {
+        return;
+    }
+    let desc_base = 1u + job * BATCH_DESC_WORDS;
+    let section_count = batch_desc_words[desc_base];
+    if (gid3.x >= section_count) {
+        return;
+    }
+
+    let table_count = batch_desc_words[desc_base + 1u];
+    let table_repeat_stride = batch_desc_words[desc_base + 2u];
+    let huff_lut_off = batch_desc_words[desc_base + 3u];
+    let huff_lut_len = batch_desc_words[desc_base + 4u];
+    let section_meta_base = batch_desc_words[desc_base + 5u];
+    let cmd_base = batch_desc_words[desc_base + 6u];
+    let cmd_len = batch_desc_words[desc_base + 7u];
+    let table_base = batch_desc_words[desc_base + 8u];
+    let out_base = batch_desc_words[desc_base + 9u];
+    let out_len = batch_desc_words[desc_base + 10u];
+    let error_base = batch_desc_words[desc_base + 11u];
+
+    if (table_repeat_stride == 0u) {
+        mark_error(error_base, gid3.x, 22u);
+        return;
+    }
+
+    let sec = gid3.x;
+    let meta_base = section_meta_base + sec * 4u;
+    let cmd_start = section_meta_words[meta_base];
+    let cmd_len_sec = section_meta_words[meta_base + 1u];
+    let out_start = out_base + section_meta_words[meta_base + 2u];
+    let out_len_sec = section_meta_words[meta_base + 3u];
+    let cmd_end = cmd_start + cmd_len_sec;
+    let bit_end = cmd_end * 8u;
+    let out_end = out_start + out_len_sec;
+    let cmd_limit = cmd_len;
+    let out_limit = out_base + out_len;
+    if (cmd_end > cmd_limit || out_end > out_limit) {
+        mark_error(error_base, sec, 23u);
+        return;
+    }
+
+    var bit_cursor = cmd_start * 8u;
+    var out_cursor = out_start;
+    var err: u32 = 0u;
+    loop {
+        if (out_cursor >= out_end) {
+            break;
+        }
+        let sym0 = decode_huffman_symbol(
+            cmd_base,
+            bit_cursor,
+            bit_end,
+            table_base,
+            huff_lut_off,
+            huff_lut_len,
+        );
+        if (sym0.ok == 0u) {
+            err = 1u + sym0.err;
+            break;
+        }
+        let sym1 = decode_huffman_symbol(
+            cmd_base,
+            sym0.next_bit,
+            bit_end,
+            table_base,
+            huff_lut_off,
+            huff_lut_len,
+        );
+        if (sym1.ok == 0u) {
+            err = 1u + sym1.err;
+            break;
+        }
+        bit_cursor = sym1.next_bit;
+        let cmd = sym0.symbol | (sym1.symbol << 8u);
+
+        let tag = cmd & 0x0fffu;
+        let len4 = (cmd >> 12u) & 0x0fu;
+        var len = len4;
+        if (len4 == 0x0fu) {
+            let ext_sym = decode_huffman_symbol(
+                cmd_base,
+                bit_cursor,
+                bit_end,
+                table_base,
+                huff_lut_off,
+                huff_lut_len,
+            );
+            if (ext_sym.ok == 0u) {
+                err = 2u + ext_sym.err;
+                break;
+            }
+            len = 15u + ext_sym.symbol;
+            bit_cursor = ext_sym.next_bit;
+        }
+        if (len == 0u) {
+            err = 3u;
+            break;
+        }
+        if (len > MAX_CMD_LEN) {
+            err = 4u;
+            break;
+        }
+        if (len > (out_end - out_cursor)) {
+            err = 5u;
+            break;
+        }
+
+        if (tag == LITERAL_TAG) {
+            var i = 0u;
+            loop {
+                if (i >= len) {
+                    break;
+                }
+                let lit_sym = decode_huffman_symbol(
+                    cmd_base,
+                    bit_cursor,
+                    bit_end,
+                    table_base,
+                    huff_lut_off,
+                    huff_lut_len,
+                );
+                if (lit_sym.ok == 0u) {
+                    err = 6u + lit_sym.err;
+                    break;
+                }
+                store_out_u8(0u, out_cursor + i, lit_sym.symbol);
+                bit_cursor = lit_sym.next_bit;
+                i = i + 1u;
+            }
+            if (err != 0u) {
+                break;
+            }
+            out_cursor = out_cursor + len;
+            continue;
+        }
+
+        if (tag >= table_count) {
+            err = 7u;
+            break;
+        }
+        if (len < 3u) {
+            err = 8u;
+            break;
+        }
+
+        let table_repeat_base = tag * table_repeat_stride;
+        var j = 0u;
+        loop {
+            if (j >= len) {
+                break;
+            }
+            let b = load_table_u8(table_base, table_repeat_base + j);
+            store_out_u8(0u, out_cursor + j, b);
+            j = j + 1u;
+        }
+        out_cursor = out_cursor + len;
+    }
+
+    if (err == 0u && bit_cursor != bit_end) {
+        err = 9u;
+    }
+    mark_error(error_base, sec, err);
+}
+"#;
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct GpuMatchProfile {
     pub(crate) upload_ms: f64,
@@ -2573,6 +2901,8 @@ struct GpuMatchRuntime {
     match_prepare_table_pipeline: wgpu::ComputePipeline,
     decode_v2_bind_group_layout: wgpu::BindGroupLayout,
     decode_v2_pipeline: wgpu::ComputePipeline,
+    decode_v2_batch_bind_group_layout: wgpu::BindGroupLayout,
+    decode_v2_batch_pipeline: wgpu::ComputePipeline,
     max_storage_binding_size: u64,
     scratch_pool: Mutex<Vec<GpuBatchScratch>>,
     scratch_hot: Mutex<Option<GpuBatchScratch>>,
@@ -2757,6 +3087,15 @@ struct PreparedGpuDecodeJob<'a> {
     layout: GpuDecodePayloadLayout,
 }
 
+#[derive(Clone, Copy)]
+struct GpuDecodeBatchHostJob<'a> {
+    prepared: PreparedGpuDecodeJob<'a>,
+    out_base: usize,
+    out_len: usize,
+    error_base: usize,
+    error_words: usize,
+}
+
 struct PendingGpuDecodeMap {
     out_data_copy_len: u64,
     out_total_copy_len: u64,
@@ -2768,7 +3107,7 @@ struct PendingGpuDecodeMap {
     ts_readback_buffer: Option<wgpu::Buffer>,
     ts_map_rx: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
     submit_at: Instant,
-    completion_rx: mpsc::Receiver<()>,
+    completion_gate: Arc<AtomicBool>,
     map_rx: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
 }
 
@@ -2790,8 +3129,8 @@ struct InflightGpuDecodeSubmission<'a> {
     slot_handle: GpuDecodeSlot,
     pending: PendingGpuDecodeMap,
     map_requested_at: Option<Instant>,
-    completion_done: bool,
     map_done: Option<Result<(), PDeflateError>>,
+    map_timed_out: bool,
     wait_profile: GpuDecodeV2WaitProfile,
 }
 
@@ -2823,6 +3162,7 @@ struct GpuBatchScratchCaps {
 const GPU_SCRATCH_POOL_LIMIT: usize = 4;
 const GPU_SPARSE_PACK_POOL_LIMIT: usize = 16;
 const GPU_DECODE_LARGE_SLOT_INDEX_BASE: usize = 1 << 30;
+const GPU_DECODE_V2_BATCH_DESC_WORDS: usize = 12;
 // Command stream cap heuristic for GPU section encode.
 // If this underestimates a pathological section, kernel marks overflow and
 // caller falls back to CPU for correctness.
@@ -2955,8 +3295,66 @@ fn gpu_decode_v2_wait_probe_enabled() -> bool {
     })
 }
 
+fn gpu_decode_v2_true_batch_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag_enabled("COZIP_PDEFLATE_GPU_DECODE_V2_TRUE_BATCH"))
+}
+
+fn gpu_decode_v2_true_batch_jobs(default_jobs: usize) -> usize {
+    std::env::var("COZIP_PDEFLATE_GPU_DECODE_V2_TRUE_BATCH_JOBS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default_jobs.max(1))
+}
+
 fn gpu_decode_v2_wait_probe_should_log(seq: usize) -> bool {
     seq < 8 || seq % 64 == 0
+}
+
+fn gpu_decode_v2_spin_polls_before_wait() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("COZIP_PDEFLATE_GPU_DECODE_V2_SPIN_POLLS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(16)
+    })
+}
+
+fn gpu_decode_v2_target_inflight(max_inflight: usize) -> usize {
+    if max_inflight <= 1 {
+        return 1;
+    }
+    if let Ok(v) = std::env::var("COZIP_PDEFLATE_GPU_DECODE_V2_TARGET_INFLIGHT") {
+        if let Ok(parsed) = v.trim().parse::<usize>() {
+            return parsed.clamp(1, max_inflight);
+        }
+    }
+    max_inflight
+}
+
+fn gpu_decode_v2_wait_high_watermark(max_inflight: usize, target_inflight: usize) -> usize {
+    if max_inflight <= 1 {
+        return 1;
+    }
+    if let Ok(v) = std::env::var("COZIP_PDEFLATE_GPU_DECODE_V2_WAIT_HIGH_WATERMARK") {
+        if let Ok(parsed) = v.trim().parse::<usize>() {
+            return parsed.clamp(1, max_inflight);
+        }
+    }
+    max_inflight.max(target_inflight).clamp(1, max_inflight)
+}
+
+fn gpu_decode_v2_map_timeout_ms() -> Option<f64> {
+    static VALUE: OnceLock<Option<f64>> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("COZIP_PDEFLATE_GPU_DECODE_V2_MAP_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|ms| *ms > 0.0)
+    })
 }
 
 fn sparse_inflight_submit_chunks() -> usize {
@@ -5456,6 +5854,89 @@ fn init_runtime() -> Result<GpuMatchRuntime, String> {
         module: &decode_v2_shader,
         entry_point: "main",
     });
+    let decode_v2_batch_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cozip-pdeflate-decode-v2-batch-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+    let decode_v2_batch_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("cozip-pdeflate-decode-v2-batch-shader"),
+        source: wgpu::ShaderSource::Wgsl(DECODE_V2_BATCH_SHADER.into()),
+    });
+    let decode_v2_batch_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("cozip-pdeflate-decode-v2-batch-pl"),
+            bind_group_layouts: &[&decode_v2_batch_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+    let decode_v2_batch_pipeline =
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("cozip-pdeflate-decode-v2-batch-pipeline"),
+            layout: Some(&decode_v2_batch_pipeline_layout),
+            module: &decode_v2_batch_shader,
+            entry_point: "main",
+        });
     let pack_sparse_stats_zero_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("cozip-pdeflate-pack-sparse-stats-zero"),
         size: 32,
@@ -5509,6 +5990,8 @@ fn init_runtime() -> Result<GpuMatchRuntime, String> {
         match_prepare_table_pipeline,
         decode_v2_bind_group_layout,
         decode_v2_pipeline,
+        decode_v2_batch_bind_group_layout,
+        decode_v2_batch_pipeline,
         max_storage_binding_size,
         scratch_pool: Mutex::new(Vec::new()),
         scratch_hot: Mutex::new(None),
@@ -8338,11 +8821,12 @@ fn upload_gpu_decode_job_to_slot(
     Ok(())
 }
 
-fn submit_gpu_decode_job_on_slot(
+fn encode_gpu_decode_job_on_slot(
     runtime: &GpuMatchRuntime,
     slot: &GpuDecodeSlotEntry,
     prepared: PreparedGpuDecodeJob<'_>,
     kernel_ts_probe: bool,
+    encoder: &mut wgpu::CommandEncoder,
 ) -> Result<PendingGpuDecodeMap, PDeflateError> {
     let out_data_copy_len = u64::try_from(align_up4(prepared.job.chunk_uncompressed_len))
         .map_err(|_| PDeflateError::NumericOverflow)?
@@ -8354,11 +8838,6 @@ fn submit_gpu_decode_job_on_slot(
     let out_total_copy_len = out_data_copy_len
         .checked_add(err_copy_len)
         .ok_or(PDeflateError::NumericOverflow)?;
-    let mut encoder = runtime
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("cozip-pdeflate-decode-v2-encoder"),
-        });
     let mut ts_readback_buffer = None;
     let mut ts_query_set = None;
     let mut ts_resolve_buffer = None;
@@ -8421,21 +8900,13 @@ fn submit_gpu_decode_job_on_slot(
         out_data_copy_len,
         err_copy_len,
     );
-    let submit_seq = next_gpu_submit_seq();
-    let t_submit = Instant::now();
-    let _submission = runtime.queue.submit(Some(encoder.finish()));
-    let submit_ms = elapsed_ms(t_submit);
-    let (done_tx, done_rx) = mpsc::channel();
-    runtime.queue.on_submitted_work_done(move || {
-        let _ = done_tx.send(());
-    });
     Ok(PendingGpuDecodeMap {
         out_data_copy_len,
         out_total_copy_len,
         out_len: prepared.job.chunk_uncompressed_len,
         error_words,
-        submit_seq,
-        submit_ms,
+        submit_seq: next_gpu_submit_seq(),
+        submit_ms: 0.0,
         kernel_timestamp_ms: if kernel_ts_probe {
             None
         } else {
@@ -8444,7 +8915,7 @@ fn submit_gpu_decode_job_on_slot(
         ts_readback_buffer,
         ts_map_rx: None,
         submit_at: Instant::now(),
-        completion_rx: done_rx,
+        completion_gate: Arc::new(AtomicBool::new(false)),
         map_rx: None,
     })
 }
@@ -8506,6 +8977,661 @@ fn collect_gpu_decode_job_from_slot(
     result.map(|decoded_chunk| (decoded_chunk, elapsed_ms(t_collect)))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn decode_chunks_gpu_v2_true_batch(
+    runtime: &GpuMatchRuntime,
+    prepared_jobs: &[PreparedGpuDecodeJob<'_>],
+    default_batch_jobs: usize,
+    wait_probe_enabled: bool,
+    kernel_ts_probe: bool,
+    target_inflight: usize,
+    wait_high_watermark: usize,
+    spin_polls_before_wait: usize,
+    map_timeout_ms: Option<f64>,
+) -> Result<Vec<GpuDecodeResult>, PDeflateError> {
+    let mut out = Vec::with_capacity(prepared_jobs.len());
+    let batch_jobs = gpu_decode_v2_true_batch_jobs(default_batch_jobs)
+        .max(1)
+        .min(prepared_jobs.len().max(1));
+
+    let mut wait_probe_submit_ms = 0.0_f64;
+    let mut wait_probe_submit_done_wait_ms = 0.0_f64;
+    let mut wait_probe_map_callback_wait_ms = 0.0_f64;
+    let mut wait_probe_map_copy_ms = 0.0_f64;
+    let mut wait_probe_kernel_timestamp_ms = 0.0_f64;
+    let mut wait_probe_kernel_timestamp_samples = 0usize;
+    let mut wait_probe_queue_stall_est_ms = 0.0_f64;
+    let mut wait_probe_ready_any_hits = 0usize;
+    let wait_probe_wait_loops = 0usize;
+    let mut wait_probe_inflight_batches_sum = 0usize;
+    let mut wait_probe_inflight_batches_max = 0usize;
+    let mut wait_probe_inflight_samples = 0usize;
+    let mut wait_probe_completed_jobs = 0usize;
+
+    let fallback_capacity_jobs = 0usize;
+    let mut fallback_submit_error_jobs = 0usize;
+    let mut fallback_map_timeout_jobs = 0usize;
+    let mut fallback_map_error_jobs = 0usize;
+    let mut fallback_collect_error_jobs = 0usize;
+    let mut fallback_kernel_error_jobs = 0usize;
+
+    for round in prepared_jobs.chunks(batch_jobs) {
+        let mut desc_words = Vec::<u32>::with_capacity(
+            1usize.saturating_add(round.len().saturating_mul(GPU_DECODE_V2_BATCH_DESC_WORDS)),
+        );
+        desc_words.push(u32::try_from(round.len()).map_err(|_| PDeflateError::NumericOverflow)?);
+        let mut section_meta_words =
+            Vec::<u32>::with_capacity(round.len().saturating_mul(GPU_DECODE_SECTION_META_WORDS));
+        let mut cmd_bytes_all = Vec::<u8>::new();
+        let mut table_bytes_all = Vec::<u8>::new();
+        let mut host_jobs = Vec::<GpuDecodeBatchHostJob<'_>>::with_capacity(round.len());
+        let mut out_total_bytes = 0usize;
+        let mut error_total_words = 0usize;
+        let mut max_sections = 0u32;
+        let mut round_failed = false;
+
+        for prepared in round {
+            let table_bytes =
+                match build_gpu_decode_table_buffer_bytes(prepared.job.payload, prepared.layout) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        round_failed = true;
+                        break;
+                    }
+                };
+            let cmd_bytes = match prepared.job.payload.get(prepared.layout.cmd_start..) {
+                Some(v) => v,
+                None => {
+                    round_failed = true;
+                    break;
+                }
+            };
+            let section_meta_base = section_meta_words.len();
+            let mut section_meta_ok = true;
+            for section in &prepared.job.section_meta {
+                let cmd_end = match section.cmd_offset.checked_add(section.cmd_len) {
+                    Some(v) => v,
+                    None => {
+                        section_meta_ok = false;
+                        break;
+                    }
+                };
+                let out_end = match section.out_offset.checked_add(section.out_len) {
+                    Some(v) => v,
+                    None => {
+                        section_meta_ok = false;
+                        break;
+                    }
+                };
+                if cmd_end > cmd_bytes.len() || out_end > prepared.job.chunk_uncompressed_len {
+                    section_meta_ok = false;
+                    break;
+                }
+                let cmd_off_u32 = match u32::try_from(section.cmd_offset) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        section_meta_ok = false;
+                        break;
+                    }
+                };
+                let cmd_len_u32 = match u32::try_from(section.cmd_len) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        section_meta_ok = false;
+                        break;
+                    }
+                };
+                let out_off_u32 = match u32::try_from(section.out_offset) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        section_meta_ok = false;
+                        break;
+                    }
+                };
+                let out_len_u32 = match u32::try_from(section.out_len) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        section_meta_ok = false;
+                        break;
+                    }
+                };
+                section_meta_words.push(cmd_off_u32);
+                section_meta_words.push(cmd_len_u32);
+                section_meta_words.push(out_off_u32);
+                section_meta_words.push(out_len_u32);
+            }
+            if !section_meta_ok {
+                round_failed = true;
+                break;
+            }
+
+            let table_count_u32 = match u32::try_from(prepared.layout.table_count) {
+                Ok(v) => v,
+                Err(_) => {
+                    round_failed = true;
+                    break;
+                }
+            };
+            let table_repeat_stride_u32 = match u32::try_from(GPU_DECODE_TABLE_REPEAT_STRIDE) {
+                Ok(v) => v,
+                Err(_) => {
+                    round_failed = true;
+                    break;
+                }
+            };
+            let section_count_u32 = match u32::try_from(prepared.job.section_meta.len()) {
+                Ok(v) => v,
+                Err(_) => {
+                    round_failed = true;
+                    break;
+                }
+            };
+            let huff_lut_off_u32 = match table_count_u32.checked_mul(table_repeat_stride_u32) {
+                Some(v) => v,
+                None => {
+                    round_failed = true;
+                    break;
+                }
+            };
+            let huff_lut_len_u32 = match u32::try_from(
+                prepared
+                    .layout
+                    .huff_lut_end
+                    .saturating_sub(prepared.layout.huff_lut_start),
+            ) {
+                Ok(v) => v,
+                Err(_) => {
+                    round_failed = true;
+                    break;
+                }
+            };
+            let section_meta_base_u32 = match u32::try_from(section_meta_base) {
+                Ok(v) => v,
+                Err(_) => {
+                    round_failed = true;
+                    break;
+                }
+            };
+            let cmd_base_u32 = match u32::try_from(cmd_bytes_all.len()) {
+                Ok(v) => v,
+                Err(_) => {
+                    round_failed = true;
+                    break;
+                }
+            };
+            let cmd_len_u32 = match u32::try_from(cmd_bytes.len()) {
+                Ok(v) => v,
+                Err(_) => {
+                    round_failed = true;
+                    break;
+                }
+            };
+            let table_base_u32 = match u32::try_from(table_bytes_all.len()) {
+                Ok(v) => v,
+                Err(_) => {
+                    round_failed = true;
+                    break;
+                }
+            };
+            let out_base = align_up4(out_total_bytes);
+            let out_base_u32 = match u32::try_from(out_base) {
+                Ok(v) => v,
+                Err(_) => {
+                    round_failed = true;
+                    break;
+                }
+            };
+            let out_len = prepared.job.chunk_uncompressed_len;
+            let out_len_u32 = match u32::try_from(out_len) {
+                Ok(v) => v,
+                Err(_) => {
+                    round_failed = true;
+                    break;
+                }
+            };
+            let error_words = prepared.job.section_meta.len().max(1);
+            let error_base = error_total_words;
+            let error_base_u32 = match u32::try_from(error_base) {
+                Ok(v) => v,
+                Err(_) => {
+                    round_failed = true;
+                    break;
+                }
+            };
+            out_total_bytes = match out_base.checked_add(out_len) {
+                Some(v) => v,
+                None => {
+                    round_failed = true;
+                    break;
+                }
+            };
+            error_total_words = match error_total_words.checked_add(error_words) {
+                Some(v) => v,
+                None => {
+                    round_failed = true;
+                    break;
+                }
+            };
+            max_sections = max_sections.max(section_count_u32.max(1));
+
+            desc_words.push(section_count_u32);
+            desc_words.push(table_count_u32);
+            desc_words.push(table_repeat_stride_u32);
+            desc_words.push(huff_lut_off_u32);
+            desc_words.push(huff_lut_len_u32);
+            desc_words.push(section_meta_base_u32);
+            desc_words.push(cmd_base_u32);
+            desc_words.push(cmd_len_u32);
+            desc_words.push(table_base_u32);
+            desc_words.push(out_base_u32);
+            desc_words.push(out_len_u32);
+            desc_words.push(error_base_u32);
+
+            cmd_bytes_all.extend_from_slice(cmd_bytes);
+            table_bytes_all.extend_from_slice(&table_bytes);
+            host_jobs.push(GpuDecodeBatchHostJob {
+                prepared: *prepared,
+                out_base,
+                out_len,
+                error_base,
+                error_words,
+            });
+        }
+
+        if round_failed || host_jobs.is_empty() {
+            for prepared in round {
+                out.push(GpuDecodeResult {
+                    chunk_index: prepared.job.chunk_index,
+                    slot: None,
+                    disposition: GpuDecodeDisposition::CpuFallback,
+                    decoded_chunk: None,
+                });
+            }
+            fallback_submit_error_jobs = fallback_submit_error_jobs.saturating_add(round.len());
+            continue;
+        }
+
+        let desc_size = u64::try_from(desc_words.len())
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4)
+            .max(4);
+        let section_meta_size = u64::try_from(section_meta_words.len())
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4)
+            .max(4);
+        let cmd_words = pack_bytes_to_words(&cmd_bytes_all);
+        let table_words = pack_bytes_to_words(&table_bytes_all);
+        let cmd_size = u64::try_from(cmd_words.len())
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4)
+            .max(4);
+        let table_size = u64::try_from(table_words.len())
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4)
+            .max(4);
+        let out_copy_bytes = u64::try_from(align_up4(out_total_bytes))
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .max(4);
+        let err_copy_bytes = u64::try_from(error_total_words)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4)
+            .max(4);
+        let err_zero_words = vec![0u32; error_total_words.max(1)];
+
+        let desc_buffer = storage_upload_buffer(
+            &runtime.device,
+            "cozip-pdeflate-decode-v2-batch-desc",
+            desc_size,
+        );
+        let section_meta_buffer = storage_upload_buffer(
+            &runtime.device,
+            "cozip-pdeflate-decode-v2-batch-section-meta",
+            section_meta_size,
+        );
+        let cmd_buffer = storage_upload_buffer(
+            &runtime.device,
+            "cozip-pdeflate-decode-v2-batch-cmd",
+            cmd_size,
+        );
+        let table_buffer = storage_upload_buffer(
+            &runtime.device,
+            "cozip-pdeflate-decode-v2-batch-table",
+            table_size,
+        );
+        let out_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-decode-v2-batch-out"),
+            size: out_copy_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let error_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-decode-v2-batch-error"),
+            size: err_copy_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let out_readback = runtime.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-decode-v2-batch-out-readback"),
+            size: out_copy_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let err_readback = runtime.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-decode-v2-batch-err-readback"),
+            size: err_copy_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = runtime
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("cozip-pdeflate-decode-v2-batch-bg"),
+                layout: &runtime.decode_v2_batch_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: desc_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: section_meta_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: cmd_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: table_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: out_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: error_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+        runtime
+            .queue
+            .write_buffer(&desc_buffer, 0, bytemuck::cast_slice(&desc_words));
+        runtime.queue.write_buffer(
+            &section_meta_buffer,
+            0,
+            bytemuck::cast_slice(&section_meta_words),
+        );
+        runtime
+            .queue
+            .write_buffer(&cmd_buffer, 0, bytemuck::cast_slice(&cmd_words));
+        runtime
+            .queue
+            .write_buffer(&table_buffer, 0, bytemuck::cast_slice(&table_words));
+        runtime
+            .queue
+            .write_buffer(&error_buffer, 0, bytemuck::cast_slice(&err_zero_words));
+
+        let mut ts_readback_buffer = None;
+        let mut ts_map_rx = None;
+        let mut ts_query_set = None;
+        let mut ts_resolve_buffer = None;
+        if kernel_ts_probe {
+            ts_query_set = Some(runtime.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("cozip-pdeflate-decode-v2-batch-ts-query"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2,
+            }));
+            ts_resolve_buffer = Some(runtime.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cozip-pdeflate-decode-v2-batch-ts-resolve"),
+                size: 16,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }));
+            ts_readback_buffer = Some(runtime.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cozip-pdeflate-decode-v2-batch-ts-readback"),
+                size: 16,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }));
+        }
+
+        let dispatch_x = max_sections.max(1);
+        let dispatch_y =
+            u32::try_from(host_jobs.len()).map_err(|_| PDeflateError::NumericOverflow)?;
+        let mut encoder = runtime
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("cozip-pdeflate-decode-v2-batch-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cozip-pdeflate-decode-v2-batch-pass"),
+                timestamp_writes: ts_query_set.as_ref().map(|query_set| {
+                    wgpu::ComputePassTimestampWrites {
+                        query_set,
+                        beginning_of_pass_write_index: Some(0),
+                        end_of_pass_write_index: Some(1),
+                    }
+                }),
+            });
+            pass.set_pipeline(&runtime.decode_v2_batch_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+        }
+        if let (Some(query_set), Some(resolve_buffer), Some(readback_buffer)) = (
+            ts_query_set.as_ref(),
+            ts_resolve_buffer.as_ref(),
+            ts_readback_buffer.as_ref(),
+        ) {
+            encoder.resolve_query_set(query_set, 0..2, resolve_buffer, 0);
+            encoder.copy_buffer_to_buffer(resolve_buffer, 0, readback_buffer, 0, 16);
+        }
+        encoder.copy_buffer_to_buffer(&out_buffer, 0, &out_readback, 0, out_copy_bytes);
+        encoder.copy_buffer_to_buffer(&error_buffer, 0, &err_readback, 0, err_copy_bytes);
+
+        let t_submit = Instant::now();
+        let submission = runtime.queue.submit(Some(encoder.finish()));
+        let submit_ms = elapsed_ms(t_submit);
+        if wait_probe_enabled {
+            wait_probe_submit_ms += submit_ms;
+        }
+        let submit_at = Instant::now();
+        let completion_gate = Arc::new(AtomicBool::new(false));
+        let completion_gate_cb = Arc::clone(&completion_gate);
+        runtime.queue.on_submitted_work_done(move || {
+            completion_gate_cb.store(true, Ordering::Release);
+        });
+
+        let out_slice = out_readback.slice(..out_copy_bytes);
+        let err_slice = err_readback.slice(..err_copy_bytes);
+        let (out_tx, out_rx) = mpsc::channel();
+        let (err_tx, err_rx) = mpsc::channel();
+        out_slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = out_tx.send(res);
+        });
+        err_slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = err_tx.send(res);
+        });
+        if let Some(ts_buffer) = ts_readback_buffer.as_ref() {
+            let (ts_tx, rx) = mpsc::channel();
+            ts_buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |res| {
+                    let _ = ts_tx.send(res);
+                });
+            ts_map_rx = Some(rx);
+        }
+
+        runtime.device.poll(wgpu::Maintain::wait_for(submission));
+        let submit_done_wait_ms = elapsed_ms(submit_at);
+        let t_map_wait = Instant::now();
+        let out_map_ok = out_rx.recv().ok().and_then(Result::ok).is_some();
+        let err_map_ok = err_rx.recv().ok().and_then(Result::ok).is_some();
+        let mut kernel_timestamp_ms = f64::NAN;
+        if let Some(ts_rx) = ts_map_rx.take() {
+            if ts_rx.recv().ok().and_then(Result::ok).is_some() {
+                if let Some(ts_buffer) = ts_readback_buffer.take() {
+                    let mapped = ts_buffer.slice(..).get_mapped_range();
+                    let ts_words: &[u64] = bytemuck::cast_slice(&mapped);
+                    if ts_words.len() >= 2 && ts_words[1] >= ts_words[0] {
+                        let period_ms = (runtime.queue.get_timestamp_period() as f64) / 1_000_000.0;
+                        kernel_timestamp_ms =
+                            (ts_words[1].saturating_sub(ts_words[0]) as f64) * period_ms;
+                    }
+                    drop(mapped);
+                    ts_buffer.unmap();
+                }
+            }
+        }
+        let map_callback_wait_ms = elapsed_ms(t_map_wait);
+
+        if !out_map_ok || !err_map_ok {
+            for prepared in round {
+                out.push(GpuDecodeResult {
+                    chunk_index: prepared.job.chunk_index,
+                    slot: None,
+                    disposition: GpuDecodeDisposition::CpuFallback,
+                    decoded_chunk: None,
+                });
+            }
+            if map_timeout_ms.is_some() {
+                fallback_map_timeout_jobs = fallback_map_timeout_jobs.saturating_add(round.len());
+            } else {
+                fallback_map_error_jobs = fallback_map_error_jobs.saturating_add(round.len());
+            }
+            continue;
+        }
+
+        let t_map_copy = Instant::now();
+        let mapped_out = out_slice.get_mapped_range();
+        let mapped_err = err_slice.get_mapped_range();
+        let err_words: &[u32] = bytemuck::cast_slice(&mapped_err);
+        for host in &host_jobs {
+            let sec_count = host.prepared.job.section_meta.len();
+            let err_end = host
+                .error_base
+                .saturating_add(host.error_words)
+                .min(err_words.len());
+            let has_error = if sec_count > 0 && host.error_base < err_end {
+                err_words[host.error_base..err_end]
+                    .iter()
+                    .take(sec_count)
+                    .copied()
+                    .any(|v| v != 0)
+            } else {
+                false
+            };
+            if has_error {
+                fallback_kernel_error_jobs = fallback_kernel_error_jobs.saturating_add(1);
+                out.push(GpuDecodeResult {
+                    chunk_index: host.prepared.job.chunk_index,
+                    slot: None,
+                    disposition: GpuDecodeDisposition::CpuFallback,
+                    decoded_chunk: None,
+                });
+                continue;
+            }
+            let end = host.out_base.saturating_add(host.out_len);
+            if end > mapped_out.len() || host.out_base > end {
+                fallback_collect_error_jobs = fallback_collect_error_jobs.saturating_add(1);
+                out.push(GpuDecodeResult {
+                    chunk_index: host.prepared.job.chunk_index,
+                    slot: None,
+                    disposition: GpuDecodeDisposition::CpuFallback,
+                    decoded_chunk: None,
+                });
+                continue;
+            }
+            let mut decoded = vec![0u8; host.out_len];
+            if !decoded.is_empty() {
+                decoded.copy_from_slice(&mapped_out[host.out_base..end]);
+            }
+            out.push(GpuDecodeResult {
+                chunk_index: host.prepared.job.chunk_index,
+                slot: None,
+                disposition: GpuDecodeDisposition::SubmittedGpu,
+                decoded_chunk: Some(decoded),
+            });
+        }
+        drop(mapped_err);
+        drop(mapped_out);
+        err_readback.unmap();
+        out_readback.unmap();
+        let map_copy_ms = elapsed_ms(t_map_copy);
+
+        if wait_probe_enabled {
+            wait_probe_submit_done_wait_ms += submit_done_wait_ms;
+            wait_probe_map_callback_wait_ms += map_callback_wait_ms;
+            wait_probe_map_copy_ms += map_copy_ms;
+            if kernel_timestamp_ms.is_finite() {
+                wait_probe_kernel_timestamp_ms += kernel_timestamp_ms;
+                wait_probe_kernel_timestamp_samples =
+                    wait_probe_kernel_timestamp_samples.saturating_add(1);
+                wait_probe_queue_stall_est_ms +=
+                    (submit_done_wait_ms - kernel_timestamp_ms).max(0.0);
+            } else {
+                wait_probe_queue_stall_est_ms += submit_done_wait_ms.max(0.0);
+            }
+            if completion_gate.load(Ordering::Acquire) {
+                wait_probe_ready_any_hits = wait_probe_ready_any_hits.saturating_add(1);
+            }
+            wait_probe_inflight_samples = wait_probe_inflight_samples.saturating_add(1);
+            wait_probe_inflight_batches_sum =
+                wait_probe_inflight_batches_sum.saturating_add(host_jobs.len());
+            wait_probe_inflight_batches_max = wait_probe_inflight_batches_max.max(host_jobs.len());
+            wait_probe_completed_jobs = wait_probe_completed_jobs.saturating_add(host_jobs.len());
+        }
+    }
+
+    if wait_probe_enabled {
+        let inflight_avg = if wait_probe_inflight_samples > 0 {
+            (wait_probe_inflight_batches_sum as f64) / (wait_probe_inflight_samples as f64)
+        } else {
+            0.0
+        };
+        let kernel_ts_status = if wait_probe_kernel_timestamp_samples > 0 {
+            "ok"
+        } else {
+            "disabled"
+        };
+        eprintln!(
+            "[cozip_pdeflate][timing][decode-v2-ready-any] jobs={} submit_ms={:.3} submit_done_wait_ms={:.3} map_callback_wait_ms={:.3} map_copy_ms={:.3} kernel_timestamp_ms={:.3} queue_stall_est_ms={:.3} ready_any_hits={} wait_loops={} inflight_batches_avg={:.2} inflight_batches_max={} inflight_samples={} kernel_ts_status={} ctrl_target_inflight={} ctrl_wait_high={} ctrl_spin_polls={}",
+            wait_probe_completed_jobs,
+            wait_probe_submit_ms,
+            wait_probe_submit_done_wait_ms,
+            wait_probe_map_callback_wait_ms,
+            wait_probe_map_copy_ms,
+            wait_probe_kernel_timestamp_ms,
+            wait_probe_queue_stall_est_ms,
+            wait_probe_ready_any_hits,
+            wait_probe_wait_loops,
+            inflight_avg,
+            wait_probe_inflight_batches_max,
+            wait_probe_inflight_samples,
+            kernel_ts_status,
+            target_inflight,
+            wait_high_watermark,
+            spin_polls_before_wait
+        );
+        eprintln!(
+            "[cozip_pdeflate][timing][decode-v2-fallback-reasons] jobs={} capacity={} submit_err={} map_timeout={} map_err={} collect_err={} kernel_fallback={}",
+            wait_probe_completed_jobs,
+            fallback_capacity_jobs,
+            fallback_submit_error_jobs,
+            fallback_map_timeout_jobs,
+            fallback_map_error_jobs,
+            fallback_collect_error_jobs,
+            fallback_kernel_error_jobs
+        );
+    }
+
+    Ok(out)
+}
+
 fn gpu_decode_section_boundaries_word_aligned(section_meta: &[GpuDecodeSectionMeta]) -> bool {
     // decode-v2 section-parallel kernel writes bytes via u32 RMW; internal section boundaries
     // must be word-aligned to avoid cross-section word races.
@@ -8562,6 +9688,39 @@ pub(crate) fn decode_chunks_gpu_v2(
         return Ok(out);
     }
 
+    let micro_submit = options.gpu_submit_chunks.max(1);
+    let max_inflight = options.gpu_slot_count.max(1);
+    let target_inflight = gpu_decode_v2_target_inflight(max_inflight);
+    let wait_high_watermark = gpu_decode_v2_wait_high_watermark(max_inflight, target_inflight);
+    let spin_polls_before_wait = gpu_decode_v2_spin_polls_before_wait();
+    let map_timeout_ms = gpu_decode_v2_map_timeout_ms();
+    let wait_probe_enabled = gpu_decode_v2_wait_probe_enabled();
+    let kernel_ts_probe = wait_probe_enabled && runtime.supports_timestamp_query;
+    if wait_probe_enabled && !runtime.supports_timestamp_query {
+        let _ = GPU_DECODE_V2_KERNEL_TS_UNSUPPORTED_LOGGED.get_or_init(|| {
+            eprintln!(
+                "[cozip_pdeflate][timing][decode-v2-wait-breakdown] status=disabled reason=timestamp_query_not_supported"
+            );
+        });
+    }
+
+    if gpu_decode_v2_true_batch_enabled() {
+        let mut decoded = decode_chunks_gpu_v2_true_batch(
+            runtime,
+            &prepared_jobs,
+            micro_submit,
+            wait_probe_enabled,
+            kernel_ts_probe,
+            target_inflight,
+            wait_high_watermark,
+            spin_polls_before_wait,
+            map_timeout_ms,
+        )?;
+        out.append(&mut decoded);
+        out.sort_by_key(|r| r.chunk_index);
+        return Ok(out);
+    }
+
     let (normal_target_count, large_target_count) = gpu_decode_slot_split(options.gpu_slot_count);
     let normal_base = gpu_decode_normal_caps(options)?;
     let mut large_base = gpu_decode_large_caps(normal_base);
@@ -8610,19 +9769,9 @@ pub(crate) fn decode_chunks_gpu_v2(
         large_base,
     )?;
 
-    let micro_submit = options.gpu_submit_chunks.max(1);
-    let max_inflight = options.gpu_slot_count.max(1);
-    let wait_probe_enabled = gpu_decode_v2_wait_probe_enabled();
-    let kernel_ts_probe = wait_probe_enabled && runtime.supports_timestamp_query;
-    if wait_probe_enabled && !runtime.supports_timestamp_query {
-        let _ = GPU_DECODE_V2_KERNEL_TS_UNSUPPORTED_LOGGED.get_or_init(|| {
-            eprintln!(
-                "[cozip_pdeflate][timing][decode-v2-wait-breakdown] status=disabled reason=timestamp_query_not_supported"
-            );
-        });
-    }
     let mut next_submit_idx = 0usize;
     let mut inflight = Vec::<InflightGpuDecodeSubmission<'_>>::new();
+    let mut completed_queue = VecDeque::<GpuDecodeResult>::new();
     let mut wait_probe_submit_ms = 0.0_f64;
     let mut wait_probe_submit_done_wait_ms = 0.0_f64;
     let mut wait_probe_map_callback_wait_ms = 0.0_f64;
@@ -8636,129 +9785,34 @@ pub(crate) fn decode_chunks_gpu_v2(
     let mut wait_probe_inflight_batches_max = 0usize;
     let mut wait_probe_inflight_samples = 0usize;
     let mut wait_probe_completed_jobs = 0usize;
+    let mut fallback_capacity_jobs = 0usize;
+    let mut fallback_submit_error_jobs = 0usize;
+    let mut fallback_map_timeout_jobs = 0usize;
+    let mut fallback_map_error_jobs = 0usize;
+    let mut fallback_collect_error_jobs = 0usize;
+    let mut fallback_kernel_error_jobs = 0usize;
+    let mut no_progress_loops = 0usize;
 
     while next_submit_idx < prepared_jobs.len() || !inflight.is_empty() {
         recycle_gpu_decode_ready_slots(&mut pool.normal);
         recycle_gpu_decode_ready_slots(&mut pool.large);
 
-        let mut submitted_in_round = 0usize;
-        while next_submit_idx < prepared_jobs.len()
-            && submitted_in_round < micro_submit
-            && inflight.len() < max_inflight
-        {
-            let prepared = prepared_jobs[next_submit_idx];
-            let acquired = try_acquire_gpu_decode_slot_for_job(&mut pool, prepared);
-            let Some((class, slot_idx, slot_handle)) = acquired else {
-                let fit_any =
-                    pool.normal.caps.fits(prepared.req) || pool.large.caps.fits(prepared.req);
-                if !fit_any {
-                    out.push(GpuDecodeResult {
-                        chunk_index: prepared.job.chunk_index,
-                        slot: None,
-                        disposition: GpuDecodeDisposition::CpuFallback,
-                        decoded_chunk: None,
-                    });
-                    next_submit_idx = next_submit_idx.saturating_add(1);
-                    submitted_in_round = submitted_in_round.saturating_add(1);
-                    continue;
-                }
-                break;
-            };
-
-            let submit_result = match class {
-                GpuDecodeSlotClass::Normal => {
-                    let slot = &pool.normal.slots[slot_idx];
-                    upload_gpu_decode_job_to_slot(runtime, slot, prepared).and_then(|_| {
-                        submit_gpu_decode_job_on_slot(runtime, slot, prepared, kernel_ts_probe)
-                    })
-                }
-                GpuDecodeSlotClass::Large => {
-                    let slot = &pool.large.slots[slot_idx];
-                    upload_gpu_decode_job_to_slot(runtime, slot, prepared).and_then(|_| {
-                        submit_gpu_decode_job_on_slot(runtime, slot, prepared, kernel_ts_probe)
-                    })
-                }
-            };
-            match submit_result {
-                Ok(pending) => {
-                    if wait_probe_enabled {
-                        wait_probe_submit_ms += pending.submit_ms;
-                    }
-                    inflight.push(InflightGpuDecodeSubmission {
-                        prepared,
-                        class,
-                        slot_idx,
-                        slot_handle,
-                        pending,
-                        map_requested_at: None,
-                        completion_done: false,
-                        map_done: None,
-                        wait_profile: GpuDecodeV2WaitProfile::default(),
-                    });
-                }
-                Err(_) => {
-                    match class {
-                        GpuDecodeSlotClass::Normal => {
-                            mark_gpu_decode_slot_free(&mut pool.normal, slot_idx)
-                        }
-                        GpuDecodeSlotClass::Large => {
-                            mark_gpu_decode_slot_free(&mut pool.large, slot_idx)
-                        }
-                    }
-                    out.push(GpuDecodeResult {
-                        chunk_index: prepared.job.chunk_index,
-                        slot: None,
-                        disposition: GpuDecodeDisposition::CpuFallback,
-                        decoded_chunk: None,
-                    });
-                }
-            }
-            next_submit_idx = next_submit_idx.saturating_add(1);
-            submitted_in_round = submitted_in_round.saturating_add(1);
-        }
-
-        if inflight.is_empty() {
-            continue;
-        }
-        if wait_probe_enabled {
-            wait_probe_inflight_samples = wait_probe_inflight_samples.saturating_add(1);
-            wait_probe_inflight_batches_sum =
-                wait_probe_inflight_batches_sum.saturating_add(inflight.len());
-            wait_probe_inflight_batches_max = wait_probe_inflight_batches_max.max(inflight.len());
-        }
-
+        // Stage 1: Complete (recover credit first)
         runtime.device.poll(wgpu::Maintain::Poll);
         let mut completed_in_round = 0usize;
         let mut i = 0usize;
         while i < inflight.len() {
             {
                 let pending = &mut inflight[i];
-                if !pending.completion_done {
-                    match pending.pending.completion_rx.try_recv() {
-                        Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
-                            pending.completion_done = true;
-                            pending.wait_profile.submit_seq = pending.pending.submit_seq;
-                            pending.wait_profile.submit_ms = pending.pending.submit_ms;
-                            pending.wait_profile.submit_done_wait_ms =
-                                elapsed_ms(pending.pending.submit_at);
-                        }
-                        Err(mpsc::TryRecvError::Empty) => {}
-                    }
-                }
 
-                if pending.completion_done
-                    && pending.pending.kernel_timestamp_ms.is_none()
-                    && pending.pending.ts_map_rx.is_none()
+                // Batch-level completion gate (single callback per submit batch).
+                if pending.wait_profile.submit_done_wait_ms == 0.0
+                    && pending.pending.completion_gate.load(Ordering::Acquire)
                 {
-                    if let Some(ts_buffer) = pending.pending.ts_readback_buffer.as_ref() {
-                        let (ts_tx, ts_rx) = mpsc::channel();
-                        ts_buffer
-                            .slice(..)
-                            .map_async(wgpu::MapMode::Read, move |res| {
-                                let _ = ts_tx.send(res);
-                            });
-                        pending.pending.ts_map_rx = Some(ts_rx);
-                    }
+                    pending.wait_profile.submit_seq = pending.pending.submit_seq;
+                    pending.wait_profile.submit_ms = pending.pending.submit_ms;
+                    pending.wait_profile.submit_done_wait_ms =
+                        elapsed_ms(pending.pending.submit_at);
                 }
 
                 if pending.pending.kernel_timestamp_ms.is_none() {
@@ -8796,32 +9850,20 @@ pub(crate) fn decode_chunks_gpu_v2(
                     }
                 }
 
-                if pending.completion_done && pending.pending.map_rx.is_none() {
-                    let out_slice = match pending.class {
-                        GpuDecodeSlotClass::Normal => pool.normal.slots[pending.slot_idx]
-                            .buffers
-                            .out_readback_buffer
-                            .slice(..pending.pending.out_total_copy_len),
-                        GpuDecodeSlotClass::Large => pool.large.slots[pending.slot_idx]
-                            .buffers
-                            .out_readback_buffer
-                            .slice(..pending.pending.out_total_copy_len),
-                    };
-                    let (map_tx, map_rx) = mpsc::channel();
-                    out_slice.map_async(wgpu::MapMode::Read, move |res| {
-                        let _ = map_tx.send(res);
-                    });
-                    pending.map_requested_at = Some(Instant::now());
-                    pending.pending.map_rx = Some(map_rx);
-                }
-
                 if pending.map_done.is_none() {
                     if let Some(map_rx) = pending.pending.map_rx.as_ref() {
                         match map_rx.try_recv() {
                             Ok(res) => {
                                 if let Some(t_map_wait) = pending.map_requested_at.take() {
-                                    pending.wait_profile.map_callback_wait_ms =
-                                        elapsed_ms(t_map_wait);
+                                    let wait_ms = elapsed_ms(t_map_wait);
+                                    pending.wait_profile.map_callback_wait_ms = wait_ms;
+                                    if pending.wait_profile.submit_done_wait_ms == 0.0 {
+                                        pending.wait_profile.submit_seq =
+                                            pending.pending.submit_seq;
+                                        pending.wait_profile.submit_ms = pending.pending.submit_ms;
+                                        pending.wait_profile.submit_done_wait_ms =
+                                            elapsed_ms(pending.pending.submit_at);
+                                    }
                                 }
                                 pending.map_done = Some(res.map_err(|e| {
                                     PDeflateError::Gpu(format!("gpu decode out map failed: {e}"))
@@ -8830,13 +9872,43 @@ pub(crate) fn decode_chunks_gpu_v2(
                             Err(mpsc::TryRecvError::Empty) => {}
                             Err(mpsc::TryRecvError::Disconnected) => {
                                 if let Some(t_map_wait) = pending.map_requested_at.take() {
-                                    pending.wait_profile.map_callback_wait_ms =
-                                        elapsed_ms(t_map_wait);
+                                    let wait_ms = elapsed_ms(t_map_wait);
+                                    pending.wait_profile.map_callback_wait_ms = wait_ms;
+                                    if pending.wait_profile.submit_done_wait_ms == 0.0 {
+                                        pending.wait_profile.submit_seq =
+                                            pending.pending.submit_seq;
+                                        pending.wait_profile.submit_ms = pending.pending.submit_ms;
+                                        pending.wait_profile.submit_done_wait_ms =
+                                            elapsed_ms(pending.pending.submit_at);
+                                    }
                                 }
                                 pending.map_done = Some(Err(PDeflateError::Gpu(
                                     "gpu decode out map channel closed".to_string(),
                                 )));
                             }
+                        }
+                    }
+                }
+
+                if pending.map_done.is_none() {
+                    if let (Some(timeout_ms), Some(t_map_wait)) =
+                        (map_timeout_ms, pending.map_requested_at)
+                    {
+                        if elapsed_ms(t_map_wait) >= timeout_ms {
+                            pending.wait_profile.map_callback_wait_ms = elapsed_ms(t_map_wait);
+                            if pending.wait_profile.submit_done_wait_ms == 0.0 {
+                                pending.wait_profile.submit_seq = pending.pending.submit_seq;
+                                pending.wait_profile.submit_ms = pending.pending.submit_ms;
+                                pending.wait_profile.submit_done_wait_ms =
+                                    elapsed_ms(pending.pending.submit_at);
+                            }
+                            pending.map_requested_at = None;
+                            pending.pending.map_rx = None;
+                            pending.map_timed_out = true;
+                            pending.map_done = Some(Err(PDeflateError::Gpu(format!(
+                                "gpu decode out map timed out after {:.3} ms",
+                                timeout_ms
+                            ))));
                         }
                     }
                 }
@@ -8867,6 +9939,10 @@ pub(crate) fn decode_chunks_gpu_v2(
                 match collected {
                     Ok((decoded_chunk, map_copy_ms)) => {
                         submission.wait_profile.map_copy_ms = map_copy_ms;
+                        if decoded_chunk.is_none() {
+                            fallback_kernel_error_jobs =
+                                fallback_kernel_error_jobs.saturating_add(1);
+                        }
                         GpuDecodeResult {
                             chunk_index: submission.prepared.job.chunk_index,
                             slot: Some(submission.slot_handle),
@@ -8878,14 +9954,22 @@ pub(crate) fn decode_chunks_gpu_v2(
                             decoded_chunk,
                         }
                     }
-                    Err(_) => GpuDecodeResult {
-                        chunk_index: submission.prepared.job.chunk_index,
-                        slot: None,
-                        disposition: GpuDecodeDisposition::CpuFallback,
-                        decoded_chunk: None,
-                    },
+                    Err(_) => {
+                        fallback_collect_error_jobs = fallback_collect_error_jobs.saturating_add(1);
+                        GpuDecodeResult {
+                            chunk_index: submission.prepared.job.chunk_index,
+                            slot: None,
+                            disposition: GpuDecodeDisposition::CpuFallback,
+                            decoded_chunk: None,
+                        }
+                    }
                 }
             } else {
+                if submission.map_timed_out {
+                    fallback_map_timeout_jobs = fallback_map_timeout_jobs.saturating_add(1);
+                } else {
+                    fallback_map_error_jobs = fallback_map_error_jobs.saturating_add(1);
+                }
                 GpuDecodeResult {
                     chunk_index: submission.prepared.job.chunk_index,
                     slot: None,
@@ -8948,17 +10032,182 @@ pub(crate) fn decode_chunks_gpu_v2(
                     mark_gpu_decode_slot_ready(&mut pool.large, submission.slot_idx)
                 }
             }
-            out.push(decode_result);
+            completed_queue.push_back(decode_result);
             completed_in_round = completed_in_round.saturating_add(1);
         }
 
-        if completed_in_round == 0 {
-            if wait_probe_enabled {
-                wait_probe_wait_loops = wait_probe_wait_loops.saturating_add(1);
+        if wait_probe_enabled {
+            wait_probe_inflight_samples = wait_probe_inflight_samples.saturating_add(1);
+            wait_probe_inflight_batches_sum =
+                wait_probe_inflight_batches_sum.saturating_add(inflight.len());
+            wait_probe_inflight_batches_max = wait_probe_inflight_batches_max.max(inflight.len());
+        }
+
+        // Stage 2: Submit (micro-submit; avoid oversized single-submit HOL stalls)
+        let mut submitted_in_round = 0usize;
+        let mut submit_stalled = false;
+        let submit_inflight_limit = if inflight.len() < target_inflight {
+            target_inflight
+        } else {
+            max_inflight
+        };
+        let submit_budget = micro_submit.max(submit_inflight_limit.saturating_sub(inflight.len()));
+        while next_submit_idx < prepared_jobs.len()
+            && submitted_in_round < submit_budget
+            && inflight.len() < submit_inflight_limit
+        {
+            let prepared = prepared_jobs[next_submit_idx];
+            let acquired = try_acquire_gpu_decode_slot_for_job(&mut pool, prepared);
+            let Some((class, slot_idx, slot_handle)) = acquired else {
+                let fit_any =
+                    pool.normal.caps.fits(prepared.req) || pool.large.caps.fits(prepared.req);
+                if !fit_any {
+                    completed_queue.push_back(GpuDecodeResult {
+                        chunk_index: prepared.job.chunk_index,
+                        slot: None,
+                        disposition: GpuDecodeDisposition::CpuFallback,
+                        decoded_chunk: None,
+                    });
+                    fallback_capacity_jobs = fallback_capacity_jobs.saturating_add(1);
+                    next_submit_idx = next_submit_idx.saturating_add(1);
+                    submitted_in_round = submitted_in_round.saturating_add(1);
+                    continue;
+                }
+                submit_stalled = true;
+                break;
+            };
+
+            let mut encoder =
+                runtime
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("cozip-pdeflate-decode-v2-encoder"),
+                    });
+            let stage_result = match class {
+                GpuDecodeSlotClass::Normal => {
+                    let slot = &pool.normal.slots[slot_idx];
+                    upload_gpu_decode_job_to_slot(runtime, slot, prepared).and_then(|_| {
+                        encode_gpu_decode_job_on_slot(
+                            runtime,
+                            slot,
+                            prepared,
+                            kernel_ts_probe,
+                            &mut encoder,
+                        )
+                    })
+                }
+                GpuDecodeSlotClass::Large => {
+                    let slot = &pool.large.slots[slot_idx];
+                    upload_gpu_decode_job_to_slot(runtime, slot, prepared).and_then(|_| {
+                        encode_gpu_decode_job_on_slot(
+                            runtime,
+                            slot,
+                            prepared,
+                            kernel_ts_probe,
+                            &mut encoder,
+                        )
+                    })
+                }
+            };
+            match stage_result {
+                Ok(mut pending) => {
+                    let t_submit = Instant::now();
+                    let _submission = runtime.queue.submit(Some(encoder.finish()));
+                    pending.submit_ms = elapsed_ms(t_submit);
+                    if wait_probe_enabled {
+                        wait_probe_submit_ms += pending.submit_ms;
+                    }
+                    pending.submit_at = Instant::now();
+                    let completion_gate = Arc::new(AtomicBool::new(false));
+                    let completion_gate_cb = Arc::clone(&completion_gate);
+                    runtime.queue.on_submitted_work_done(move || {
+                        completion_gate_cb.store(true, Ordering::Release);
+                    });
+                    pending.completion_gate = completion_gate;
+                    if pending.map_rx.is_none() {
+                        let out_slice = match class {
+                            GpuDecodeSlotClass::Normal => pool.normal.slots[slot_idx]
+                                .buffers
+                                .out_readback_buffer
+                                .slice(..pending.out_total_copy_len),
+                            GpuDecodeSlotClass::Large => pool.large.slots[slot_idx]
+                                .buffers
+                                .out_readback_buffer
+                                .slice(..pending.out_total_copy_len),
+                        };
+                        let (map_tx, map_rx) = mpsc::channel();
+                        out_slice.map_async(wgpu::MapMode::Read, move |res| {
+                            let _ = map_tx.send(res);
+                        });
+                        pending.map_rx = Some(map_rx);
+                    }
+                    if pending.kernel_timestamp_ms.is_none() && pending.ts_map_rx.is_none() {
+                        if let Some(ts_buffer) = pending.ts_readback_buffer.as_ref() {
+                            let (ts_tx, ts_rx) = mpsc::channel();
+                            ts_buffer
+                                .slice(..)
+                                .map_async(wgpu::MapMode::Read, move |res| {
+                                    let _ = ts_tx.send(res);
+                                });
+                            pending.ts_map_rx = Some(ts_rx);
+                        }
+                    }
+                    inflight.push(InflightGpuDecodeSubmission {
+                        prepared,
+                        class,
+                        slot_idx,
+                        slot_handle,
+                        pending: pending,
+                        map_requested_at: Some(Instant::now()),
+                        map_done: None,
+                        map_timed_out: false,
+                        wait_profile: GpuDecodeV2WaitProfile::default(),
+                    });
+                }
+                Err(_) => {
+                    match class {
+                        GpuDecodeSlotClass::Normal => {
+                            mark_gpu_decode_slot_free(&mut pool.normal, slot_idx)
+                        }
+                        GpuDecodeSlotClass::Large => {
+                            mark_gpu_decode_slot_free(&mut pool.large, slot_idx)
+                        }
+                    }
+                    completed_queue.push_back(GpuDecodeResult {
+                        chunk_index: prepared.job.chunk_index,
+                        slot: None,
+                        disposition: GpuDecodeDisposition::CpuFallback,
+                        decoded_chunk: None,
+                    });
+                    fallback_submit_error_jobs = fallback_submit_error_jobs.saturating_add(1);
+                }
             }
-            runtime.device.poll(wgpu::Maintain::Wait);
-        } else if wait_probe_enabled {
-            wait_probe_ready_any_hits = wait_probe_ready_any_hits.saturating_add(1);
+            next_submit_idx = next_submit_idx.saturating_add(1);
+            submitted_in_round = submitted_in_round.saturating_add(1);
+        }
+
+        // Stage 3: CPU-side finalize after submit prioritization.
+        while let Some(result) = completed_queue.pop_front() {
+            out.push(result);
+        }
+
+        if completed_in_round == 0 && submitted_in_round == 0 {
+            no_progress_loops = no_progress_loops.saturating_add(1);
+            let should_block_wait = submit_stalled || inflight.len() >= wait_high_watermark;
+            if should_block_wait && no_progress_loops >= spin_polls_before_wait {
+                if wait_probe_enabled {
+                    wait_probe_wait_loops = wait_probe_wait_loops.saturating_add(1);
+                }
+                runtime.device.poll(wgpu::Maintain::Wait);
+                no_progress_loops = 0;
+            } else {
+                std::thread::yield_now();
+            }
+        } else {
+            no_progress_loops = 0;
+            if wait_probe_enabled && completed_in_round > 0 {
+                wait_probe_ready_any_hits = wait_probe_ready_any_hits.saturating_add(1);
+            }
         }
     }
 
@@ -8977,7 +10226,7 @@ pub(crate) fn decode_chunks_gpu_v2(
             "disabled"
         };
         eprintln!(
-            "[cozip_pdeflate][timing][decode-v2-ready-any] jobs={} submit_ms={:.3} submit_done_wait_ms={:.3} map_callback_wait_ms={:.3} map_copy_ms={:.3} kernel_timestamp_ms={:.3} queue_stall_est_ms={:.3} ready_any_hits={} wait_loops={} inflight_batches_avg={:.2} inflight_batches_max={} inflight_samples={} kernel_ts_status={}",
+            "[cozip_pdeflate][timing][decode-v2-ready-any] jobs={} submit_ms={:.3} submit_done_wait_ms={:.3} map_callback_wait_ms={:.3} map_copy_ms={:.3} kernel_timestamp_ms={:.3} queue_stall_est_ms={:.3} ready_any_hits={} wait_loops={} inflight_batches_avg={:.2} inflight_batches_max={} inflight_samples={} kernel_ts_status={} ctrl_target_inflight={} ctrl_wait_high={} ctrl_spin_polls={}",
             wait_probe_completed_jobs,
             wait_probe_submit_ms,
             wait_probe_submit_done_wait_ms,
@@ -8990,7 +10239,20 @@ pub(crate) fn decode_chunks_gpu_v2(
             inflight_avg,
             wait_probe_inflight_batches_max,
             wait_probe_inflight_samples,
-            kernel_ts_status
+            kernel_ts_status,
+            target_inflight,
+            wait_high_watermark,
+            spin_polls_before_wait
+        );
+        eprintln!(
+            "[cozip_pdeflate][timing][decode-v2-fallback-reasons] jobs={} capacity={} submit_err={} map_timeout={} map_err={} collect_err={} kernel_fallback={}",
+            wait_probe_completed_jobs,
+            fallback_capacity_jobs,
+            fallback_submit_error_jobs,
+            fallback_map_timeout_jobs,
+            fallback_map_error_jobs,
+            fallback_collect_error_jobs,
+            fallback_kernel_error_jobs
         );
     }
     Ok(out)

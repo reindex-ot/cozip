@@ -1366,7 +1366,7 @@ pub fn pdeflate_decompress_into_with_stats_with_options(
             .max(1)
     };
     let prof_cpu_decode_workers = cpu_worker_count;
-    let gpu_batch_limit = options.gpu_pipelined_submit_chunks.max(1);
+    let gpu_batch_limit = gpu_decode_batch_limit(options, chunk_count);
     let queue_state = Arc::new(Mutex::new((0..chunk_count).collect::<VecDeque<usize>>()));
     let err_slot = Arc::new(Mutex::new(None::<PDeflateError>));
     let err_flag = Arc::new(AtomicBool::new(false));
@@ -1450,24 +1450,23 @@ pub fn pdeflate_decompress_into_with_stats_with_options(
                         };
                         let mut picked = Vec::with_capacity(gpu_batch_limit);
                         while picked.len() < gpu_batch_limit {
-                            let Some(idx) = queue.pop_front() else {
+                            let idx = if options.gpu_decompress_force_gpu {
+                                queue.pop_front()
+                            } else {
+                                // Keep scheduler policy intact while avoiding "front ineligible blocks GPU".
+                                // Pick the next GPU-eligible chunk from the global queue.
+                                let pos = queue.iter().position(|&idx| {
+                                    tasks
+                                        .get(idx)
+                                        .map(|task| task.out_len >= options.gpu_min_chunk_size)
+                                        .unwrap_or(false)
+                                });
+                                pos.and_then(|p| queue.remove(p))
+                            };
+                            let Some(idx) = idx else {
                                 break;
                             };
-                            let eligible = if options.gpu_decompress_force_gpu {
-                                true
-                            } else {
-                                tasks
-                                    .get(idx)
-                                    .map(|task| task.out_len >= options.gpu_min_chunk_size)
-                                    .unwrap_or(false)
-                            };
-                            if eligible {
-                                picked.push(idx);
-                            } else {
-                                // Not suitable for GPU: return to CPU workers via front.
-                                queue.push_front(idx);
-                                break;
-                            }
+                            picked.push(idx);
                         }
                         picked
                     };
@@ -1870,6 +1869,26 @@ fn cpu_worker_count() -> usize {
     // GPU worker mostly blocks on device progress, so reserving a CPU core here
     // can underutilize CPU on CPU-heavy inputs.
     available.max(1)
+}
+
+fn gpu_decode_batch_chunks_override() -> Option<usize> {
+    static VALUE: OnceLock<Option<usize>> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("COZIP_PDEFLATE_GPU_DECODE_BATCH_CHUNKS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v > 0)
+    })
+}
+
+fn gpu_decode_batch_limit(options: &PDeflateOptions, chunk_count: usize) -> usize {
+    let base = options
+        .gpu_pipelined_submit_chunks
+        .max(options.gpu_submit_chunks)
+        .max(options.gpu_slot_count)
+        .max(1);
+    let requested = gpu_decode_batch_chunks_override().unwrap_or(base);
+    requested.min(chunk_count.max(1))
 }
 
 fn set_worker_error_once(
