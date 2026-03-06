@@ -176,6 +176,7 @@ pub struct PDeflateOptions {
     pub match_probe_limit: usize,
     pub hash_history_limit: usize,
     pub table_sample_stride: usize,
+    pub gpu_table_sample_stride: usize,
     pub gpu_compress_enabled: bool,
     pub gpu_decompress_enabled: bool,
     pub gpu_decompress_force_gpu: bool,
@@ -200,6 +201,7 @@ impl Default for PDeflateOptions {
             match_probe_limit: 16,
             hash_history_limit: 16,
             table_sample_stride: 4,
+            gpu_table_sample_stride: 16,
             gpu_compress_enabled: false,
             gpu_decompress_enabled: true,
             gpu_decompress_force_gpu: false,
@@ -1824,6 +1826,11 @@ fn validate_options(options: &PDeflateOptions) -> Result<(), PDeflateError> {
             "table_sample_stride must be > 0",
         ));
     }
+    if options.gpu_table_sample_stride == 0 {
+        return Err(PDeflateError::InvalidOptions(
+            "gpu_table_sample_stride must be > 0",
+        ));
+    }
     if options.gpu_submit_chunks == 0 {
         return Err(PDeflateError::InvalidOptions(
             "gpu_submit_chunks must be > 0",
@@ -2446,7 +2453,7 @@ fn compress_chunk_gpu_batch(
             options.min_ref_len,
             options.match_probe_limit,
             options.hash_history_limit,
-            options.table_sample_stride,
+            options.gpu_table_sample_stride,
         );
         match batch_result {
             Ok(entries) => {
@@ -4345,7 +4352,7 @@ fn build_table_dispatch(
             options.min_ref_len,
             options.match_probe_limit,
             options.hash_history_limit,
-            options.table_sample_stride,
+            options.gpu_table_sample_stride,
         ) {
             return Ok(BuiltTableDispatch {
                 table: None,

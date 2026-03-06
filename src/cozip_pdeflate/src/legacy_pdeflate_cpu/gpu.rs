@@ -454,6 +454,11 @@ var<workgroup> shard_score_1: array<u32, 128>;
 var<workgroup> shard_pos_2: array<u32, 128>;
 var<workgroup> shard_len_2: array<u32, 128>;
 var<workgroup> shard_score_2: array<u32, 128>;
+var<workgroup> candidate_pos_wg: u32;
+var<workgroup> candidate_len_wg: u32;
+var<workgroup> candidate_sig0_wg: u32;
+var<workgroup> candidate_sig1_wg: u32;
+var<workgroup> duplicate_found_wg: atomic<u32>;
 
 fn load_src(idx: u32) -> u32 {
     let w = src_words[idx >> 2u];
@@ -646,7 +651,7 @@ fn main(
     shard_score_2[lane] = top_score_2;
     workgroupBarrier();
 
-    if (gid3.x != 0u || gid3.y != 0u || gid3.z != 0u || lane != 0u) {
+    if (gid3.x != 0u || gid3.y != 0u || gid3.z != 0u) {
         return;
     }
 
@@ -743,10 +748,16 @@ fn main(
                 continue;
             }
 
-            let sig0 = load_src_prefix_sig(pos, len);
-            let sig1 = load_src_suffix_sig(pos, len);
-            var is_dup = 0u;
-            var e = 0u;
+            if (lane == 0u) {
+                candidate_pos_wg = pos;
+                candidate_len_wg = len;
+                candidate_sig0_wg = load_src_prefix_sig(pos, len);
+                candidate_sig1_wg = load_src_suffix_sig(pos, len);
+                atomicStore(&duplicate_found_wg, 0u);
+            }
+            workgroupBarrier();
+
+            var e = lane;
             loop {
                 if (e >= out_count) {
                     break;
@@ -756,30 +767,42 @@ fn main(
                 let prev_desc = emit_desc_words[desc_base + 0u];
                 let prev_sig0 = emit_desc_words[desc_base + 1u];
                 let prev_sig1 = emit_desc_words[desc_base + 2u];
-                if (entry_matches_src(pos, len, sig0, sig1, prev_desc, e_len, prev_sig0, prev_sig1)) {
-                    is_dup = 1u;
+                if (entry_matches_src(
+                    candidate_pos_wg,
+                    candidate_len_wg,
+                    candidate_sig0_wg,
+                    candidate_sig1_wg,
+                    prev_desc,
+                    e_len,
+                    prev_sig0,
+                    prev_sig1,
+                )) {
+                    atomicStore(&duplicate_found_wg, 1u);
                     break;
                 }
-                e = e + 1u;
+                e = e + 128u;
             }
-            if (is_dup == 1u) {
-                continue;
-            }
+            workgroupBarrier();
 
-            out_meta[1u + out_count * 2u] = data_cursor;
-            out_meta[2u + out_count * 2u] = len;
-            let desc_base = emit_desc_base(out_count);
-            emit_desc_words[desc_base + 0u] = pos;
-            emit_desc_words[desc_base + 1u] = sig0;
-            emit_desc_words[desc_base + 2u] = sig1;
-            data_cursor = data_cursor + len;
-            out_count = out_count + 1u;
+            if (lane == 0u && atomicLoad(&duplicate_found_wg) == 0u) {
+                out_meta[1u + out_count * 2u] = data_cursor;
+                out_meta[2u + out_count * 2u] = len;
+                let desc_base = emit_desc_base(out_count);
+                emit_desc_words[desc_base + 0u] = pos;
+                emit_desc_words[desc_base + 1u] = candidate_sig0_wg;
+                emit_desc_words[desc_base + 2u] = candidate_sig1_wg;
+                data_cursor = data_cursor + len;
+                out_count = out_count + 1u;
+            }
+            workgroupBarrier();
         }
         rank = rank + 1u;
     }
 
-    out_meta[0] = out_count;
-    out_meta[1u + max_entries * 2u] = data_cursor;
+    if (lane == 0u) {
+        out_meta[0] = out_count;
+        out_meta[1u + max_entries * 2u] = data_cursor;
+    }
 }
 "#;
 
@@ -788,7 +811,7 @@ const BUILD_TABLE_FINALIZE_EMIT_SHADER: &str = r#"
 @group(0) @binding(1) var<storage, read> table_meta: array<u32>;
 @group(0) @binding(2) var<storage, read> emit_desc_words: array<u32>;
 @group(0) @binding(3) var<storage, read> params: array<u32>;
-@group(0) @binding(4) var<storage, read_write> out_data: array<u32>;
+@group(0) @binding(4) var<storage, read_write> out_data: array<atomic<u32>>;
 
 const FINALIZE_LITERAL_FLAG: u32 = 0x80000000u;
 const FINALIZE_EMIT_DESC_WORDS: u32 = 3u;
@@ -811,59 +834,39 @@ fn emit_desc_literal_byte(desc: u32) -> u32 {
     return desc & 0xffu;
 }
 
-fn read_output_byte(pos: u32, out_count: u32) -> u32 {
-    var entry_idx = 0u;
-    loop {
-        if (entry_idx >= out_count) {
-            break;
-        }
-        let meta_base = 1u + entry_idx * 2u;
-        let off = table_meta[meta_base];
-        let len = table_meta[meta_base + 1u];
-        if (pos >= off && pos < off + len) {
-            let desc = emit_desc_words[emit_desc_base(entry_idx)];
-            let local = pos - off;
-            if (emit_desc_is_literal(desc)) {
-                return emit_desc_literal_byte(desc);
-            }
-            return load_src(desc + local);
-        }
-        entry_idx = entry_idx + 1u;
+fn output_byte_for_entry(entry_idx: u32, local: u32) -> u32 {
+    let desc = emit_desc_words[emit_desc_base(entry_idx)];
+    if (emit_desc_is_literal(desc)) {
+        return emit_desc_literal_byte(desc);
     }
-    return 0u;
+    return load_src(desc + local);
 }
 
 @compute
-@workgroup_size(256, 1, 1)
-fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+@workgroup_size(32, 1, 1)
+fn main(
+    @builtin(workgroup_id) wid3: vec3<u32>,
+    @builtin(local_invocation_id) lid3: vec3<u32>,
+) {
     let max_entries = params[4];
-    let data_total_idx = 1u + max_entries * 2u;
-    let used_bytes = table_meta[data_total_idx];
-    let used_words = (used_bytes + 3u) >> 2u;
     let out_count = min(table_meta[0], max_entries);
-    let word_idx = gid3.x;
-    if (word_idx >= used_words) {
+    let entry_idx = wid3.x;
+    if (entry_idx >= out_count) {
+        return;
+    }
+    let lane = lid3.x;
+    let meta_base = 1u + entry_idx * 2u;
+    let off = table_meta[meta_base];
+    let len = table_meta[meta_base + 1u];
+    if (lane >= len) {
         return;
     }
 
-    let base = word_idx * 4u;
-    var b0 = 0u;
-    var b1 = 0u;
-    var b2 = 0u;
-    var b3 = 0u;
-    if (base < used_bytes) {
-        b0 = read_output_byte(base, out_count);
-    }
-    if (base + 1u < used_bytes) {
-        b1 = read_output_byte(base + 1u, out_count);
-    }
-    if (base + 2u < used_bytes) {
-        b2 = read_output_byte(base + 2u, out_count);
-    }
-    if (base + 3u < used_bytes) {
-        b3 = read_output_byte(base + 3u, out_count);
-    }
-    out_data[word_idx] = b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+    let out_pos = off + lane;
+    let out_word = out_pos >> 2u;
+    let out_shift = (out_pos & 3u) * 8u;
+    let byte = output_byte_for_entry(entry_idx, lane) & 0xffu;
+    atomicOr(&out_data[out_word], byte << out_shift);
 }
 "#;
 
@@ -12240,9 +12243,8 @@ pub(crate) fn build_table_gpu_device_batch(
             emit_groups,
             max_entry_len: capped_max_entry_len,
             table_data_bytes_cap,
-            build_id: build_id_base.saturating_add(
-                u64::try_from(idx).map_err(|_| PDeflateError::NumericOverflow)?,
-            ),
+            build_id: build_id_base
+                .saturating_add(u64::try_from(idx).map_err(|_| PDeflateError::NumericOverflow)?),
         });
         total_src_word_offset = total_src_word_offset
             .checked_add(chunk_src_words.len())
@@ -12477,10 +12479,16 @@ pub(crate) fn build_table_gpu_device_batch(
     let t_upload = Instant::now();
     r.queue
         .write_buffer(&src_buffer, 0, bytemuck::cast_slice(&src_words));
-    r.queue
-        .write_buffer(&freq_params_buffer, 0, bytemuck::cast_slice(&freq_params_words));
-    r.queue
-        .write_buffer(&cand_params_buffer, 0, bytemuck::cast_slice(&cand_params_words));
+    r.queue.write_buffer(
+        &freq_params_buffer,
+        0,
+        bytemuck::cast_slice(&freq_params_words),
+    );
+    r.queue.write_buffer(
+        &cand_params_buffer,
+        0,
+        bytemuck::cast_slice(&cand_params_words),
+    );
     r.queue.write_buffer(
         &bucket_params_buffer,
         0,
@@ -12684,7 +12692,11 @@ pub(crate) fn build_table_gpu_device_batch(
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: binding_resource(&sorted_idx_buffer, sorted_idx_offset, sorted_idx_size),
+                    resource: binding_resource(
+                        &sorted_idx_buffer,
+                        sorted_idx_offset,
+                        sorted_idx_size,
+                    ),
                 },
             ],
         });
@@ -12706,7 +12718,11 @@ pub(crate) fn build_table_gpu_device_batch(
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: binding_resource(&sorted_idx_buffer, sorted_idx_offset, sorted_idx_size),
+                    resource: binding_resource(
+                        &sorted_idx_buffer,
+                        sorted_idx_offset,
+                        sorted_idx_size,
+                    ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,

@@ -315,6 +315,13 @@ fn legacy_options_from_hybrid(
         hybrid_scheduler_policy: legacy_pdeflate_cpu::PDeflateHybridSchedulerPolicy::GlobalQueue,
         ..legacy_pdeflate_cpu::PDeflateOptions::default()
     };
+    if let Ok(raw) = std::env::var("COZIP_PDEFLATE_GPU_TABLE_SAMPLE_STRIDE") {
+        if let Ok(parsed) = raw.trim().parse::<usize>() {
+            if parsed > 0 {
+                legacy.gpu_table_sample_stride = parsed;
+            }
+        }
+    }
     if options.gpu_only {
         // legacy path has no strict gpu-only mode; keep GPU enabled and let scheduler assign.
         legacy.gpu_compress_enabled = true;
