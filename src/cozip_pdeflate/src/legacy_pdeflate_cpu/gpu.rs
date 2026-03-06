@@ -9352,6 +9352,17 @@ fn decode_chunks_gpu_v2_true_batch(
     let copy_jobs = gpu_decode_v2_true_batch_copy_jobs(batch_jobs)
         .max(1)
         .min(batch_jobs);
+    let desired_inflight = target_inflight.max(1).min(prepared_jobs.len().max(1));
+    let max_jobs_for_target_inflight = prepared_jobs
+        .len()
+        .saturating_add(desired_inflight.saturating_sub(1))
+        / desired_inflight;
+    // Keep super-batches large enough to amortize callback/map overhead, but small
+    // enough that the current decode window can still realize the requested inflight.
+    let super_batch_jobs = max_jobs_for_target_inflight
+        .min(batch_jobs.saturating_mul(desired_inflight))
+        .max(copy_jobs)
+        .min(prepared_jobs.len().max(1));
     let readback_ring = gpu_decode_v2_true_batch_readback_ring(target_inflight.max(1))
         .clamp(1, wait_high_watermark.max(1));
     let map_timeout_duration = map_timeout_ms
@@ -9626,7 +9637,7 @@ fn decode_chunks_gpu_v2_true_batch(
         release_gpu_decode_v2_true_batch_scratch(runtime, pending.scratch);
     };
 
-    for round in prepared_jobs.chunks(copy_jobs) {
+    for round in prepared_jobs.chunks(super_batch_jobs) {
         let mut desc_words = Vec::<u32>::with_capacity(
             1usize.saturating_add(round.len().saturating_mul(GPU_DECODE_V2_BATCH_DESC_WORDS)),
         );
