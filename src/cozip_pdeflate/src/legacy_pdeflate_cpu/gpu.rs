@@ -454,11 +454,24 @@ var<workgroup> shard_score_1: array<u32, 128>;
 var<workgroup> shard_pos_2: array<u32, 128>;
 var<workgroup> shard_len_2: array<u32, 128>;
 var<workgroup> shard_score_2: array<u32, 128>;
-var<workgroup> candidate_pos_wg: u32;
-var<workgroup> candidate_len_wg: u32;
-var<workgroup> candidate_sig0_wg: u32;
-var<workgroup> candidate_sig1_wg: u32;
-var<workgroup> duplicate_found_wg: atomic<u32>;
+var<workgroup> taken_literals_wg: array<u32, 256>;
+var<workgroup> out_count_wg: u32;
+var<workgroup> data_cursor_wg: u32;
+var<workgroup> rank_pos_wg: array<u32, 128>;
+var<workgroup> rank_len_wg: array<u32, 128>;
+var<workgroup> rank_score_wg: array<u32, 128>;
+var<workgroup> rank_sig0_wg: array<u32, 128>;
+var<workgroup> rank_sig1_wg: array<u32, 128>;
+var<workgroup> rank_active_wg: array<u32, 128>;
+var<workgroup> reduce_pos_wg: array<u32, 128>;
+var<workgroup> reduce_len_wg: array<u32, 128>;
+var<workgroup> reduce_score_wg: array<u32, 128>;
+var<workgroup> reduce_idx_wg: array<u32, 128>;
+var<workgroup> reduce_found_wg: array<u32, 128>;
+var<workgroup> reduce_byte_wg: array<u32, 128>;
+var<workgroup> reduce_freq_wg: array<u32, 128>;
+var<workgroup> literal_stop_wg: u32;
+var<workgroup> rank_stop_wg: u32;
 
 fn load_src(idx: u32) -> u32 {
     let w = src_words[idx >> 2u];
@@ -568,6 +581,21 @@ fn better_candidate(
     return pos < best_pos;
 }
 
+fn better_literal(
+    freq: u32,
+    byte: u32,
+    best_freq: u32,
+    best_byte: u32,
+) -> bool {
+    if (freq > best_freq) {
+        return true;
+    }
+    if (freq < best_freq) {
+        return false;
+    }
+    return byte < best_byte;
+}
+
 @compute
 @workgroup_size(128, 1, 1)
 fn main(
@@ -655,153 +683,252 @@ fn main(
         return;
     }
 
-    var taken_literals: array<u32, 256>;
-    var b_init = 0u;
+    var b_init = lane;
     loop {
         if (b_init >= 256u) {
             break;
         }
-        taken_literals[b_init] = 0u;
-        b_init = b_init + 1u;
+        taken_literals_wg[b_init] = 0u;
+        b_init = b_init + 128u;
     }
-
-    var out_count = 0u;
-    var data_cursor = 0u;
+    if (lane == 0u) {
+        out_count_wg = 0u;
+        data_cursor_wg = 0u;
+    }
+    workgroupBarrier();
 
     var lit_rank = 0u;
     loop {
-        if (lit_rank >= literal_limit || out_count >= max_entries) {
+        if (lit_rank >= literal_limit || out_count_wg >= max_entries) {
             break;
         }
         var best_byte = 0u;
         var best_freq = 0u;
         var has_best = 0u;
-        var b = 0u;
+        var b = lane;
         loop {
             if (b >= 256u) {
                 break;
             }
-            if (taken_literals[b] == 0u) {
+            if (taken_literals_wg[b] == 0u) {
                 let f = freq_words[b];
                 if (f >= min_literal_freq) {
-                    if (has_best == 0u || f > best_freq || (f == best_freq && b < best_byte)) {
+                    if (has_best == 0u || better_literal(f, b, best_freq, best_byte)) {
                         has_best = 1u;
                         best_byte = b;
                         best_freq = f;
                     }
                 }
             }
-            b = b + 1u;
+            b = b + 128u;
         }
-        if (has_best == 0u) {
+        reduce_found_wg[lane] = has_best;
+        reduce_byte_wg[lane] = best_byte;
+        reduce_freq_wg[lane] = best_freq;
+        workgroupBarrier();
+
+        var lit_step = 64u;
+        loop {
+            if (lit_step == 0u) {
+                break;
+            }
+            if (lane < lit_step) {
+                let rhs_found = reduce_found_wg[lane + lit_step];
+                if (rhs_found != 0u) {
+                    let lhs_found = reduce_found_wg[lane];
+                    let rhs_byte = reduce_byte_wg[lane + lit_step];
+                    let rhs_freq = reduce_freq_wg[lane + lit_step];
+                    if (
+                        lhs_found == 0u ||
+                        better_literal(
+                            rhs_freq,
+                            rhs_byte,
+                            reduce_freq_wg[lane],
+                            reduce_byte_wg[lane],
+                        )
+                    ) {
+                        reduce_found_wg[lane] = rhs_found;
+                        reduce_byte_wg[lane] = rhs_byte;
+                        reduce_freq_wg[lane] = rhs_freq;
+                    }
+                }
+            }
+            workgroupBarrier();
+            lit_step = lit_step >> 1u;
+        }
+
+        if (lane == 0u) {
+            if (reduce_found_wg[0] != 0u && data_cursor_wg + 1u <= max_data_bytes) {
+                let chosen_byte = reduce_byte_wg[0];
+                out_meta[1u + out_count_wg * 2u] = data_cursor_wg;
+                out_meta[2u + out_count_wg * 2u] = 1u;
+                let desc_base = emit_desc_base(out_count_wg);
+                emit_desc_words[desc_base + 0u] = FINALIZE_LITERAL_FLAG | chosen_byte;
+                emit_desc_words[desc_base + 1u] = chosen_byte;
+                emit_desc_words[desc_base + 2u] = chosen_byte;
+                data_cursor_wg = data_cursor_wg + 1u;
+                out_count_wg = out_count_wg + 1u;
+                taken_literals_wg[chosen_byte] = 1u;
+                literal_stop_wg = 0u;
+            } else {
+                literal_stop_wg = 1u;
+            }
+        }
+        workgroupBarrier();
+        if (literal_stop_wg != 0u) {
             break;
         }
-        if (data_cursor + 1u > max_data_bytes) {
-            break;
-        }
-        out_meta[1u + out_count * 2u] = data_cursor;
-        out_meta[2u + out_count * 2u] = 1u;
-        let desc_base = emit_desc_base(out_count);
-        emit_desc_words[desc_base + 0u] = FINALIZE_LITERAL_FLAG | best_byte;
-        emit_desc_words[desc_base + 1u] = best_byte;
-        emit_desc_words[desc_base + 2u] = best_byte;
-        data_cursor = data_cursor + 1u;
-        out_count = out_count + 1u;
-        taken_literals[best_byte] = 1u;
         lit_rank = lit_rank + 1u;
     }
 
     var rank = 0u;
     loop {
-        if (rank >= 3u || out_count >= max_entries) {
+        if (rank >= 3u || out_count_wg >= max_entries) {
             break;
         }
-        var shard = 0u;
+        var score = 0u;
+        var pos = 0u;
+        var len = 0u;
+        if (rank == 0u) {
+            score = shard_score_0[lane];
+            pos = shard_pos_0[lane];
+            len = shard_len_0[lane];
+        } else if (rank == 1u) {
+            score = shard_score_1[lane];
+            pos = shard_pos_1[lane];
+            len = shard_len_1[lane];
+        } else {
+            score = shard_score_2[lane];
+            pos = shard_pos_2[lane];
+            len = shard_len_2[lane];
+        }
+        if (score != 0u && len != 0u && len <= max_entry_len && pos + len <= total_len) {
+            rank_pos_wg[lane] = pos;
+            rank_len_wg[lane] = len;
+            rank_score_wg[lane] = score;
+            rank_sig0_wg[lane] = load_src_prefix_sig(pos, len);
+            rank_sig1_wg[lane] = load_src_suffix_sig(pos, len);
+            rank_active_wg[lane] = 1u;
+        } else {
+            rank_pos_wg[lane] = 0u;
+            rank_len_wg[lane] = 0u;
+            rank_score_wg[lane] = 0u;
+            rank_sig0_wg[lane] = 0u;
+            rank_sig1_wg[lane] = 0u;
+            rank_active_wg[lane] = 0u;
+        }
+        workgroupBarrier();
+
         loop {
-            if (shard >= FINALIZE_SHARDS || out_count >= max_entries) {
+            if (out_count_wg >= max_entries) {
                 break;
             }
-            var score = 0u;
-            var pos = 0u;
-            var len = 0u;
-            if (rank == 0u) {
-                score = shard_score_0[shard];
-                pos = shard_pos_0[shard];
-                len = shard_len_0[shard];
-            } else if (rank == 1u) {
-                score = shard_score_1[shard];
-                pos = shard_pos_1[shard];
-                len = shard_len_1[shard];
+            var keep = rank_active_wg[lane];
+            if (keep != 0u) {
+                let candidate_len = rank_len_wg[lane];
+                if (data_cursor_wg + candidate_len > max_data_bytes) {
+                    keep = 0u;
+                }
+            }
+            if (keep != 0u) {
+                var e = 0u;
+                loop {
+                    if (e >= out_count_wg) {
+                        break;
+                    }
+                    let e_len = out_meta[2u + e * 2u];
+                    let desc_base = emit_desc_base(e);
+                    let prev_desc = emit_desc_words[desc_base + 0u];
+                    let prev_sig0 = emit_desc_words[desc_base + 1u];
+                    let prev_sig1 = emit_desc_words[desc_base + 2u];
+                    if (entry_matches_src(
+                        rank_pos_wg[lane],
+                        rank_len_wg[lane],
+                        rank_sig0_wg[lane],
+                        rank_sig1_wg[lane],
+                        prev_desc,
+                        e_len,
+                        prev_sig0,
+                        prev_sig1,
+                    )) {
+                        keep = 0u;
+                        break;
+                    }
+                    e = e + 1u;
+                }
+            }
+            if (keep != 0u) {
+                reduce_score_wg[lane] = rank_score_wg[lane];
+                reduce_len_wg[lane] = rank_len_wg[lane];
+                reduce_pos_wg[lane] = rank_pos_wg[lane];
+                reduce_idx_wg[lane] = lane;
             } else {
-                score = shard_score_2[shard];
-                pos = shard_pos_2[shard];
-                len = shard_len_2[shard];
+                reduce_score_wg[lane] = 0u;
+                reduce_len_wg[lane] = 0u;
+                reduce_pos_wg[lane] = 0u;
+                reduce_idx_wg[lane] = 0xffffffffu;
             }
-            shard = shard + 1u;
-            if (score == 0u) {
-                continue;
-            }
-            if (len == 0u || len > max_entry_len || pos + len > total_len) {
-                continue;
-            }
-            if (data_cursor + len > max_data_bytes) {
-                continue;
+            workgroupBarrier();
+
+            var step = 64u;
+            loop {
+                if (step == 0u) {
+                    break;
+                }
+                if (lane < step) {
+                    let rhs_score = reduce_score_wg[lane + step];
+                    if (
+                        rhs_score != 0u &&
+                        (reduce_score_wg[lane] == 0u ||
+                            better_candidate(
+                                rhs_score,
+                                reduce_len_wg[lane + step],
+                                reduce_pos_wg[lane + step],
+                                reduce_score_wg[lane],
+                                reduce_len_wg[lane],
+                                reduce_pos_wg[lane],
+                            ))
+                    ) {
+                        reduce_score_wg[lane] = rhs_score;
+                        reduce_len_wg[lane] = reduce_len_wg[lane + step];
+                        reduce_pos_wg[lane] = reduce_pos_wg[lane + step];
+                        reduce_idx_wg[lane] = reduce_idx_wg[lane + step];
+                    }
+                }
+                workgroupBarrier();
+                step = step >> 1u;
             }
 
             if (lane == 0u) {
-                candidate_pos_wg = pos;
-                candidate_len_wg = len;
-                candidate_sig0_wg = load_src_prefix_sig(pos, len);
-                candidate_sig1_wg = load_src_suffix_sig(pos, len);
-                atomicStore(&duplicate_found_wg, 0u);
-            }
-            workgroupBarrier();
-
-            var e = lane;
-            loop {
-                if (e >= out_count) {
-                    break;
+                let chosen_score = reduce_score_wg[0];
+                let chosen_idx = reduce_idx_wg[0];
+                if (chosen_score == 0u || chosen_idx == 0xffffffffu) {
+                    rank_stop_wg = 1u;
+                } else {
+                    let chosen_len = rank_len_wg[chosen_idx];
+                    out_meta[1u + out_count_wg * 2u] = data_cursor_wg;
+                    out_meta[2u + out_count_wg * 2u] = chosen_len;
+                    let desc_base = emit_desc_base(out_count_wg);
+                    emit_desc_words[desc_base + 0u] = rank_pos_wg[chosen_idx];
+                    emit_desc_words[desc_base + 1u] = rank_sig0_wg[chosen_idx];
+                    emit_desc_words[desc_base + 2u] = rank_sig1_wg[chosen_idx];
+                    data_cursor_wg = data_cursor_wg + chosen_len;
+                    out_count_wg = out_count_wg + 1u;
+                    rank_active_wg[chosen_idx] = 0u;
+                    rank_stop_wg = 0u;
                 }
-                let e_len = out_meta[2u + e * 2u];
-                let desc_base = emit_desc_base(e);
-                let prev_desc = emit_desc_words[desc_base + 0u];
-                let prev_sig0 = emit_desc_words[desc_base + 1u];
-                let prev_sig1 = emit_desc_words[desc_base + 2u];
-                if (entry_matches_src(
-                    candidate_pos_wg,
-                    candidate_len_wg,
-                    candidate_sig0_wg,
-                    candidate_sig1_wg,
-                    prev_desc,
-                    e_len,
-                    prev_sig0,
-                    prev_sig1,
-                )) {
-                    atomicStore(&duplicate_found_wg, 1u);
-                    break;
-                }
-                e = e + 128u;
             }
             workgroupBarrier();
-
-            if (lane == 0u && atomicLoad(&duplicate_found_wg) == 0u) {
-                out_meta[1u + out_count * 2u] = data_cursor;
-                out_meta[2u + out_count * 2u] = len;
-                let desc_base = emit_desc_base(out_count);
-                emit_desc_words[desc_base + 0u] = pos;
-                emit_desc_words[desc_base + 1u] = candidate_sig0_wg;
-                emit_desc_words[desc_base + 2u] = candidate_sig1_wg;
-                data_cursor = data_cursor + len;
-                out_count = out_count + 1u;
+            if (rank_stop_wg != 0u) {
+                break;
             }
-            workgroupBarrier();
         }
         rank = rank + 1u;
     }
 
     if (lane == 0u) {
-        out_meta[0] = out_count;
-        out_meta[1u + max_entries * 2u] = data_cursor;
+        out_meta[0] = out_count_wg;
+        out_meta[1u + max_entries * 2u] = data_cursor_wg;
     }
 }
 "#;
@@ -12348,7 +12475,7 @@ pub(crate) fn build_table_gpu_device_batch(
         .saturating_add(1);
 
     let t_pre_resource = Instant::now();
-    let mut src_words = Vec::<u32>::new();
+    let mut src_bytes = Vec::<u8>::new();
     let mut descs = Vec::<BatchChunkDesc>::with_capacity(chunks.len());
     let mut total_src_word_offset = 0usize;
     let mut total_freq_words = 0usize;
@@ -12370,8 +12497,24 @@ pub(crate) fn build_table_gpu_device_batch(
             ));
         }
         let sample_count = (chunk.len() - 2).div_ceil(sample_stride);
-        let chunk_src_words = pack_bytes_to_words(chunk);
+        let chunk_src_word_len = chunk.len().div_ceil(4);
         total_src_word_offset = align_words32(total_src_word_offset);
+        let src_byte_offset = total_src_word_offset
+            .checked_mul(4)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        let chunk_src_padded_bytes = chunk_src_word_len
+            .checked_mul(4)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        if src_bytes.len() < src_byte_offset {
+            src_bytes.resize(src_byte_offset, 0);
+        }
+        let src_byte_end = src_byte_offset
+            .checked_add(chunk_src_padded_bytes)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        if src_bytes.len() < src_byte_end {
+            src_bytes.resize(src_byte_end, 0);
+        }
+        src_bytes[src_byte_offset..src_byte_offset + chunk.len()].copy_from_slice(chunk);
         total_freq_words = align_words32(total_freq_words);
         total_cand_words = align_words32(total_cand_words);
         total_bucket_words = align_words32(total_bucket_words);
@@ -12384,10 +12527,6 @@ pub(crate) fn build_table_gpu_device_batch(
         total_cand_param_words = align_words32(total_cand_param_words);
         total_bucket_param_words = align_words32(total_bucket_param_words);
         total_finalize_param_words = align_words32(total_finalize_param_words);
-        if src_words.len() < total_src_word_offset {
-            src_words.resize(total_src_word_offset, 0);
-        }
-        src_words.extend_from_slice(&chunk_src_words);
         let cand_words = sample_count
             .checked_mul(4)
             .ok_or(PDeflateError::NumericOverflow)?;
@@ -12437,7 +12576,7 @@ pub(crate) fn build_table_gpu_device_batch(
                 .saturating_add(u64::try_from(idx).map_err(|_| PDeflateError::NumericOverflow)?),
         });
         total_src_word_offset = total_src_word_offset
-            .checked_add(chunk_src_words.len())
+            .checked_add(chunk_src_word_len)
             .ok_or(PDeflateError::NumericOverflow)?;
         total_freq_words = total_freq_words
             .checked_add(256)
@@ -12480,9 +12619,7 @@ pub(crate) fn build_table_gpu_device_batch(
 
     let t_resource_setup = Instant::now();
     let scratch_caps = GpuTableBuildBatchScratchCaps {
-        src_bytes: u64::try_from(src_words.len())
-            .map_err(|_| PDeflateError::NumericOverflow)?
-            .saturating_mul(4),
+        src_bytes: u64::try_from(src_bytes.len()).map_err(|_| PDeflateError::NumericOverflow)?,
         freq_params_bytes: u64::try_from(total_freq_param_words)
             .map_err(|_| PDeflateError::NumericOverflow)?
             .saturating_mul(4),
@@ -12588,8 +12725,7 @@ pub(crate) fn build_table_gpu_device_batch(
     }
 
     let t_upload = Instant::now();
-    r.queue
-        .write_buffer(&scratch.src_buffer, 0, bytemuck::cast_slice(&src_words));
+    r.queue.write_buffer(&scratch.src_buffer, 0, &src_bytes);
     r.queue.write_buffer(
         &scratch.freq_params_buffer,
         0,
