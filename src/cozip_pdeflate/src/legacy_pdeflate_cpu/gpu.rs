@@ -439,9 +439,11 @@ const BUILD_TABLE_FINALIZE_SHADER: &str = r#"
 @group(0) @binding(3) var<storage, read> sorted_indices: array<u32>;
 @group(0) @binding(4) var<storage, read> params: array<u32>;
 @group(0) @binding(5) var<storage, read_write> out_meta: array<u32>;
-@group(0) @binding(6) var<storage, read_write> out_data: array<u32>;
+@group(0) @binding(6) var<storage, read_write> emit_desc_words: array<u32>;
 
 const FINALIZE_SHARDS: u32 = 128u;
+const FINALIZE_LITERAL_FLAG: u32 = 0x80000000u;
+const FINALIZE_EMIT_DESC_WORDS: u32 = 3u;
 
 var<workgroup> shard_pos_0: array<u32, 128>;
 var<workgroup> shard_len_0: array<u32, 128>;
@@ -459,18 +461,83 @@ fn load_src(idx: u32) -> u32 {
     return (w >> shift) & 0xffu;
 }
 
-fn load_out_data(idx: u32) -> u32 {
-    let w = out_data[idx >> 2u];
-    let shift = (idx & 3u) * 8u;
-    return (w >> shift) & 0xffu;
+fn load_src_packed(pos: u32, len: u32) -> u32 {
+    var out = 0u;
+    var i = 0u;
+    loop {
+        if (i >= 4u || i >= len) {
+            break;
+        }
+        out = out | (load_src(pos + i) << (i * 8u));
+        i = i + 1u;
+    }
+    return out;
 }
 
-fn store_out_data(idx: u32, value: u32) {
-    let wi = idx >> 2u;
-    let shift = (idx & 3u) * 8u;
-    let mask = 0xffu << shift;
-    let prev = out_data[wi];
-    out_data[wi] = (prev & (~mask)) | ((value & 0xffu) << shift);
+fn load_src_prefix_sig(pos: u32, len: u32) -> u32 {
+    return load_src_packed(pos, min(len, 4u));
+}
+
+fn load_src_suffix_sig(pos: u32, len: u32) -> u32 {
+    if (len <= 4u) {
+        return load_src_packed(pos, len);
+    }
+    return load_src_packed(pos + len - 4u, 4u);
+}
+
+fn emit_desc_base(entry_idx: u32) -> u32 {
+    return entry_idx * FINALIZE_EMIT_DESC_WORDS;
+}
+
+fn emit_desc_is_literal(desc: u32) -> bool {
+    return (desc & FINALIZE_LITERAL_FLAG) != 0u;
+}
+
+fn emit_desc_literal_byte(desc: u32) -> u32 {
+    return desc & 0xffu;
+}
+
+fn entry_matches_src(
+    pos: u32,
+    len: u32,
+    sig0: u32,
+    sig1: u32,
+    prev_desc: u32,
+    prev_len: u32,
+    prev_sig0: u32,
+    prev_sig1: u32,
+) -> bool {
+    if (prev_len != len) {
+        return false;
+    }
+    if (emit_desc_is_literal(prev_desc)) {
+        return len == 1u && emit_desc_literal_byte(prev_desc) == (sig0 & 0xffu);
+    }
+    if (prev_sig0 != sig0 || prev_sig1 != sig1) {
+        return false;
+    }
+
+    let prev_pos = prev_desc;
+    let word_count = len >> 2u;
+    var word_idx = 0u;
+    loop {
+        if (word_idx >= word_count) {
+            break;
+        }
+        let byte_off = word_idx << 2u;
+        if (load_src_packed(pos + byte_off, 4u) != load_src_packed(prev_pos + byte_off, 4u)) {
+            return false;
+        }
+        word_idx = word_idx + 1u;
+    }
+    let rem = len & 3u;
+    if (rem != 0u) {
+        let byte_off = word_count << 2u;
+        if (load_src_packed(pos + byte_off, rem) != load_src_packed(prev_pos + byte_off, rem)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn better_candidate(
@@ -629,7 +696,10 @@ fn main(
         }
         out_meta[1u + out_count * 2u] = data_cursor;
         out_meta[2u + out_count * 2u] = 1u;
-        store_out_data(data_cursor, best_byte);
+        let desc_base = emit_desc_base(out_count);
+        emit_desc_words[desc_base + 0u] = FINALIZE_LITERAL_FLAG | best_byte;
+        emit_desc_words[desc_base + 1u] = best_byte;
+        emit_desc_words[desc_base + 2u] = best_byte;
         data_cursor = data_cursor + 1u;
         out_count = out_count + 1u;
         taken_literals[best_byte] = 1u;
@@ -673,31 +743,22 @@ fn main(
                 continue;
             }
 
+            let sig0 = load_src_prefix_sig(pos, len);
+            let sig1 = load_src_suffix_sig(pos, len);
             var is_dup = 0u;
             var e = 0u;
             loop {
                 if (e >= out_count) {
                     break;
                 }
-                let e_off = out_meta[1u + e * 2u];
                 let e_len = out_meta[2u + e * 2u];
-                if (e_len == len) {
-                    var same = 1u;
-                    var j = 0u;
-                    loop {
-                        if (j >= len) {
-                            break;
-                        }
-                        if (load_src(pos + j) != load_out_data(e_off + j)) {
-                            same = 0u;
-                            break;
-                        }
-                        j = j + 1u;
-                    }
-                    if (same == 1u) {
-                        is_dup = 1u;
-                        break;
-                    }
+                let desc_base = emit_desc_base(e);
+                let prev_desc = emit_desc_words[desc_base + 0u];
+                let prev_sig0 = emit_desc_words[desc_base + 1u];
+                let prev_sig1 = emit_desc_words[desc_base + 2u];
+                if (entry_matches_src(pos, len, sig0, sig1, prev_desc, e_len, prev_sig0, prev_sig1)) {
+                    is_dup = 1u;
+                    break;
                 }
                 e = e + 1u;
             }
@@ -707,14 +768,10 @@ fn main(
 
             out_meta[1u + out_count * 2u] = data_cursor;
             out_meta[2u + out_count * 2u] = len;
-            var j = 0u;
-            loop {
-                if (j >= len) {
-                    break;
-                }
-                store_out_data(data_cursor + j, load_src(pos + j));
-                j = j + 1u;
-            }
+            let desc_base = emit_desc_base(out_count);
+            emit_desc_words[desc_base + 0u] = pos;
+            emit_desc_words[desc_base + 1u] = sig0;
+            emit_desc_words[desc_base + 2u] = sig1;
             data_cursor = data_cursor + len;
             out_count = out_count + 1u;
         }
@@ -723,6 +780,90 @@ fn main(
 
     out_meta[0] = out_count;
     out_meta[1u + max_entries * 2u] = data_cursor;
+}
+"#;
+
+const BUILD_TABLE_FINALIZE_EMIT_SHADER: &str = r#"
+@group(0) @binding(0) var<storage, read> src_words: array<u32>;
+@group(0) @binding(1) var<storage, read> table_meta: array<u32>;
+@group(0) @binding(2) var<storage, read> emit_desc_words: array<u32>;
+@group(0) @binding(3) var<storage, read> params: array<u32>;
+@group(0) @binding(4) var<storage, read_write> out_data: array<u32>;
+
+const FINALIZE_LITERAL_FLAG: u32 = 0x80000000u;
+const FINALIZE_EMIT_DESC_WORDS: u32 = 3u;
+
+fn load_src(idx: u32) -> u32 {
+    let w = src_words[idx >> 2u];
+    let shift = (idx & 3u) * 8u;
+    return (w >> shift) & 0xffu;
+}
+
+fn emit_desc_base(entry_idx: u32) -> u32 {
+    return entry_idx * FINALIZE_EMIT_DESC_WORDS;
+}
+
+fn emit_desc_is_literal(desc: u32) -> bool {
+    return (desc & FINALIZE_LITERAL_FLAG) != 0u;
+}
+
+fn emit_desc_literal_byte(desc: u32) -> u32 {
+    return desc & 0xffu;
+}
+
+fn read_output_byte(pos: u32, out_count: u32) -> u32 {
+    var entry_idx = 0u;
+    loop {
+        if (entry_idx >= out_count) {
+            break;
+        }
+        let meta_base = 1u + entry_idx * 2u;
+        let off = table_meta[meta_base];
+        let len = table_meta[meta_base + 1u];
+        if (pos >= off && pos < off + len) {
+            let desc = emit_desc_words[emit_desc_base(entry_idx)];
+            let local = pos - off;
+            if (emit_desc_is_literal(desc)) {
+                return emit_desc_literal_byte(desc);
+            }
+            return load_src(desc + local);
+        }
+        entry_idx = entry_idx + 1u;
+    }
+    return 0u;
+}
+
+@compute
+@workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let max_entries = params[4];
+    let data_total_idx = 1u + max_entries * 2u;
+    let used_bytes = table_meta[data_total_idx];
+    let used_words = (used_bytes + 3u) >> 2u;
+    let out_count = min(table_meta[0], max_entries);
+    let word_idx = gid3.x;
+    if (word_idx >= used_words) {
+        return;
+    }
+
+    let base = word_idx * 4u;
+    var b0 = 0u;
+    var b1 = 0u;
+    var b2 = 0u;
+    var b3 = 0u;
+    if (base < used_bytes) {
+        b0 = read_output_byte(base, out_count);
+    }
+    if (base + 1u < used_bytes) {
+        b1 = read_output_byte(base + 1u, out_count);
+    }
+    if (base + 2u < used_bytes) {
+        b2 = read_output_byte(base + 2u, out_count);
+    }
+    if (base + 3u < used_bytes) {
+        b3 = read_output_byte(base + 3u, out_count);
+    }
+    out_data[word_idx] = b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
 }
 "#;
 
@@ -2906,6 +3047,8 @@ struct GpuMatchRuntime {
     build_table_bucket_scatter_pipeline: wgpu::ComputePipeline,
     build_table_finalize_bind_group_layout: wgpu::BindGroupLayout,
     build_table_finalize_pipeline: wgpu::ComputePipeline,
+    build_table_finalize_emit_bind_group_layout: wgpu::BindGroupLayout,
+    build_table_finalize_emit_pipeline: wgpu::ComputePipeline,
     build_table_pack_index_bind_group_layout: wgpu::BindGroupLayout,
     build_table_pack_index_pipeline: wgpu::ComputePipeline,
     match_prepare_table_bind_group_layout: wgpu::BindGroupLayout,
@@ -5781,6 +5924,80 @@ fn init_runtime() -> Result<GpuMatchRuntime, String> {
             module: &build_table_finalize_shader,
             entry_point: "main",
         });
+    let build_table_finalize_emit_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cozip-pdeflate-build-table-finalize-emit-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+    let build_table_finalize_emit_shader =
+        device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cozip-pdeflate-build-table-finalize-emit-shader"),
+            source: wgpu::ShaderSource::Wgsl(BUILD_TABLE_FINALIZE_EMIT_SHADER.into()),
+        });
+    let build_table_finalize_emit_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("cozip-pdeflate-build-table-finalize-emit-pl"),
+            bind_group_layouts: &[&build_table_finalize_emit_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+    let build_table_finalize_emit_pipeline =
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("cozip-pdeflate-build-table-finalize-emit-pipeline"),
+            layout: Some(&build_table_finalize_emit_layout),
+            module: &build_table_finalize_emit_shader,
+            entry_point: "main",
+        });
     let build_table_pack_index_bind_group_layout =
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("cozip-pdeflate-build-table-pack-index-bgl"),
@@ -6169,6 +6386,8 @@ fn init_runtime() -> Result<GpuMatchRuntime, String> {
         build_table_bucket_scatter_pipeline,
         build_table_finalize_bind_group_layout,
         build_table_finalize_pipeline,
+        build_table_finalize_emit_bind_group_layout,
+        build_table_finalize_emit_pipeline,
         build_table_pack_index_bind_group_layout,
         build_table_pack_index_pipeline,
         match_prepare_table_bind_group_layout,
@@ -11125,6 +11344,12 @@ pub(crate) fn build_table_gpu_device(
     let table_data_bytes = u64::try_from(table_data_words)
         .map_err(|_| PDeflateError::NumericOverflow)?
         .saturating_mul(4);
+    let finalize_emit_desc_words = max_entries
+        .checked_mul(3)
+        .ok_or(PDeflateError::NumericOverflow)?;
+    let finalize_emit_desc_bytes = u64::try_from(finalize_emit_desc_words)
+        .map_err(|_| PDeflateError::NumericOverflow)?
+        .saturating_mul(4);
     let freq_params: [u32; 1] =
         [u32::try_from(chunk.len()).map_err(|_| PDeflateError::NumericOverflow)?];
     let freq_params_bytes = u64::try_from(freq_params.len())
@@ -11290,6 +11515,12 @@ pub(crate) fn build_table_gpu_device(
             | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    let finalize_emit_desc_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cozip-pdeflate-bt-finalize-emit-desc"),
+        size: finalize_emit_desc_bytes.max(4),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     let freq_bind_group = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("cozip-pdeflate-bt-freq-bg"),
         layout: &r.build_table_freq_bind_group_layout,
@@ -11418,6 +11649,32 @@ pub(crate) fn build_table_gpu_device(
             },
             wgpu::BindGroupEntry {
                 binding: 6,
+                resource: finalize_emit_desc_buffer.as_entire_binding(),
+            },
+        ],
+    });
+    let finalize_emit_bind_group = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("cozip-pdeflate-bt-finalize-emit-bg"),
+        layout: &r.build_table_finalize_emit_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: src_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: table_meta_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: finalize_emit_desc_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: finalize_params_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
                 resource: table_data_buffer.as_entire_binding(),
             },
         ],
@@ -11550,6 +11807,7 @@ pub(crate) fn build_table_gpu_device(
     encoder2.clear_buffer(&table_meta_buffer, 0, None);
     encoder2.clear_buffer(&table_data_buffer, 0, None);
     encoder2.clear_buffer(&table_index_buffer, 0, None);
+    encoder2.clear_buffer(&finalize_emit_desc_buffer, 0, None);
     let t_bucket_prefix = Instant::now();
     if let Some(query_set) = stage_probe_query_set.as_ref() {
         encoder2.write_timestamp(query_set, 6);
@@ -11596,6 +11854,19 @@ pub(crate) fn build_table_gpu_device(
         pass.set_pipeline(&r.build_table_finalize_pipeline);
         pass.set_bind_group(0, &finalize_bind_group, &[]);
         pass.dispatch_workgroups(1, 1, 1);
+    }
+    {
+        let emit_groups = u32::try_from(table_data_words)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .div_ceil(256)
+            .max(1);
+        let mut pass = encoder2.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("cozip-pdeflate-bt-finalize-emit-pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&r.build_table_finalize_emit_pipeline);
+        pass.set_bind_group(0, &finalize_emit_bind_group, &[]);
+        pass.dispatch_workgroups(emit_groups, 1, 1);
     }
     if let Some(query_set) = stage_probe_query_set.as_ref() {
         encoder2.write_timestamp(query_set, 11);
