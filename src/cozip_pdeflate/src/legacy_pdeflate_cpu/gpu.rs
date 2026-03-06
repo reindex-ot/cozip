@@ -2995,9 +2995,12 @@ pub(crate) struct GpuPackedTable {
 }
 
 pub(crate) struct GpuPackedTableDevice {
-    pub(crate) table_index_buffer: wgpu::Buffer,
-    pub(crate) table_data_buffer: wgpu::Buffer,
-    pub(crate) table_meta_buffer: wgpu::Buffer,
+    pub(crate) table_index_buffer: Arc<wgpu::Buffer>,
+    pub(crate) table_data_buffer: Arc<wgpu::Buffer>,
+    pub(crate) table_meta_buffer: Arc<wgpu::Buffer>,
+    pub(crate) table_index_offset: u64,
+    pub(crate) table_data_offset: u64,
+    pub(crate) table_meta_offset: u64,
     pub(crate) table_count: usize,
     pub(crate) table_index_len: usize,
     pub(crate) table_data_len: usize,
@@ -6709,6 +6712,7 @@ fn pack_bytes_to_words(bytes: &[u8]) -> Vec<u32> {
 fn readback_table_sizes_from_meta_buffer(
     runtime: &GpuMatchRuntime,
     table_meta_buffer: &wgpu::Buffer,
+    table_meta_offset: u64,
     max_entries: usize,
     table_data_bytes_cap: usize,
 ) -> Result<(usize, usize, usize), PDeflateError> {
@@ -6733,12 +6737,16 @@ fn readback_table_sizes_from_meta_buffer(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("cozip-pdeflate-bt-size-readback-encoder"),
         });
-    encoder.copy_buffer_to_buffer(table_meta_buffer, 0, &readback_sizes, 0, 4);
+    encoder.copy_buffer_to_buffer(table_meta_buffer, table_meta_offset, &readback_sizes, 0, 4);
     encoder.copy_buffer_to_buffer(
         table_meta_buffer,
-        u64::try_from(data_total_idx)
-            .map_err(|_| PDeflateError::NumericOverflow)?
-            .saturating_mul(4),
+        table_meta_offset
+            .checked_add(
+                u64::try_from(data_total_idx)
+                    .map_err(|_| PDeflateError::NumericOverflow)?
+                    .saturating_mul(4),
+            )
+            .ok_or(PDeflateError::NumericOverflow)?,
         &readback_sizes,
         4,
         4,
@@ -11236,9 +11244,12 @@ pub(crate) fn upload_packed_table_device(
         mapped_at_creation: false,
     });
     Ok(GpuPackedTableDevice {
-        table_index_buffer,
-        table_data_buffer,
-        table_meta_buffer,
+        table_index_buffer: Arc::new(table_index_buffer),
+        table_data_buffer: Arc::new(table_data_buffer),
+        table_meta_buffer: Arc::new(table_meta_buffer),
+        table_index_offset: 0,
+        table_data_offset: 0,
+        table_meta_offset: 0,
         table_count,
         table_index_len: table_index.len(),
         table_data_len: table_data.len(),
@@ -11266,21 +11277,24 @@ pub(crate) fn build_table_gpu_device(
     if chunk.len() < 3 || max_entries == 0 {
         return Ok((
             GpuPackedTableDevice {
-                table_index_buffer: storage_upload_buffer(
+                table_index_buffer: Arc::new(storage_upload_buffer(
                     &r.device,
                     "cozip-pdeflate-bt-empty-table-index",
                     4,
-                ),
-                table_data_buffer: storage_upload_buffer(
+                )),
+                table_data_buffer: Arc::new(storage_upload_buffer(
                     &r.device,
                     "cozip-pdeflate-bt-empty-table-data",
                     4,
-                ),
-                table_meta_buffer: storage_upload_buffer(
+                )),
+                table_meta_buffer: Arc::new(storage_upload_buffer(
                     &r.device,
                     "cozip-pdeflate-bt-empty-table-meta",
                     4,
-                ),
+                )),
+                table_index_offset: 0,
+                table_data_offset: 0,
+                table_meta_offset: 0,
                 table_count: 0,
                 table_index_len: 0,
                 table_data_len: 0,
@@ -12021,9 +12035,12 @@ pub(crate) fn build_table_gpu_device(
     }
     Ok((
         GpuPackedTableDevice {
-            table_index_buffer,
-            table_data_buffer,
-            table_meta_buffer,
+            table_index_buffer: Arc::new(table_index_buffer),
+            table_data_buffer: Arc::new(table_data_buffer),
+            table_meta_buffer: Arc::new(table_meta_buffer),
+            table_index_offset: 0,
+            table_data_offset: 0,
+            table_meta_offset: 0,
             table_count: 0,
             table_index_len: 0,
             table_data_len: 0,
@@ -12062,6 +12079,889 @@ pub(crate) fn build_table_gpu_device(
     ))
 }
 
+pub(crate) fn build_table_gpu_device_batch(
+    chunks: &[&[u8]],
+    max_entries: usize,
+    max_entry_len: usize,
+    min_ref_len: usize,
+    match_probe_limit: usize,
+    hash_history_limit: usize,
+    table_sample_stride: usize,
+) -> Result<Vec<(GpuPackedTableDevice, GpuBuildTableProfile)>, PDeflateError> {
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+    if chunks.len() == 1 {
+        return build_table_gpu_device(
+            chunks[0],
+            max_entries,
+            max_entry_len,
+            min_ref_len,
+            match_probe_limit,
+            hash_history_limit,
+            table_sample_stride,
+        )
+        .map(|one| vec![one]);
+    }
+
+    struct BatchChunkDesc {
+        chunk_len: usize,
+        sample_count: usize,
+        src_word_offset: usize,
+        freq_word_offset: usize,
+        cand_word_offset: usize,
+        bucket_word_offset: usize,
+        sorted_idx_word_offset: usize,
+        meta_word_offset: usize,
+        data_word_offset: usize,
+        index_word_offset: usize,
+        emit_desc_word_offset: usize,
+        freq_param_word_offset: usize,
+        cand_param_word_offset: usize,
+        bucket_param_word_offset: usize,
+        finalize_param_word_offset: usize,
+        cand_groups: u32,
+        emit_groups: u32,
+        max_entry_len: usize,
+        table_data_bytes_cap: usize,
+        build_id: u64,
+    }
+
+    fn binding_resource<'a>(
+        buffer: &'a wgpu::Buffer,
+        offset: u64,
+        size: u64,
+    ) -> wgpu::BindingResource<'a> {
+        wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer,
+            offset,
+            size: Some(std::num::NonZeroU64::new(size.max(4)).unwrap()),
+        })
+    }
+
+    let t_total_build = Instant::now();
+    let r = runtime()?;
+    let capped_max_entry_len = max_entry_len.min(254).max(3);
+    let sample_stride = table_sample_stride.max(1).saturating_mul(8);
+    let min_seed_match_len = min_ref_len.max(6).min(capped_max_entry_len);
+    let history_limit = hash_history_limit.max(1).min(64);
+    let probe_limit = match_probe_limit.max(1).min(8);
+    let align_words32 = |v: usize| -> usize { (v + 7) & !7 };
+    let build_id_base = BUILD_TABLE_DEVICE_SEQ
+        .fetch_add(
+            u64::try_from(chunks.len()).map_err(|_| PDeflateError::NumericOverflow)?,
+            Ordering::Relaxed,
+        )
+        .saturating_add(1);
+
+    let t_pre_resource = Instant::now();
+    let mut src_words = Vec::<u32>::new();
+    let mut descs = Vec::<BatchChunkDesc>::with_capacity(chunks.len());
+    let mut total_src_word_offset = 0usize;
+    let mut total_freq_words = 0usize;
+    let mut total_cand_words = 0usize;
+    let mut total_bucket_words = 0usize;
+    let mut total_sorted_idx_words = 0usize;
+    let mut total_meta_words = 0usize;
+    let mut total_data_words = 0usize;
+    let mut total_index_words = 0usize;
+    let mut total_emit_desc_words = 0usize;
+    let mut total_freq_param_words = 0usize;
+    let mut total_cand_param_words = 0usize;
+    let mut total_bucket_param_words = 0usize;
+    let mut total_finalize_param_words = 0usize;
+    for (idx, chunk) in chunks.iter().copied().enumerate() {
+        if chunk.len() < 3 || max_entries == 0 {
+            return Err(PDeflateError::InvalidOptions(
+                "gpu table build batch requires chunks >= 3 bytes and max_entries > 0",
+            ));
+        }
+        let sample_count = (chunk.len() - 2).div_ceil(sample_stride);
+        let chunk_src_words = pack_bytes_to_words(chunk);
+        total_src_word_offset = align_words32(total_src_word_offset);
+        total_freq_words = align_words32(total_freq_words);
+        total_cand_words = align_words32(total_cand_words);
+        total_bucket_words = align_words32(total_bucket_words);
+        total_sorted_idx_words = align_words32(total_sorted_idx_words);
+        total_meta_words = align_words32(total_meta_words);
+        total_data_words = align_words32(total_data_words);
+        total_index_words = align_words32(total_index_words);
+        total_emit_desc_words = align_words32(total_emit_desc_words);
+        total_freq_param_words = align_words32(total_freq_param_words);
+        total_cand_param_words = align_words32(total_cand_param_words);
+        total_bucket_param_words = align_words32(total_bucket_param_words);
+        total_finalize_param_words = align_words32(total_finalize_param_words);
+        if src_words.len() < total_src_word_offset {
+            src_words.resize(total_src_word_offset, 0);
+        }
+        src_words.extend_from_slice(&chunk_src_words);
+        let cand_words = sample_count
+            .checked_mul(4)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        let table_data_bytes_cap = max_entries
+            .checked_mul(capped_max_entry_len)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        let table_data_words = table_data_bytes_cap.div_ceil(4);
+        let table_meta_words = 2usize
+            .checked_add(
+                max_entries
+                    .checked_mul(2)
+                    .ok_or(PDeflateError::NumericOverflow)?,
+            )
+            .ok_or(PDeflateError::NumericOverflow)?;
+        let emit_desc_words = max_entries
+            .checked_mul(3)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        let cand_groups = u32::try_from(sample_count)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .div_ceil(128)
+            .max(1);
+        let emit_groups = u32::try_from(table_data_words)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .div_ceil(256)
+            .max(1);
+        descs.push(BatchChunkDesc {
+            chunk_len: chunk.len(),
+            sample_count,
+            src_word_offset: total_src_word_offset,
+            freq_word_offset: total_freq_words,
+            cand_word_offset: total_cand_words,
+            bucket_word_offset: total_bucket_words,
+            sorted_idx_word_offset: total_sorted_idx_words,
+            meta_word_offset: total_meta_words,
+            data_word_offset: total_data_words,
+            index_word_offset: total_index_words,
+            emit_desc_word_offset: total_emit_desc_words,
+            freq_param_word_offset: total_freq_param_words,
+            cand_param_word_offset: total_cand_param_words,
+            bucket_param_word_offset: total_bucket_param_words,
+            finalize_param_word_offset: total_finalize_param_words,
+            cand_groups,
+            emit_groups,
+            max_entry_len: capped_max_entry_len,
+            table_data_bytes_cap,
+            build_id: build_id_base.saturating_add(
+                u64::try_from(idx).map_err(|_| PDeflateError::NumericOverflow)?,
+            ),
+        });
+        total_src_word_offset = total_src_word_offset
+            .checked_add(chunk_src_words.len())
+            .ok_or(PDeflateError::NumericOverflow)?;
+        total_freq_words = total_freq_words
+            .checked_add(256)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        total_cand_words = total_cand_words
+            .checked_add(cand_words)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        total_bucket_words = total_bucket_words
+            .checked_add(BUILD_TABLE_SORT_BUCKETS)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        total_sorted_idx_words = total_sorted_idx_words
+            .checked_add(sample_count)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        total_meta_words = total_meta_words
+            .checked_add(table_meta_words)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        total_data_words = total_data_words
+            .checked_add(table_data_words)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        total_index_words = total_index_words
+            .checked_add(max_entries.div_ceil(4))
+            .ok_or(PDeflateError::NumericOverflow)?;
+        total_emit_desc_words = total_emit_desc_words
+            .checked_add(emit_desc_words)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        total_freq_param_words = total_freq_param_words
+            .checked_add(1)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        total_cand_param_words = total_cand_param_words
+            .checked_add(7)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        total_bucket_param_words = total_bucket_param_words
+            .checked_add(1)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        total_finalize_param_words = total_finalize_param_words
+            .checked_add(8)
+            .ok_or(PDeflateError::NumericOverflow)?;
+    }
+    let pre_resource_ms = elapsed_ms(t_pre_resource);
+
+    let t_resource_setup = Instant::now();
+    let src_buffer = storage_upload_buffer(
+        &r.device,
+        "cozip-pdeflate-bt-batch-src",
+        u64::try_from(src_words.len())
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4),
+    );
+    let freq_params_buffer = storage_upload_buffer(
+        &r.device,
+        "cozip-pdeflate-bt-batch-freq-params",
+        u64::try_from(total_freq_param_words)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4),
+    );
+    let cand_params_buffer = storage_upload_buffer(
+        &r.device,
+        "cozip-pdeflate-bt-batch-cand-params",
+        u64::try_from(total_cand_param_words)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4),
+    );
+    let bucket_params_buffer = storage_upload_buffer(
+        &r.device,
+        "cozip-pdeflate-bt-batch-bucket-params",
+        u64::try_from(total_bucket_param_words)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4),
+    );
+    let finalize_params_buffer = storage_upload_buffer(
+        &r.device,
+        "cozip-pdeflate-bt-batch-finalize-params",
+        u64::try_from(total_finalize_param_words)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4),
+    );
+    let freq_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cozip-pdeflate-bt-batch-freq"),
+        size: u64::try_from(total_freq_words)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4)
+            .max(4),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let cand_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cozip-pdeflate-bt-batch-cand"),
+        size: u64::try_from(total_cand_words)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4)
+            .max(4),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let bucket_count_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cozip-pdeflate-bt-batch-bucket-count"),
+        size: u64::try_from(total_bucket_words)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4)
+            .max(4),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let bucket_offset_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cozip-pdeflate-bt-batch-bucket-offset"),
+        size: u64::try_from(total_bucket_words)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4)
+            .max(4),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let bucket_cursor_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cozip-pdeflate-bt-batch-bucket-cursor"),
+        size: u64::try_from(total_bucket_words)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4)
+            .max(4),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let sorted_idx_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cozip-pdeflate-bt-batch-sorted-idx"),
+        size: u64::try_from(total_sorted_idx_words)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4)
+            .max(4),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let table_meta_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cozip-pdeflate-bt-batch-table-meta"),
+        size: u64::try_from(total_meta_words)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4)
+            .max(4),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let table_data_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cozip-pdeflate-bt-batch-table-data"),
+        size: u64::try_from(total_data_words)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4)
+            .max(4),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let table_index_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cozip-pdeflate-bt-batch-table-index"),
+        size: u64::try_from(total_index_words)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4)
+            .max(4),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let emit_desc_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cozip-pdeflate-bt-batch-emit-desc"),
+        size: u64::try_from(total_emit_desc_words)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4)
+            .max(4),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let resource_setup_ms = elapsed_ms(t_resource_setup);
+
+    let mut freq_params_words = vec![0u32; total_freq_param_words];
+    let mut cand_params_words = vec![0u32; total_cand_param_words];
+    let mut bucket_params_words = vec![0u32; total_bucket_param_words];
+    let mut finalize_params_words = vec![0u32; total_finalize_param_words];
+    for desc in &descs {
+        freq_params_words[desc.freq_param_word_offset] =
+            u32::try_from(desc.chunk_len).map_err(|_| PDeflateError::NumericOverflow)?;
+        let cand_base = desc.cand_param_word_offset;
+        cand_params_words[cand_base + 0] =
+            u32::try_from(desc.chunk_len).map_err(|_| PDeflateError::NumericOverflow)?;
+        cand_params_words[cand_base + 1] =
+            u32::try_from(sample_stride).map_err(|_| PDeflateError::NumericOverflow)?;
+        cand_params_words[cand_base + 2] =
+            u32::try_from(desc.max_entry_len).map_err(|_| PDeflateError::NumericOverflow)?;
+        cand_params_words[cand_base + 3] =
+            u32::try_from(min_seed_match_len).map_err(|_| PDeflateError::NumericOverflow)?;
+        cand_params_words[cand_base + 4] =
+            u32::try_from(history_limit).map_err(|_| PDeflateError::NumericOverflow)?;
+        cand_params_words[cand_base + 5] =
+            u32::try_from(probe_limit).map_err(|_| PDeflateError::NumericOverflow)?;
+        cand_params_words[cand_base + 6] =
+            u32::try_from(desc.sample_count).map_err(|_| PDeflateError::NumericOverflow)?;
+        bucket_params_words[desc.bucket_param_word_offset] =
+            u32::try_from(desc.sample_count).map_err(|_| PDeflateError::NumericOverflow)?;
+        let finalize_base = desc.finalize_param_word_offset;
+        finalize_params_words[finalize_base + 0] =
+            u32::try_from(desc.chunk_len).map_err(|_| PDeflateError::NumericOverflow)?;
+        finalize_params_words[finalize_base + 1] =
+            u32::try_from(desc.sample_count).map_err(|_| PDeflateError::NumericOverflow)?;
+        finalize_params_words[finalize_base + 2] = 0;
+        finalize_params_words[finalize_base + 3] =
+            u32::try_from(desc.max_entry_len).map_err(|_| PDeflateError::NumericOverflow)?;
+        finalize_params_words[finalize_base + 4] =
+            u32::try_from(max_entries).map_err(|_| PDeflateError::NumericOverflow)?;
+        finalize_params_words[finalize_base + 5] = 64;
+        finalize_params_words[finalize_base + 6] = 8;
+        finalize_params_words[finalize_base + 7] =
+            u32::try_from(desc.table_data_bytes_cap).map_err(|_| PDeflateError::NumericOverflow)?;
+    }
+
+    let t_upload = Instant::now();
+    r.queue
+        .write_buffer(&src_buffer, 0, bytemuck::cast_slice(&src_words));
+    r.queue
+        .write_buffer(&freq_params_buffer, 0, bytemuck::cast_slice(&freq_params_words));
+    r.queue
+        .write_buffer(&cand_params_buffer, 0, bytemuck::cast_slice(&cand_params_words));
+    r.queue.write_buffer(
+        &bucket_params_buffer,
+        0,
+        bytemuck::cast_slice(&bucket_params_words),
+    );
+    r.queue.write_buffer(
+        &finalize_params_buffer,
+        0,
+        bytemuck::cast_slice(&finalize_params_words),
+    );
+    let upload_ms = elapsed_ms(t_upload);
+
+    struct BatchBindGroups {
+        freq: wgpu::BindGroup,
+        candidate: wgpu::BindGroup,
+        bucket_count: wgpu::BindGroup,
+        bucket_prefix: wgpu::BindGroup,
+        bucket_scatter: wgpu::BindGroup,
+        finalize: wgpu::BindGroup,
+        finalize_emit: wgpu::BindGroup,
+        pack_index: wgpu::BindGroup,
+        cand_groups: u32,
+        emit_groups: u32,
+    }
+
+    let t_encode = Instant::now();
+    let mut groups = Vec::<BatchBindGroups>::with_capacity(descs.len());
+    for desc in &descs {
+        let src_offset = u64::try_from(desc.src_word_offset)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        let src_size = u64::try_from(desc.chunk_len.div_ceil(4))
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        let freq_size = 256_u64.saturating_mul(4);
+        let freq_offset = u64::try_from(desc.freq_word_offset)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        let cand_offset = u64::try_from(desc.cand_word_offset)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        let cand_size = u64::try_from(
+            desc.sample_count
+                .checked_mul(4)
+                .ok_or(PDeflateError::NumericOverflow)?,
+        )
+        .map_err(|_| PDeflateError::NumericOverflow)?
+        .saturating_mul(4);
+        let bucket_offset = u64::try_from(desc.bucket_word_offset)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        let bucket_size = u64::try_from(BUILD_TABLE_SORT_BUCKETS)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        let sorted_idx_offset = u64::try_from(desc.sorted_idx_word_offset)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        let sorted_idx_size = u64::try_from(desc.sample_count)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        let meta_offset = u64::try_from(desc.meta_word_offset)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        let meta_size = u64::try_from(
+            2usize
+                .checked_add(
+                    max_entries
+                        .checked_mul(2)
+                        .ok_or(PDeflateError::NumericOverflow)?,
+                )
+                .ok_or(PDeflateError::NumericOverflow)?,
+        )
+        .map_err(|_| PDeflateError::NumericOverflow)?
+        .saturating_mul(4);
+        let data_offset = u64::try_from(desc.data_word_offset)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        let data_size = u64::try_from(desc.table_data_bytes_cap.div_ceil(4))
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        let index_offset = u64::try_from(desc.index_word_offset)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        let index_size = u64::try_from(max_entries.div_ceil(4))
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        let emit_desc_offset = u64::try_from(desc.emit_desc_word_offset)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        let emit_desc_size = u64::try_from(
+            max_entries
+                .checked_mul(3)
+                .ok_or(PDeflateError::NumericOverflow)?,
+        )
+        .map_err(|_| PDeflateError::NumericOverflow)?
+        .saturating_mul(4);
+        let freq_param_offset = u64::try_from(desc.freq_param_word_offset)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        let cand_param_offset = u64::try_from(desc.cand_param_word_offset)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        let bucket_param_offset = u64::try_from(desc.bucket_param_word_offset)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        let finalize_param_offset = u64::try_from(desc.finalize_param_word_offset)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+
+        let freq = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-pdeflate-bt-batch-freq-bg"),
+            layout: &r.build_table_freq_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: binding_resource(&src_buffer, src_offset, src_size),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: binding_resource(&freq_params_buffer, freq_param_offset, 4),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: binding_resource(&freq_buffer, freq_offset, freq_size),
+                },
+            ],
+        });
+        let candidate = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-pdeflate-bt-batch-cand-bg"),
+            layout: &r.build_table_candidate_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: binding_resource(&src_buffer, src_offset, src_size),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: binding_resource(&cand_params_buffer, cand_param_offset, 28),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: binding_resource(&cand_buffer, cand_offset, cand_size),
+                },
+            ],
+        });
+        let bucket_count = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-pdeflate-bt-batch-bucket-count-bg"),
+            layout: &r.build_table_bucket_count_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: binding_resource(&cand_buffer, cand_offset, cand_size),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: binding_resource(&bucket_params_buffer, bucket_param_offset, 4),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: binding_resource(&bucket_count_buffer, bucket_offset, bucket_size),
+                },
+            ],
+        });
+        let bucket_prefix = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-pdeflate-bt-batch-bucket-prefix-bg"),
+            layout: &r.build_table_bucket_prefix_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: binding_resource(&bucket_count_buffer, bucket_offset, bucket_size),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: binding_resource(&bucket_offset_buffer, bucket_offset, bucket_size),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: binding_resource(&finalize_params_buffer, finalize_param_offset, 32),
+                },
+            ],
+        });
+        let bucket_scatter = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-pdeflate-bt-batch-bucket-scatter-bg"),
+            layout: &r.build_table_bucket_scatter_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: binding_resource(&cand_buffer, cand_offset, cand_size),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: binding_resource(&bucket_params_buffer, bucket_param_offset, 4),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: binding_resource(&bucket_offset_buffer, bucket_offset, bucket_size),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: binding_resource(&bucket_cursor_buffer, bucket_offset, bucket_size),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: binding_resource(&sorted_idx_buffer, sorted_idx_offset, sorted_idx_size),
+                },
+            ],
+        });
+        let finalize = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-pdeflate-bt-batch-finalize-bg"),
+            layout: &r.build_table_finalize_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: binding_resource(&src_buffer, src_offset, src_size),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: binding_resource(&freq_buffer, freq_offset, freq_size),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: binding_resource(&cand_buffer, cand_offset, cand_size),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: binding_resource(&sorted_idx_buffer, sorted_idx_offset, sorted_idx_size),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: binding_resource(&finalize_params_buffer, finalize_param_offset, 32),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: binding_resource(&table_meta_buffer, meta_offset, meta_size),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: binding_resource(&emit_desc_buffer, emit_desc_offset, emit_desc_size),
+                },
+            ],
+        });
+        let finalize_emit = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-pdeflate-bt-batch-finalize-emit-bg"),
+            layout: &r.build_table_finalize_emit_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: binding_resource(&src_buffer, src_offset, src_size),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: binding_resource(&table_meta_buffer, meta_offset, meta_size),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: binding_resource(&emit_desc_buffer, emit_desc_offset, emit_desc_size),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: binding_resource(&finalize_params_buffer, finalize_param_offset, 32),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: binding_resource(&table_data_buffer, data_offset, data_size),
+                },
+            ],
+        });
+        let pack_index = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-pdeflate-bt-batch-pack-index-bg"),
+            layout: &r.build_table_pack_index_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: binding_resource(&table_meta_buffer, meta_offset, meta_size),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: binding_resource(&finalize_params_buffer, finalize_param_offset, 32),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: binding_resource(&table_index_buffer, index_offset, index_size),
+                },
+            ],
+        });
+        groups.push(BatchBindGroups {
+            freq,
+            candidate,
+            bucket_count,
+            bucket_prefix,
+            bucket_scatter,
+            finalize,
+            finalize_emit,
+            pack_index,
+            cand_groups: desc.cand_groups,
+            emit_groups: desc.emit_groups,
+        });
+    }
+    let encode_setup_ms = elapsed_ms(t_encode);
+
+    let t_encode_pass1 = Instant::now();
+    let mut encoder = r
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("cozip-pdeflate-bt-batch-encoder"),
+        });
+    encoder.clear_buffer(&freq_buffer, 0, None);
+    encoder.clear_buffer(&cand_buffer, 0, None);
+    encoder.clear_buffer(&bucket_count_buffer, 0, None);
+    encoder.clear_buffer(&bucket_offset_buffer, 0, None);
+    encoder.clear_buffer(&bucket_cursor_buffer, 0, None);
+    encoder.clear_buffer(&sorted_idx_buffer, 0, None);
+    encoder.clear_buffer(&table_meta_buffer, 0, None);
+    encoder.clear_buffer(&table_data_buffer, 0, None);
+    encoder.clear_buffer(&table_index_buffer, 0, None);
+    encoder.clear_buffer(&emit_desc_buffer, 0, None);
+    for (group, desc) in groups.iter().zip(descs.iter()) {
+        let freq_groups = u32::try_from(desc.chunk_len)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .div_ceil(256)
+            .max(1);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cozip-pdeflate-bt-batch-freq-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&r.build_table_freq_pipeline);
+            pass.set_bind_group(0, &group.freq, &[]);
+            pass.dispatch_workgroups(freq_groups, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cozip-pdeflate-bt-batch-candidate-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&r.build_table_candidate_pipeline);
+            pass.set_bind_group(0, &group.candidate, &[]);
+            pass.dispatch_workgroups(group.cand_groups, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cozip-pdeflate-bt-batch-bucket-count-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&r.build_table_bucket_count_pipeline);
+            pass.set_bind_group(0, &group.bucket_count, &[]);
+            pass.dispatch_workgroups(group.cand_groups, 1, 1);
+        }
+    }
+    let encode_pass1_ms = elapsed_ms(t_encode_pass1);
+
+    let t_encode_pass2 = Instant::now();
+    for group in &groups {
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cozip-pdeflate-bt-batch-bucket-prefix-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&r.build_table_bucket_prefix_pipeline);
+            pass.set_bind_group(0, &group.bucket_prefix, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cozip-pdeflate-bt-batch-bucket-scatter-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&r.build_table_bucket_scatter_pipeline);
+            pass.set_bind_group(0, &group.bucket_scatter, &[]);
+            pass.dispatch_workgroups(group.cand_groups, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cozip-pdeflate-bt-batch-finalize-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&r.build_table_finalize_pipeline);
+            pass.set_bind_group(0, &group.finalize, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cozip-pdeflate-bt-batch-finalize-emit-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&r.build_table_finalize_emit_pipeline);
+            pass.set_bind_group(0, &group.finalize_emit, &[]);
+            pass.dispatch_workgroups(group.emit_groups, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cozip-pdeflate-bt-batch-pack-index-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&r.build_table_pack_index_pipeline);
+            pass.set_bind_group(0, &group.pack_index, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+    }
+    let encode_pass2_ms = elapsed_ms(t_encode_pass2);
+
+    let t_submit = Instant::now();
+    let pass1_submit_seq = next_gpu_submit_seq();
+    let pass2_submit_seq = pass1_submit_seq;
+    let submission = r.queue.submit(Some(encoder.finish()));
+    let submit_ms = elapsed_ms(t_submit);
+    let t_wait = Instant::now();
+    r.device.poll(wgpu::Maintain::wait_for(submission.clone()));
+    let wait_ms = elapsed_ms(t_wait);
+    let total_build_ms = elapsed_ms(t_total_build);
+
+    let chunk_count_f = chunks.len() as f64;
+    let avg_total_ms = total_build_ms / chunk_count_f;
+    let avg_pre_resource_ms = pre_resource_ms / chunk_count_f;
+    let avg_resource_setup_ms = resource_setup_ms / chunk_count_f;
+    let avg_upload_ms = upload_ms / chunk_count_f;
+    let avg_encode_setup_ms = encode_setup_ms / chunk_count_f;
+    let avg_encode_pass1_ms = encode_pass1_ms / chunk_count_f;
+    let avg_encode_pass2_ms = encode_pass2_ms / chunk_count_f;
+    let avg_submit_ms = submit_ms / chunk_count_f;
+    let avg_wait_ms = wait_ms / chunk_count_f;
+    let table_index_buffer = Arc::new(table_index_buffer);
+    let table_data_buffer = Arc::new(table_data_buffer);
+    let table_meta_buffer = Arc::new(table_meta_buffer);
+
+    let mut out = Vec::with_capacity(descs.len());
+    for desc in descs {
+        out.push((
+            GpuPackedTableDevice {
+                table_index_buffer: Arc::clone(&table_index_buffer),
+                table_data_buffer: Arc::clone(&table_data_buffer),
+                table_meta_buffer: Arc::clone(&table_meta_buffer),
+                table_index_offset: u64::try_from(desc.index_word_offset)
+                    .map_err(|_| PDeflateError::NumericOverflow)?
+                    .saturating_mul(4),
+                table_data_offset: u64::try_from(desc.data_word_offset)
+                    .map_err(|_| PDeflateError::NumericOverflow)?
+                    .saturating_mul(4),
+                table_meta_offset: u64::try_from(desc.meta_word_offset)
+                    .map_err(|_| PDeflateError::NumericOverflow)?
+                    .saturating_mul(4),
+                table_count: 0,
+                table_index_len: 0,
+                table_data_len: 0,
+                sizes_known: false,
+                max_entries,
+                table_data_bytes_cap: desc.table_data_bytes_cap,
+                build_id: desc.build_id,
+                build_submit_seq: pass2_submit_seq,
+                build_submit_index: Some(submission.clone()),
+                build_breakdown: GpuTableBuildBreakdown {
+                    total_ms: avg_total_ms,
+                    pre_resource_ms: avg_pre_resource_ms,
+                    resource_setup_ms: avg_resource_setup_ms,
+                    upload_ms: avg_upload_ms,
+                    encode_pass1_ms: avg_encode_pass1_ms,
+                    submit_pass1_ms: 0.0,
+                    encode_pass2_ms: avg_encode_pass2_ms + avg_encode_setup_ms,
+                    submit_pass2_ms: avg_submit_ms,
+                    stage_probe_submit_ms: 0.0,
+                    stage_probe_wait_ms: avg_wait_ms,
+                    stage_probe_parse_ms: 0.0,
+                    stage_gpu_sum_ms: avg_wait_ms,
+                    tail_ms: 0.0,
+                    other_ms: avg_pre_resource_ms,
+                },
+            },
+            GpuBuildTableProfile {
+                upload_ms: avg_upload_ms,
+                freq_kernel_ms: 0.0,
+                candidate_kernel_ms: 0.0,
+                readback_ms: avg_wait_ms,
+                materialize_ms: 0.0,
+                sort_ms: 0.0,
+                sample_count: desc.sample_count,
+            },
+        ));
+    }
+    Ok(out)
+}
+
 fn resolve_packed_table_sizes(
     packed: &GpuPackedTableDevice,
 ) -> Result<(usize, usize, usize), PDeflateError> {
@@ -12079,6 +12979,7 @@ fn resolve_packed_table_sizes(
     readback_table_sizes_from_meta_buffer(
         r,
         &packed.table_meta_buffer,
+        packed.table_meta_offset,
         packed.max_entries,
         packed.table_data_bytes_cap,
     )
@@ -12200,12 +13101,23 @@ fn resolve_packed_table_sizes_batch(
                     .ok_or(PDeflateError::NumericOverflow)?,
             )
             .ok_or(PDeflateError::NumericOverflow)?;
-        encoder.copy_buffer_to_buffer(&packed.table_meta_buffer, 0, &readback, dst, 4);
         encoder.copy_buffer_to_buffer(
             &packed.table_meta_buffer,
-            u64::try_from(data_total_idx)
-                .map_err(|_| PDeflateError::NumericOverflow)?
-                .saturating_mul(4),
+            packed.table_meta_offset,
+            &readback,
+            dst,
+            4,
+        );
+        encoder.copy_buffer_to_buffer(
+            &packed.table_meta_buffer,
+            packed
+                .table_meta_offset
+                .checked_add(
+                    u64::try_from(data_total_idx)
+                        .map_err(|_| PDeflateError::NumericOverflow)?
+                        .saturating_mul(4),
+                )
+                .ok_or(PDeflateError::NumericOverflow)?,
             &readback,
             dst + 4,
             4,
@@ -12380,7 +13292,7 @@ pub(crate) fn readback_packed_table_device(
         if index_copy_bytes > 0 {
             encoder.copy_buffer_to_buffer(
                 &packed.table_index_buffer,
-                0,
+                packed.table_index_offset,
                 &readback,
                 0,
                 index_copy_bytes,
@@ -12389,7 +13301,7 @@ pub(crate) fn readback_packed_table_device(
         if data_copy_bytes > 0 {
             encoder.copy_buffer_to_buffer(
                 &packed.table_data_buffer,
-                0,
+                packed.table_data_offset,
                 &readback,
                 index_copy_bytes,
                 data_copy_bytes,
@@ -12485,6 +13397,8 @@ struct PackedBatchInputs<'a> {
 struct PackedTableDeviceCopy<'a> {
     index_src: &'a wgpu::Buffer,
     data_src: &'a wgpu::Buffer,
+    index_src_offset: u64,
+    data_src_offset: u64,
     index_dst_offset: u64,
     data_dst_offset: u64,
     index_len: usize,
@@ -12493,6 +13407,7 @@ struct PackedTableDeviceCopy<'a> {
 
 struct PackedTableMetaDeviceCopy<'a> {
     meta_src: &'a wgpu::Buffer,
+    src_count_offset: u64,
     dst_count_offset: u64,
     dst_data_total_offset: u64,
     src_data_total_offset: u64,
@@ -12518,6 +13433,8 @@ enum PackedTableUploadKind<'a> {
     Device {
         index_buffer: &'a wgpu::Buffer,
         data_buffer: &'a wgpu::Buffer,
+        index_offset: u64,
+        data_offset: u64,
     },
 }
 
@@ -12647,9 +13564,13 @@ fn pack_match_batch_inputs<'a>(
                         .saturating_mul(4);
                     table_meta_device_copies.push(PackedTableMetaDeviceCopy {
                         meta_src: &table_gpu.table_meta_buffer,
+                        src_count_offset: table_gpu.table_meta_offset,
                         dst_count_offset,
                         dst_data_total_offset,
-                        src_data_total_offset,
+                        src_data_total_offset: table_gpu
+                            .table_meta_offset
+                            .checked_add(src_data_total_offset)
+                            .ok_or(PDeflateError::NumericOverflow)?,
                     });
                 }
                 (
@@ -12658,6 +13579,8 @@ fn pack_match_batch_inputs<'a>(
                     PackedTableUploadKind::Device {
                         index_buffer: &table_gpu.table_index_buffer,
                         data_buffer: &table_gpu.table_data_buffer,
+                        index_offset: table_gpu.table_index_offset,
+                        data_offset: table_gpu.table_data_offset,
                     },
                 )
             } else if let (Some(index_bytes), Some(data_bytes)) =
@@ -12773,11 +13696,15 @@ fn pack_match_batch_inputs<'a>(
             PackedTableUploadKind::Device {
                 index_buffer,
                 data_buffer,
+                index_offset,
+                data_offset,
             } => {
                 let t_device_plan = Instant::now();
                 table_device_copies.push(PackedTableDeviceCopy {
                     index_src: index_buffer,
                     data_src: data_buffer,
+                    index_src_offset: index_offset,
+                    data_src_offset: data_offset,
                     index_dst_offset: upload.index_offset,
                     data_dst_offset: upload.data_offset,
                     index_len: upload.index_len,
@@ -12847,7 +13774,7 @@ fn encode_table_device_copies(
         if index_copy_bytes > 0 {
             encoder.copy_buffer_to_buffer(
                 &copy.index_src,
-                0,
+                copy.index_src_offset,
                 &scratch.table_index_buffer,
                 copy.index_dst_offset,
                 index_copy_bytes,
@@ -12859,7 +13786,7 @@ fn encode_table_device_copies(
         if data_copy_bytes > 0 {
             encoder.copy_buffer_to_buffer(
                 &copy.data_src,
-                0,
+                copy.data_src_offset,
                 &scratch.table_data_buffer,
                 copy.data_dst_offset,
                 data_copy_bytes,
@@ -12869,7 +13796,7 @@ fn encode_table_device_copies(
     for meta in meta_copies {
         encoder.copy_buffer_to_buffer(
             meta.meta_src,
-            0,
+            meta.src_count_offset,
             &scratch.table_meta_buffer,
             meta.dst_count_offset,
             4,

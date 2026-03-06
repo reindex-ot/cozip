@@ -2391,26 +2391,40 @@ fn compress_chunk_gpu_batch(
     let prepare_table_readback_ms = 0.0_f64;
     let mut prepare_gpu_table_build_chunks = 0usize;
     let prepare_gpu_table_readback_chunks = 0usize;
-    let mut prepared = Vec::<GpuPreparedChunk<'_>>::with_capacity(indices.len());
-    for &chunk_idx in indices {
+    let mut prepared = Vec::<Option<GpuPreparedChunk<'_>>>::with_capacity(indices.len());
+    prepared.resize_with(indices.len(), || None);
+    let mut gpu_table_batch_positions = Vec::<usize>::new();
+    let mut gpu_table_batch_chunks = Vec::<&[u8]>::new();
+    for (pos, &chunk_idx) in indices.iter().enumerate() {
         let start = chunk_idx
             .checked_mul(chunk_size)
             .ok_or(PDeflateError::NumericOverflow)?;
         let end = (start + chunk_size).min(input.len());
         let chunk = &input[start..end];
-        let built = build_table_dispatch(
-            chunk,
-            options,
-            should_use_gpu_table_build(options, chunk.len()),
-        )?;
-        prepare_table_build_ms += built.build_ms;
-        if built.gpu_table.is_some() {
-            prepare_gpu_table_build_chunks = prepare_gpu_table_build_chunks.saturating_add(1);
-        }
         let max_ref_len = options.max_ref_len.min(MAX_CMD_LEN).min(64);
+        if should_use_gpu_table_build(options, chunk.len()) {
+            gpu_table_batch_positions.push(pos);
+            gpu_table_batch_chunks.push(chunk);
+            prepared[pos] = Some(GpuPreparedChunk {
+                index: chunk_idx,
+                chunk,
+                table: None,
+                gpu_table: None,
+                table_count: 0,
+                table_index: Vec::new(),
+                table_data: Vec::new(),
+                table_profile: BuildTableProfile::default(),
+                table_build_ms: 0.0,
+                max_ref_len,
+                gpu_eligible: false,
+            });
+            continue;
+        }
+        let built = build_table_dispatch(chunk, options, false)?;
+        prepare_table_build_ms += built.build_ms;
         let gpu_eligible = max_ref_len >= options.min_ref_len
             && (built.table_count > 0 || built.gpu_table.is_some());
-        prepared.push(GpuPreparedChunk {
+        prepared[pos] = Some(GpuPreparedChunk {
             index: chunk_idx,
             chunk,
             table: built.table,
@@ -2424,6 +2438,93 @@ fn compress_chunk_gpu_batch(
             gpu_eligible,
         });
     }
+    if !gpu_table_batch_chunks.is_empty() {
+        let batch_result = gpu::build_table_gpu_device_batch(
+            &gpu_table_batch_chunks,
+            options.max_table_entries.min(MAX_TABLE_ID),
+            options.max_table_entry_len,
+            options.min_ref_len,
+            options.match_probe_limit,
+            options.hash_history_limit,
+            options.table_sample_stride,
+        );
+        match batch_result {
+            Ok(entries) => {
+                for ((pos, chunk), (gpu_table, gpu_prof)) in gpu_table_batch_positions
+                    .iter()
+                    .copied()
+                    .zip(gpu_table_batch_chunks.iter().copied())
+                    .zip(entries.into_iter())
+                {
+                    let built_profile = BuildTableProfile {
+                        freq_ms: gpu_prof.freq_kernel_ms,
+                        probe_ms: gpu_prof.candidate_kernel_ms,
+                        materialize_ms: gpu_prof.materialize_ms,
+                        sort_ms: gpu_prof.sort_ms,
+                        ..BuildTableProfile::default()
+                    };
+                    let build_ms = gpu_table.build_breakdown.total_ms;
+                    prepare_table_build_ms += build_ms;
+                    prepare_gpu_table_build_chunks =
+                        prepare_gpu_table_build_chunks.saturating_add(1);
+                    let max_ref_len = options.max_ref_len.min(MAX_CMD_LEN).min(64);
+                    prepared[pos] = Some(GpuPreparedChunk {
+                        index: indices[pos],
+                        chunk,
+                        table: None,
+                        gpu_table: Some(gpu_table),
+                        table_count: 0,
+                        table_index: Vec::new(),
+                        table_data: Vec::new(),
+                        table_profile: built_profile,
+                        table_build_ms: build_ms,
+                        max_ref_len,
+                        gpu_eligible: max_ref_len >= options.min_ref_len,
+                    });
+                }
+            }
+            Err(_) => {
+                for pos in gpu_table_batch_positions.iter().copied() {
+                    let chunk_idx = indices[pos];
+                    let start = chunk_idx
+                        .checked_mul(chunk_size)
+                        .ok_or(PDeflateError::NumericOverflow)?;
+                    let end = (start + chunk_size).min(input.len());
+                    let chunk = &input[start..end];
+                    let built = build_table_dispatch(
+                        chunk,
+                        options,
+                        should_use_gpu_table_build(options, chunk.len()),
+                    )?;
+                    prepare_table_build_ms += built.build_ms;
+                    if built.gpu_table.is_some() {
+                        prepare_gpu_table_build_chunks =
+                            prepare_gpu_table_build_chunks.saturating_add(1);
+                    }
+                    let max_ref_len = options.max_ref_len.min(MAX_CMD_LEN).min(64);
+                    let gpu_eligible = max_ref_len >= options.min_ref_len
+                        && (built.table_count > 0 || built.gpu_table.is_some());
+                    prepared[pos] = Some(GpuPreparedChunk {
+                        index: chunk_idx,
+                        chunk,
+                        table: built.table,
+                        gpu_table: built.gpu_table,
+                        table_count: built.table_count,
+                        table_index: built.table_index,
+                        table_data: built.table_data,
+                        table_profile: built.profile,
+                        table_build_ms: built.build_ms,
+                        max_ref_len,
+                        gpu_eligible,
+                    });
+                }
+            }
+        }
+    }
+    let prepared = prepared
+        .into_iter()
+        .map(|v| v.expect("prepared chunk missing"))
+        .collect::<Vec<_>>();
     let prepare_ms = elapsed_ms(t_prepare);
     let prepare_misc_ms =
         (prepare_ms - prepare_table_build_ms - prepare_table_readback_ms).max(0.0);
