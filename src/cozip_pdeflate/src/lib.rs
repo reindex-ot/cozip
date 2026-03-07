@@ -312,6 +312,11 @@ fn legacy_options_from_hybrid(
         gpu_pipelined_submit_chunks: options.gpu_pipelined_submit_chunks.max(1),
         gpu_min_chunk_size: options.gpu_min_chunk_size.max(1),
         gpu_tail_stop_ratio: options.gpu_tail_stop_ratio,
+        compression_mode: match options.compression_mode {
+            CompressionMode::Speed => legacy_pdeflate_cpu::PDeflateCompressionMode::Speed,
+            CompressionMode::Balanced => legacy_pdeflate_cpu::PDeflateCompressionMode::Balanced,
+            CompressionMode::Ratio => legacy_pdeflate_cpu::PDeflateCompressionMode::Ratio,
+        },
         hybrid_scheduler_policy: legacy_pdeflate_cpu::PDeflateHybridSchedulerPolicy::GlobalQueue,
         ..legacy_pdeflate_cpu::PDeflateOptions::default()
     };

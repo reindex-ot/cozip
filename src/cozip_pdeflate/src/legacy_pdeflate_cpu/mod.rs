@@ -166,6 +166,13 @@ pub enum PDeflateHybridSchedulerPolicy {
     GpuLedSplitQueue,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PDeflateCompressionMode {
+    Speed,
+    Balanced,
+    Ratio,
+}
+
 #[derive(Debug, Clone)]
 pub struct PDeflateOptions {
     pub chunk_size: usize,
@@ -187,6 +194,7 @@ pub struct PDeflateOptions {
     pub gpu_pipelined_submit_chunks: usize,
     pub gpu_min_chunk_size: usize,
     pub gpu_tail_stop_ratio: f32,
+    pub compression_mode: PDeflateCompressionMode,
     pub hybrid_scheduler_policy: PDeflateHybridSchedulerPolicy,
 }
 
@@ -212,6 +220,7 @@ impl Default for PDeflateOptions {
             gpu_pipelined_submit_chunks: 4,
             gpu_min_chunk_size: 64 * 1024,
             gpu_tail_stop_ratio: 1.0,
+            compression_mode: PDeflateCompressionMode::Speed,
             hybrid_scheduler_policy: PDeflateHybridSchedulerPolicy::GlobalQueue,
         }
     }
@@ -2530,6 +2539,7 @@ fn compress_chunk_gpu_batch(
     prepared.resize_with(indices.len(), || None);
     let mut gpu_table_batch_positions = Vec::<usize>::new();
     let mut gpu_table_batch_chunks = Vec::<&[u8]>::new();
+    let mut gpu_table_build_requested_chunks = 0usize;
     for (pos, &chunk_idx) in indices.iter().enumerate() {
         let start = chunk_idx
             .checked_mul(chunk_size)
@@ -2538,6 +2548,7 @@ fn compress_chunk_gpu_batch(
         let chunk = &input[start..end];
         let max_ref_len = options.max_ref_len.min(MAX_CMD_LEN).min(64);
         if should_use_gpu_table_build(options, chunk.len()) {
+            gpu_table_build_requested_chunks = gpu_table_build_requested_chunks.saturating_add(1);
             gpu_table_batch_positions.push(pos);
             gpu_table_batch_chunks.push(chunk);
             prepared[pos] = Some(GpuPreparedChunk {
@@ -2574,14 +2585,16 @@ fn compress_chunk_gpu_batch(
         });
     }
     if !gpu_table_batch_chunks.is_empty() {
+        let (gpu_table_sample_stride, gpu_match_probe_limit, gpu_hash_history_limit) =
+            gpu_table_build_tuning(options);
         let batch_result = gpu::build_table_gpu_device_batch(
             &gpu_table_batch_chunks,
             options.max_table_entries.min(MAX_TABLE_ID),
             options.max_table_entry_len,
             options.min_ref_len,
-            options.match_probe_limit,
-            options.hash_history_limit,
-            options.gpu_table_sample_stride,
+            gpu_match_probe_limit,
+            gpu_hash_history_limit,
+            gpu_table_sample_stride,
         );
         match batch_result {
             Ok(entries) => {
@@ -3184,19 +3197,25 @@ fn compress_chunk_gpu_batch(
         out.push((p.index, chunk));
     }
     let finalize_ms = elapsed_ms(t_finalize);
-    let emit_gpu_batch_detail = if profile_detail {
+    let emit_gpu_batch_detail = if profile_enabled() {
+        if !profile_detail {
+            true
+        } else {
         let seq = PROFILE_DETAIL_GPU_BATCH_SEQ.fetch_add(1, Ordering::Relaxed);
         profile_detail_should_log_stream(seq)
+        }
     } else {
         false
     };
     if emit_gpu_batch_detail {
         let chunks_f = (indices.len() as f64).max(1.0);
         eprintln!(
-            "[cozip_pdeflate][timing][gpu-batch] batch_chunks={} gpu_jobs={} gpu_used={} t_prepare_ms={:.3} t_prepare_table_build_ms={:.3} t_prepare_table_readback_ms={:.3} t_prepare_misc_ms={:.3} prepare_gpu_table_build_chunks={} prepare_gpu_table_readback_chunks={} t_gpu_call_ms={:.3} t_finalize_ms={:.3} t_pack_inputs_ms={:.3} t_section_setup_ms={:.3} t_section_tok_dispatch_ms={:.3} t_section_pre_dispatch_ms={:.3} t_section_scat_dispatch_ms={:.3} t_section_pack_dispatch_ms={:.3} t_section_meta_dispatch_ms={:.3} t_section_tok_wait_ms={:.3} t_section_pre_wait_ms={:.3} t_section_scat_wait_ms={:.3} t_section_pack_wait_ms={:.3} t_section_meta_wait_ms={:.3} t_sparse_lens_submit_done_wait_ms={:.3} t_sparse_lens_map_after_done_ms={:.3} sparse_lens_poll_calls={} sparse_lens_yield_calls={} t_sparse_lens_wait_ms={:.3} t_sparse_wait_ms={:.3} t_sparse_copy_ms={:.3} t_upload_ms={:.3} t_wait_ms={:.3} t_map_copy_ms={:.3} gpu_call_ms_per_chunk={:.3}",
+            "[cozip_pdeflate][timing][gpu-batch] batch_chunks={} gpu_jobs={} gpu_used={} table_build_requested_chunks={} compression_mode={:?} t_prepare_ms={:.3} t_prepare_table_build_ms={:.3} t_prepare_table_readback_ms={:.3} t_prepare_misc_ms={:.3} prepare_gpu_table_build_chunks={} prepare_gpu_table_readback_chunks={} t_gpu_call_ms={:.3} t_finalize_ms={:.3} t_pack_inputs_ms={:.3} t_section_setup_ms={:.3} t_section_tok_dispatch_ms={:.3} t_section_pre_dispatch_ms={:.3} t_section_scat_dispatch_ms={:.3} t_section_pack_dispatch_ms={:.3} t_section_meta_dispatch_ms={:.3} t_section_tok_wait_ms={:.3} t_section_pre_wait_ms={:.3} t_section_scat_wait_ms={:.3} t_section_pack_wait_ms={:.3} t_section_meta_wait_ms={:.3} t_sparse_lens_submit_done_wait_ms={:.3} t_sparse_lens_map_after_done_ms={:.3} sparse_lens_poll_calls={} sparse_lens_yield_calls={} t_sparse_lens_wait_ms={:.3} t_sparse_wait_ms={:.3} t_sparse_copy_ms={:.3} t_upload_ms={:.3} t_wait_ms={:.3} t_map_copy_ms={:.3} gpu_call_ms_per_chunk={:.3}",
             indices.len(),
             gpu_job_indices.len(),
             gpu_used_chunks,
+            gpu_table_build_requested_chunks,
+            options.compression_mode,
             prepare_ms,
             prepare_table_build_ms,
             prepare_table_readback_ms,
@@ -4715,14 +4734,16 @@ fn build_table_dispatch(
     let t0 = Instant::now();
     if allow_gpu && options.gpu_compress_enabled && gpu::is_runtime_available() {
         let max_entries = options.max_table_entries.min(MAX_TABLE_ID);
+        let (gpu_table_sample_stride, gpu_match_probe_limit, gpu_hash_history_limit) =
+            gpu_table_build_tuning(options);
         if let Ok((gpu_table, gpu_prof)) = gpu::build_table_gpu_device(
             chunk,
             max_entries,
             options.max_table_entry_len,
             options.min_ref_len,
-            options.match_probe_limit,
-            options.hash_history_limit,
-            options.gpu_table_sample_stride,
+            gpu_match_probe_limit,
+            gpu_hash_history_limit,
+            gpu_table_sample_stride,
         ) {
             return Ok(BuiltTableDispatch {
                 table: None,
@@ -4755,9 +4776,56 @@ fn build_table_dispatch(
     })
 }
 
+fn gpu_table_build_tuning(options: &PDeflateOptions) -> (usize, usize, usize) {
+    match options.compression_mode {
+        PDeflateCompressionMode::Speed => (
+            options.gpu_table_sample_stride.saturating_mul(4),
+            options.match_probe_limit.min(8),
+            options.hash_history_limit.min(8),
+        ),
+        PDeflateCompressionMode::Balanced => (
+            options.gpu_table_sample_stride.saturating_mul(2),
+            options.match_probe_limit.min(12),
+            options.hash_history_limit.min(12),
+        ),
+        PDeflateCompressionMode::Ratio => (
+            options.gpu_table_sample_stride,
+            options.match_probe_limit,
+            options.hash_history_limit,
+        ),
+    }
+}
+
+fn cpu_table_build_tuning(options: &PDeflateOptions) -> (usize, usize, usize, usize, usize) {
+    match options.compression_mode {
+        PDeflateCompressionMode::Speed => (
+            options.table_sample_stride.saturating_mul(4),
+            options.match_probe_limit.min(8),
+            options.hash_history_limit.min(8),
+            options.max_table_entries.min(128),
+            options.max_table_entry_len.min(24),
+        ),
+        PDeflateCompressionMode::Balanced => (
+            options.table_sample_stride.saturating_mul(2),
+            options.match_probe_limit.min(12),
+            options.hash_history_limit.min(12),
+            options.max_table_entries.min(192),
+            options.max_table_entry_len.min(28),
+        ),
+        PDeflateCompressionMode::Ratio => (
+            options.table_sample_stride,
+            options.match_probe_limit,
+            options.hash_history_limit,
+            options.max_table_entries,
+            options.max_table_entry_len,
+        ),
+    }
+}
+
 fn should_use_gpu_table_build(options: &PDeflateOptions, chunk_len: usize) -> bool {
     options.gpu_compress_enabled
         && chunk_len >= options.gpu_min_chunk_size
+        && options.compression_mode != PDeflateCompressionMode::Speed
         && gpu_table_build_enabled()
 }
 
@@ -4777,13 +4845,12 @@ fn build_table(chunk: &[u8], options: &PDeflateOptions) -> (Vec<Vec<u8>>, BuildT
         return (Vec::new(), prof);
     }
 
-    let max_entry_len = options.max_table_entry_len.min(254);
-    let max_entries = options.max_table_entries.min(MAX_TABLE_ID);
-    // Speed-biased sampling: keep external option semantics while reducing
-    // probe volume for large chunks.
-    let sample_stride = options.table_sample_stride.max(1).saturating_mul(8);
-    // Table seeding is the dominant cost path. Keep probe fan-out tighter here.
-    let probe_limit = options.match_probe_limit.max(1);
+    let (table_sample_stride, match_probe_limit, hash_history_limit, tuned_max_entries, tuned_max_entry_len) =
+        cpu_table_build_tuning(options);
+    let max_entry_len = tuned_max_entry_len.min(254);
+    let max_entries = tuned_max_entries.min(MAX_TABLE_ID);
+    let sample_stride = table_sample_stride.max(1).saturating_mul(8);
+    let probe_limit = match_probe_limit.max(1);
     let min_seed_match_len = options.min_ref_len.max(6);
 
     // zlib-style hot-path: fixed slots instead of HashMap entry churn.
@@ -4837,7 +4904,7 @@ fn build_table(chunk: &[u8], options: &PDeflateOptions) -> (Vec<Vec<u8>>, BuildT
 
     let probe_t0 = Instant::now();
     const NO_POS: u32 = u32::MAX;
-    let history_cap = options.hash_history_limit.max(1);
+    let history_cap = hash_history_limit.max(1);
     let sampled_count = (chunk.len() - 2).div_ceil(sample_stride);
     let seed_slot_target = sampled_count.clamp(1 << 14, 1 << 18);
     let mut seed_slot_count = 1usize;
