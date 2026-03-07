@@ -166,7 +166,7 @@ impl CoZipDeflate {
         self.init_stats.gpu_context_init_ms
     }
 
-    pub fn compress_stream<R: Read, W: Write>(
+    pub fn compress_stream<R: Read + Send, W: Write>(
         &self,
         reader: &mut R,
         writer: &mut W,
@@ -174,15 +174,36 @@ impl CoZipDeflate {
         self.compress_stream_with_options(reader, writer, StreamOptions::default())
     }
 
-    pub fn compress_stream_with_options<R: Read, W: Write>(
+    pub fn compress_stream_with_options<R: Read + Send, W: Write>(
         &self,
         reader: &mut R,
         writer: &mut W,
         stream_options: StreamOptions,
     ) -> Result<PDeflateStats, CozipDeflateError> {
+        self.compress_stream_with_async_options(
+            reader,
+            writer,
+            stream_options,
+            AsyncStreamOptions::default(),
+        )
+    }
+
+    fn compress_stream_with_async_options<R: Read + Send, W: Write>(
+        &self,
+        reader: &mut R,
+        writer: &mut W,
+        stream_options: StreamOptions,
+        async_stream_options: AsyncStreamOptions,
+    ) -> Result<PDeflateStats, CozipDeflateError> {
         let _ = stream_options;
-        pdeflate::pdeflate_compress_reader_with_stats(reader, writer, &self.options)
-            .map_err(map_pdeflate_error)
+        pdeflate::pdeflate_compress_reader_with_stats(
+            reader,
+            writer,
+            &self.options,
+            async_stream_options.buffer_capacity,
+            async_stream_options.low_watermark,
+        )
+        .map_err(map_pdeflate_error)
     }
 
     pub fn decompress_stream<R: Read, W: Write>(
@@ -221,7 +242,12 @@ impl CoZipDeflate {
         let mut reader = BufReader::with_capacity(stream_options.io_buffer_size.max(1), input_file);
         let mut writer =
             BufWriter::with_capacity(stream_options.io_buffer_size.max(1), output_file);
-        let stats = self.compress_stream_with_options(&mut reader, &mut writer, stream_options)?;
+        let stats = self.compress_stream_with_async_options(
+            &mut reader,
+            &mut writer,
+            stream_options,
+            AsyncStreamOptions::default(),
+        )?;
         writer.flush()?;
         Ok(stats)
     }
@@ -270,7 +296,18 @@ impl CoZipDeflate {
         let input_std = input_file.into_std().await;
         let output_std = output_file.into_std().await;
         tokio::task::spawn_blocking(move || {
-            this.compress_file_with_options(input_std, output_std, stream_options)
+            let mut reader =
+                BufReader::with_capacity(stream_options.io_buffer_size.max(1), input_std);
+            let mut writer =
+                BufWriter::with_capacity(stream_options.io_buffer_size.max(1), output_std);
+            let stats = this.compress_stream_with_async_options(
+                &mut reader,
+                &mut writer,
+                stream_options,
+                _async_stream_options,
+            )?;
+            writer.flush()?;
+            Ok::<_, CozipDeflateError>(stats)
         })
         .await?
     }

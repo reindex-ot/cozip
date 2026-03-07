@@ -6,7 +6,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::ptr;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
 
@@ -658,10 +658,12 @@ fn create_temp_spool_file() -> Result<File, PDeflateError> {
     ))
 }
 
-pub(crate) fn pdeflate_compress_reader_with_stats<R: Read, W: Write>(
+pub(crate) fn pdeflate_compress_reader_with_stats<R: Read + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     options: &PDeflateOptions,
+    target_buffered_bytes: usize,
+    low_watermark_bytes: usize,
 ) -> Result<PDeflateStats, PDeflateError> {
     validate_options(options)?;
 
@@ -670,36 +672,130 @@ pub(crate) fn pdeflate_compress_reader_with_stats<R: Read, W: Write>(
     let mut chunk_count = 0usize;
     let mut table_entries_total = 0usize;
     let mut section_count_total = 0usize;
-    let mut buffer = vec![0u8; options.chunk_size.max(1)];
+    let chunk_size = options.chunk_size.max(1);
+    let target_buffered_bytes = target_buffered_bytes.max(chunk_size);
+    let low_watermark_bytes = low_watermark_bytes.max(chunk_size).min(target_buffered_bytes);
 
-    loop {
-        let mut filled = 0usize;
-        while filled < buffer.len() {
-            let read = reader.read(&mut buffer[filled..])?;
-            if read == 0 {
-                break;
-            }
-            filled = filled.saturating_add(read);
-        }
-        if filled == 0 {
-            break;
-        }
-
-        input_bytes = input_bytes
-            .checked_add(u64::try_from(filled).map_err(|_| PDeflateError::NumericOverflow)?)
-            .ok_or(PDeflateError::NumericOverflow)?;
-
-        let encoded = compress_chunk(&buffer[..filled], options)?;
-        spool.write_all(
-            &u32::try_from(encoded.payload.len())
-                .map_err(|_| PDeflateError::NumericOverflow)?
-                .to_le_bytes(),
-        )?;
-        spool.write_all(&encoded.payload)?;
-        chunk_count = chunk_count.saturating_add(1);
-        table_entries_total = table_entries_total.saturating_add(encoded.table_entries);
-        section_count_total = section_count_total.saturating_add(encoded.section_count);
+    #[derive(Default)]
+    struct StreamQueueState {
+        queue: VecDeque<Vec<u8>>,
+        buffered_bytes: usize,
+        eof: bool,
+        error: Option<std::io::Error>,
+        stopped: bool,
     }
+
+    let queue = Arc::new((Mutex::new(StreamQueueState::default()), Condvar::new()));
+
+    thread::scope(|scope| -> Result<(), PDeflateError> {
+        let queue_ref = Arc::clone(&queue);
+        scope.spawn(move || {
+            loop {
+                let (lock, cv) = &*queue_ref;
+                let mut state = match lock.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+                while state.buffered_bytes >= target_buffered_bytes
+                    && state.error.is_none()
+                    && !state.stopped
+                {
+                    state = match cv.wait(state) {
+                        Ok(guard) => guard,
+                        Err(_) => return,
+                    };
+                }
+                if state.stopped || state.error.is_some() {
+                    return;
+                }
+                drop(state);
+
+                let mut buffer = vec![0u8; chunk_size];
+                let mut filled = 0usize;
+                while filled < chunk_size {
+                    match reader.read(&mut buffer[filled..]) {
+                        Ok(0) => break,
+                        Ok(read) => filled = filled.saturating_add(read),
+                        Err(err) => {
+                            let (lock, cv) = &*queue_ref;
+                            if let Ok(mut state) = lock.lock() {
+                                state.error = Some(err);
+                                state.stopped = true;
+                                cv.notify_all();
+                            }
+                            return;
+                        }
+                    }
+                }
+
+                let (lock, cv) = &*queue_ref;
+                let mut state = match lock.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+                if filled == 0 {
+                    state.eof = true;
+                    cv.notify_all();
+                    return;
+                }
+                buffer.truncate(filled);
+                state.buffered_bytes = state.buffered_bytes.saturating_add(filled);
+                state.queue.push_back(buffer);
+                cv.notify_all();
+            }
+        });
+
+        loop {
+            let chunk = {
+                let (lock, cv) = &*queue;
+                let mut state = lock
+                    .lock()
+                    .map_err(|_| PDeflateError::InvalidStream("stream queue poisoned"))?;
+                loop {
+                    if let Some(err) = state.error.take() {
+                        state.stopped = true;
+                        cv.notify_all();
+                        return Err(PDeflateError::Io(err));
+                    }
+                    if let Some(chunk) = state.queue.pop_front() {
+                        state.buffered_bytes = state.buffered_bytes.saturating_sub(chunk.len());
+                        if state.buffered_bytes < low_watermark_bytes {
+                            cv.notify_all();
+                        }
+                        break Some(chunk);
+                    }
+                    if state.eof {
+                        state.stopped = true;
+                        cv.notify_all();
+                        break None;
+                    }
+                    state = cv
+                        .wait(state)
+                        .map_err(|_| PDeflateError::InvalidStream("stream queue poisoned"))?;
+                }
+            };
+
+            let Some(chunk) = chunk else {
+                break;
+            };
+
+            input_bytes = input_bytes
+                .checked_add(u64::try_from(chunk.len()).map_err(|_| PDeflateError::NumericOverflow)?)
+                .ok_or(PDeflateError::NumericOverflow)?;
+
+            let encoded = compress_chunk(&chunk, options)?;
+            spool.write_all(
+                &u32::try_from(encoded.payload.len())
+                    .map_err(|_| PDeflateError::NumericOverflow)?
+                    .to_le_bytes(),
+            )?;
+            spool.write_all(&encoded.payload)?;
+            chunk_count = chunk_count.saturating_add(1);
+            table_entries_total = table_entries_total.saturating_add(encoded.table_entries);
+            section_count_total = section_count_total.saturating_add(encoded.section_count);
+        }
+        Ok(())
+    })?;
 
     let mut header = Vec::with_capacity(24);
     header.extend_from_slice(&STREAM_MAGIC);
