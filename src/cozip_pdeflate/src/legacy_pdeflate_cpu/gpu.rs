@@ -3655,7 +3655,7 @@ impl GpuTableBuildBatchScratchCaps {
 
 const GPU_SCRATCH_POOL_LIMIT: usize = 4;
 const GPU_TABLE_BUILD_BATCH_POOL_LIMIT: usize = 4;
-const GPU_SPARSE_PACK_POOL_LIMIT: usize = 16;
+const GPU_SPARSE_PACK_POOL_LIMIT: usize = 4;
 const GPU_DECODE_V2_TRUE_BATCH_POOL_LIMIT: usize = 16;
 const GPU_DECODE_LARGE_SLOT_INDEX_BASE: usize = 1 << 30;
 const GPU_DECODE_V2_BATCH_DESC_WORDS: usize = 12;
@@ -16980,8 +16980,8 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
         drop(result_mapped);
         scratch.result_readback_buffer.unmap();
         let lens_copy_ms = elapsed_ms(t_lens_copy);
-
         let payload_readback_bytes = payload_readback_bytes.max(4);
+
         let t_payload_readback_setup = Instant::now();
         let payload_readback_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cozip-pdeflate-pack-sparse-direct-payload-readback"),
@@ -17040,10 +17040,11 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
         for (idx, state) in direct_states.iter().enumerate() {
             let chunk_base = usize::try_from(payload_copy_offsets[idx])
                 .map_err(|_| PDeflateError::NumericOverflow)?;
-            let chunk_copy_len = usize::try_from(payload_copy_bytes[idx])
-                .map_err(|_| PDeflateError::NumericOverflow)?;
             let chunk_end = chunk_base
-                .checked_add(chunk_copy_len)
+                .checked_add(
+                    usize::try_from(payload_copy_bytes[idx])
+                        .map_err(|_| PDeflateError::NumericOverflow)?,
+                )
                 .ok_or(PDeflateError::NumericOverflow)?;
             let mapped = payload_bytes.get(chunk_base..chunk_end).ok_or_else(|| {
                 PDeflateError::Gpu(
@@ -17051,7 +17052,7 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
                         "integrated/payload-readback-copy: payload batch readback truncated idx={} chunk_base={} chunk_copy_len={} payload_len={} payload_readback_bytes={} mapped_len={} out_base_word={}",
                         idx,
                         chunk_base,
-                        chunk_copy_len,
+                        payload_copy_bytes[idx],
                         payload_lens[idx],
                         payload_readback_bytes,
                         payload_bytes.len(),
