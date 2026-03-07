@@ -3123,11 +3123,30 @@ pub(crate) struct PendingGpuSparsePackBatch {
     payload_readback_plan_bytes: Vec<u64>,
     result_readback_bytes: u64,
     payload_readback_bytes: u64,
+    sparse_prebuild_build_id_min: u64,
+    sparse_prebuild_build_id_max: u64,
+    sparse_prebuild_submit_seq_min: u64,
+    sparse_prebuild_submit_seq_max: u64,
+    sparse_latest_build_submit_seq: u64,
+    sparse_latest_build_id: u64,
+    sparse_build_ids: Vec<u64>,
     result_rx: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
     payload_rx: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
     result_ready: bool,
     payload_ready: bool,
     submit_at: Instant,
+    pack_alloc_setup_ms: f64,
+    pack_resolve_sizes_ms: f64,
+    pack_resolve_scan_ms: f64,
+    pack_resolve_readback_setup_ms: f64,
+    pack_resolve_submit_ms: f64,
+    pack_resolve_map_wait_ms: f64,
+    pack_resolve_parse_ms: f64,
+    pack_src_copy_ms: f64,
+    pack_metadata_loop_ms: f64,
+    pack_host_copy_ms: f64,
+    pack_device_copy_plan_ms: f64,
+    pack_finalize_ms: f64,
     match_upload_ms: f64,
     match_table_copy_ms: f64,
     match_prepare_dispatch_ms: f64,
@@ -3153,10 +3172,13 @@ pub(crate) struct PendingGpuSparsePackBatch {
     sparse_pack_dispatch_ms: f64,
     result_readback_setup_ms: f64,
     payload_readback_setup_ms: f64,
+    submit_ms: f64,
+    phase1_submit_done_wait_ms: f64,
     phase1_result_wait_calls: u64,
     phase1_payload_wait_calls: u64,
     phase1_result_ready_hits: u64,
     phase1_payload_ready_hits: u64,
+    phase1_yield_calls: u64,
     batch_scratch: Option<GpuBatchScratch>,
     sparse_scratch: Option<GpuSparsePackScratch>,
 }
@@ -3328,8 +3350,8 @@ fn planned_sparse_payload_readback_bytes(
 ) -> u64 {
     let predicted = align_up4(predicted_payload_bytes.max(4));
     let guarded = predicted
-        .saturating_add(predicted / 4)
-        .saturating_add(64 * 1024);
+        .saturating_add(predicted / 8)
+        .saturating_add(16 * 1024);
     let planned = align_up4(guarded);
     u64::try_from(planned)
         .unwrap_or(u64::MAX)
@@ -3947,6 +3969,16 @@ fn sparse_ready_first_spin_polls() -> usize {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(16)
             .max(1)
+    })
+}
+
+fn sparse_ready_first_yield_rounds() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("COZIP_PDEFLATE_GPU_SPARSE_READY_FIRST_YIELD_ROUNDS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0)
     })
 }
 
@@ -15686,11 +15718,11 @@ pub(crate) fn compute_matches_and_encode_sections_batch(
     }
 }
 
-pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
+pub(crate) fn submit_matches_encode_and_pack_sparse_batch(
     inputs: &[GpuMatchInput<'_>],
     section_count: usize,
     max_cmd_len: usize,
-) -> Result<GpuBatchSparsePackOutput, PDeflateError> {
+) -> Result<PendingGpuSparsePackBatch, PDeflateError> {
     let with_gpu_stage = |stage: &'static str, err: PDeflateError| -> PDeflateError {
         match err {
             PDeflateError::Gpu(msg) => PDeflateError::Gpu(format!("{stage}: {msg}")),
@@ -15698,13 +15730,72 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
         }
     };
     if inputs.is_empty() {
-        return Ok(GpuBatchSparsePackOutput {
-            chunks: Vec::new(),
-            match_profile: GpuMatchProfile::default(),
-            section_profile: GpuSectionEncodeProfile::default(),
-            sparse_profile: GpuMatchProfile::default(),
-            sparse_batch_profile: GpuSparsePackBatchProfile::default(),
-            kernel_profile: GpuBatchKernelProfile::default(),
+        return Ok(PendingGpuSparsePackBatch {
+            inputs_len: 0,
+            compression_mode: super::PDeflateCompressionMode::Speed,
+            direct_states: Vec::new(),
+            payload_readback_offsets: Vec::new(),
+            payload_readback_plan_bytes: Vec::new(),
+            result_readback_bytes: 0,
+            payload_readback_bytes: 0,
+            sparse_prebuild_build_id_min: u64::MAX,
+            sparse_prebuild_build_id_max: 0,
+            sparse_prebuild_submit_seq_min: u64::MAX,
+            sparse_prebuild_submit_seq_max: 0,
+            sparse_latest_build_submit_seq: 0,
+            sparse_latest_build_id: 0,
+            sparse_build_ids: Vec::new(),
+            result_rx: mpsc::channel().1,
+            payload_rx: mpsc::channel().1,
+            result_ready: true,
+            payload_ready: true,
+            submit_at: Instant::now(),
+            pack_alloc_setup_ms: 0.0,
+            pack_resolve_sizes_ms: 0.0,
+            pack_resolve_scan_ms: 0.0,
+            pack_resolve_readback_setup_ms: 0.0,
+            pack_resolve_submit_ms: 0.0,
+            pack_resolve_map_wait_ms: 0.0,
+            pack_resolve_parse_ms: 0.0,
+            pack_src_copy_ms: 0.0,
+            pack_metadata_loop_ms: 0.0,
+            pack_host_copy_ms: 0.0,
+            pack_device_copy_plan_ms: 0.0,
+            pack_finalize_ms: 0.0,
+            match_upload_ms: 0.0,
+            match_table_copy_ms: 0.0,
+            match_prepare_dispatch_ms: 0.0,
+            match_kernel_dispatch_ms: 0.0,
+            section_upload_ms: 0.0,
+            section_setup_ms: 0.0,
+            section_pass_dispatch_ms: 0.0,
+            section_tokenize_dispatch_ms: 0.0,
+            section_prefix_dispatch_ms: 0.0,
+            section_scatter_dispatch_ms: 0.0,
+            section_pack_dispatch_ms: 0.0,
+            section_meta_dispatch_ms: 0.0,
+            pack_inputs_ms: 0.0,
+            batch_scratch_acquire_ms: 0.0,
+            sparse_scratch_acquire_ms: 0.0,
+            sparse_prepare_ms: 0.0,
+            table_size_resolve_ms: 0.0,
+            pack_bind_group_ms: 0.0,
+            encoder_create_ms: 0.0,
+            table_stream_copy_ms: 0.0,
+            match_clear_ms: 0.0,
+            sparse_prepare_dispatch_ms: 0.0,
+            sparse_pack_dispatch_ms: 0.0,
+            result_readback_setup_ms: 0.0,
+            payload_readback_setup_ms: 0.0,
+            submit_ms: 0.0,
+            phase1_submit_done_wait_ms: 0.0,
+            phase1_result_wait_calls: 0,
+            phase1_payload_wait_calls: 0,
+            phase1_result_ready_hits: 0,
+            phase1_payload_ready_hits: 0,
+            phase1_yield_calls: 0,
+            batch_scratch: None,
+            sparse_scratch: None,
         });
     }
     if section_count == 0 {
@@ -15714,52 +15805,9 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
     }
     let compression_mode = inputs[0].compression_mode;
 
-    struct SparsePackPrepared {
-        chunk_len: usize,
-        section_count: usize,
-        table_data_stream_offset: usize,
-        section_index_stream_offset: usize,
-        section_index_cap_len: usize,
-        section_cmd_cap_len: usize,
-        total_len_cap: usize,
-        total_bytes_cap: u64,
-        table_count: usize,
-        table_index_len: usize,
-        table_data_len: usize,
-    }
-
-    #[derive(Clone, Copy)]
-    struct SparsePackHostJob {
-        section_meta_words_off: usize,
-        table_index_off: usize,
-        table_data_off: usize,
-        section_index_off: usize,
-        out_lens_words_off: usize,
-        section_prefix_words_off: usize,
-        section_offsets_words_off: usize,
-        out_cmd_off: usize,
-        out_base_word: usize,
-    }
-
-    struct DirectSectionState {
-        chunk_len: usize,
-        src_base_u32: u32,
-        out_lens_bytes: u64,
-        out_cmd_bytes: u64,
-        max_tokens_per_section: u32,
-        max_cmd_words_per_section: u32,
-        predicted_payload_bytes: usize,
-        predicted_payload_class: GpuSparsePayloadClass,
-        slot_cap_bytes: u64,
-        cap_payload_class: GpuSparsePayloadClass,
-        prep: SparsePackPrepared,
-        host: SparsePackHostJob,
-        section_offsets_local: Vec<u32>,
-        section_offsets_global: Vec<u32>,
-        section_caps: Vec<u32>,
-        section_token_offsets: Vec<u32>,
-        section_token_caps: Vec<u32>,
-    }
+    type SparsePackPrepared = IntegratedSparsePackPrepared;
+    type SparsePackHostJob = IntegratedSparsePackHostJob;
+    type DirectSectionState = IntegratedDirectSectionState;
 
     struct DirectSectionGpu {
         state_idx: usize,
@@ -16704,8 +16752,16 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
     let section_setup_ms = elapsed_ms(t_section_setup);
     let sparse_prepare_total_ms = elapsed_ms(t_sparse_prepare);
     let sparse_prepare_ms = (sparse_prepare_total_ms - sparse_scratch_acquire_ms).max(0.0);
+    let mut batch_scratch_slot = Some(batch_scratch);
+    let mut scratch_slot = Some(scratch);
 
-    let result = (|| -> Result<GpuBatchSparsePackOutput, PDeflateError> {
+    let result = (|| -> Result<PendingGpuSparsePackBatch, PDeflateError> {
+        let batch_scratch = batch_scratch_slot
+            .take()
+            .ok_or_else(|| PDeflateError::Gpu("integrated/submit: batch scratch missing".to_string()))?;
+        let scratch = scratch_slot
+            .take()
+            .ok_or_else(|| PDeflateError::Gpu("integrated/submit: sparse scratch missing".to_string()))?;
         let validate_integrated_section_state =
             |state_idx: usize, state: &DirectSectionState| -> Result<(), PDeflateError> {
                 let readback_lens_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
@@ -17334,655 +17390,692 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
         payload_slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = out_tx.send(res);
         });
-        let t_wait1 = Instant::now();
-        let spin_polls_before_wait = sparse_ready_first_spin_polls();
-        let mut result_ready = false;
-        let mut payload_ready = false;
-        let mut phase1_submit_done_wait_ms = 0.0_f64;
-        let mut phase1_result_wait_calls = 0u64;
-        let mut phase1_payload_wait_calls = 0u64;
-        let mut phase1_result_ready_hits = 0u64;
-        let mut phase1_payload_ready_hits = 0u64;
-        while !(result_ready && payload_ready) {
-            for _ in 0..spin_polls_before_wait {
-                r.device.poll(wgpu::Maintain::Poll);
-                if !result_ready {
-                    match result_rx.try_recv() {
-                        Ok(Ok(())) => {
-                            result_ready = true;
-                            phase1_result_ready_hits = phase1_result_ready_hits.saturating_add(1);
-                        }
-                        Ok(Err(e)) => {
-                            return Err(PDeflateError::Gpu(format!(
-                                "integrated/result-readback-map: map_async failed: {e}"
-                            )));
-                        }
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            return Err(PDeflateError::Gpu(
-                                "integrated/result-readback-map: channel closed while waiting"
-                                    .to_string(),
-                            ));
-                        }
-                        Err(mpsc::TryRecvError::Empty) => {}
-                    }
-                }
-                if !payload_ready {
-                    match out_rx.try_recv() {
-                        Ok(Ok(())) => {
-                            payload_ready = true;
-                            phase1_payload_ready_hits =
-                                phase1_payload_ready_hits.saturating_add(1);
-                        }
-                        Ok(Err(e)) => {
-                            return Err(PDeflateError::Gpu(format!(
-                                "integrated/payload-readback-map: map_async failed: {e}"
-                            )));
-                        }
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            return Err(PDeflateError::Gpu(
-                                "integrated/payload-readback-map: channel closed while waiting"
-                                    .to_string(),
-                            ));
-                        }
-                        Err(mpsc::TryRecvError::Empty) => {}
-                    }
-                }
-                if result_ready && payload_ready {
-                    break;
-                }
-            }
-            if result_ready && payload_ready {
-                break;
-            }
-            let t_wait = Instant::now();
-            r.device.poll(wgpu::Maintain::Wait);
-            let wait_ms = elapsed_ms(t_wait);
-            phase1_submit_done_wait_ms += wait_ms;
-            if !result_ready {
-                phase1_result_wait_calls = phase1_result_wait_calls.saturating_add(1);
-            }
-            if !payload_ready {
-                phase1_payload_wait_calls = phase1_payload_wait_calls.saturating_add(1);
-            }
-            if !result_ready {
-                match result_rx.try_recv() {
-                    Ok(Ok(())) => {
-                        result_ready = true;
-                    }
-                    Ok(Err(e)) => {
-                        return Err(PDeflateError::Gpu(format!(
-                            "integrated/result-readback-map: map_async failed: {e}"
-                        )));
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        return Err(PDeflateError::Gpu(
-                            "integrated/result-readback-map: channel closed while waiting"
-                                .to_string(),
-                        ));
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                }
-            }
-            if !payload_ready {
-                match out_rx.try_recv() {
-                    Ok(Ok(())) => {
-                        payload_ready = true;
-                    }
-                    Ok(Err(e)) => {
-                        return Err(PDeflateError::Gpu(format!(
-                            "integrated/payload-readback-map: map_async failed: {e}"
-                        )));
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        return Err(PDeflateError::Gpu(
-                            "integrated/payload-readback-map: channel closed while waiting"
-                                .to_string(),
-                        ));
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                }
-            }
-        }
-        let phase1_wait_ms = elapsed_ms(t_wait1);
-
-        let t_lens_copy = Instant::now();
-        let (
-            payload_lens,
-            payload_table_counts,
-            payload_copy_bytes,
-        ) = {
-            let result_mapped = result_slice.get_mapped_range();
-            let result_words: &[u32] = bytemuck::cast_slice(&result_mapped);
-            let parse_result = (|| -> Result<_, PDeflateError> {
-                let mut payload_lens = Vec::<usize>::with_capacity(inputs.len());
-                let mut payload_table_counts = Vec::<usize>::with_capacity(inputs.len());
-                let mut payload_copy_bytes = Vec::<u64>::with_capacity(inputs.len());
-                for (idx, state) in direct_states.iter().enumerate() {
-                    let base = idx * GPU_SPARSE_PACK_BATCH_RESULT_WORDS;
-                    let total_len_u32 = *result_words.get(base + 2).unwrap_or(&0xffff_ffff);
-                    let total_words_u32 = *result_words.get(base + 3).unwrap_or(&0);
-                    if total_len_u32 == 0xffff_ffff || total_words_u32 == 0 {
-                        return Err(PDeflateError::Gpu(
-                            "integrated/result-parse: sparse size prepare overflow while packing"
-                                .to_string(),
-                        ));
-                    }
-                    let total_len = usize::try_from(total_len_u32)
-                        .map_err(|_| PDeflateError::NumericOverflow)?;
-                    let total_copy_len = align_up4(total_len);
-                    let total_copy_bytes = u64::try_from(total_copy_len)
-                        .map_err(|_| PDeflateError::NumericOverflow)?;
-                    if total_copy_bytes > state.prep.total_bytes_cap {
-                        return Err(PDeflateError::Gpu(
-                            "gpu sparse pack produced oversized aligned payload".to_string(),
-                        ));
-                    }
-                    if total_copy_bytes > payload_readback_plan_bytes[idx] {
-                        return Err(PDeflateError::Gpu(format!(
-                            "integrated/result-parse: planned payload readback too small idx={} planned={} actual={}",
-                            idx,
-                            payload_readback_plan_bytes[idx],
-                            total_copy_bytes,
-                        )));
-                    }
-                    payload_copy_bytes.push(total_copy_bytes);
-                    payload_lens.push(total_len);
-                    payload_table_counts.push(state.prep.table_count);
-                }
-                Ok((
-                    payload_lens,
-                    payload_table_counts,
-                    payload_copy_bytes,
-                ))
-            })();
-            drop(result_mapped);
-            scratch.result_readback_buffer.unmap();
-            parse_result?
-        };
-        let lens_copy_ms = elapsed_ms(t_lens_copy);
-        let phase2_wait_ms = 0.0_f64;
-
-        let t_copy = Instant::now();
-        let (
-            out,
-            predicted_payload_bytes_total,
-            cap_payload_bytes_total,
-            actual_payload_bytes_total,
-            predicted_class_counts,
-            cap_class_counts,
-            actual_class_counts,
-            predicted_underestimate_chunks,
-            predicted_underestimate_bytes,
-            predicted_overestimate_bytes,
-        ) = {
-            let payload_mapped = payload_slice.get_mapped_range();
-            let payload_bytes: &[u8] = &payload_mapped;
-            let copy_result = (|| -> Result<_, PDeflateError> {
-                let mut out = Vec::<GpuSparsePackChunkOutput>::with_capacity(inputs.len());
-                let mut predicted_payload_bytes_total = 0u64;
-                let mut cap_payload_bytes_total = 0u64;
-                let mut actual_payload_bytes_total = 0u64;
-                let mut predicted_class_counts = [0u32; GPU_SPARSE_PAYLOAD_CLASS_COUNT];
-                let mut cap_class_counts = [0u32; GPU_SPARSE_PAYLOAD_CLASS_COUNT];
-                let mut actual_class_counts = [0u32; GPU_SPARSE_PAYLOAD_CLASS_COUNT];
-                let mut predicted_underestimate_chunks = 0u32;
-                let mut predicted_underestimate_bytes = 0u64;
-                let mut predicted_overestimate_bytes = 0u64;
-                for (idx, state) in direct_states.iter().enumerate() {
-                    let chunk_base = usize::try_from(payload_readback_offsets[idx])
-                        .map_err(|_| PDeflateError::NumericOverflow)?;
-                    let chunk_end = chunk_base
-                        .checked_add(
-                            usize::try_from(payload_copy_bytes[idx])
-                                .map_err(|_| PDeflateError::NumericOverflow)?,
-                        )
-                        .ok_or(PDeflateError::NumericOverflow)?;
-                    let mapped = payload_bytes.get(chunk_base..chunk_end).ok_or_else(|| {
-                        PDeflateError::Gpu(
-                            format!(
-                                "integrated/payload-readback-copy: payload batch readback truncated idx={} chunk_base={} chunk_copy_len={} payload_len={} payload_readback_bytes={} mapped_len={} out_base_word={}",
-                                idx,
-                                chunk_base,
-                                payload_copy_bytes[idx],
-                                payload_lens[idx],
-                                payload_readback_bytes,
-                                payload_bytes.len(),
-                                state.host.out_base_word,
-                            ),
-                        )
-                    })?;
-                    let payload_len = payload_lens[idx];
-                    let actual_payload_class = classify_sparse_payload_bytes(payload_len);
-                    predicted_payload_bytes_total = predicted_payload_bytes_total
-                        .saturating_add(u64::try_from(state.predicted_payload_bytes).unwrap_or(u64::MAX));
-                    cap_payload_bytes_total = cap_payload_bytes_total
-                        .saturating_add(state.prep.total_bytes_cap);
-                    actual_payload_bytes_total = actual_payload_bytes_total
-                        .saturating_add(u64::try_from(payload_len).unwrap_or(u64::MAX));
-                    predicted_class_counts[state.predicted_payload_class.idx()] =
-                        predicted_class_counts[state.predicted_payload_class.idx()].saturating_add(1);
-                    cap_class_counts[state.cap_payload_class.idx()] =
-                        cap_class_counts[state.cap_payload_class.idx()].saturating_add(1);
-                    actual_class_counts[actual_payload_class.idx()] =
-                        actual_class_counts[actual_payload_class.idx()].saturating_add(1);
-                    if state.predicted_payload_bytes < payload_len {
-                        predicted_underestimate_chunks =
-                            predicted_underestimate_chunks.saturating_add(1);
-                        predicted_underestimate_bytes = predicted_underestimate_bytes.saturating_add(
-                            u64::try_from(payload_len - state.predicted_payload_bytes)
-                                .unwrap_or(u64::MAX),
-                        );
-                    } else {
-                        predicted_overestimate_bytes = predicted_overestimate_bytes.saturating_add(
-                            u64::try_from(state.predicted_payload_bytes - payload_len)
-                                .unwrap_or(u64::MAX),
-                        );
-                    }
-                    let mut payload = vec![0u8; payload_len];
-                    payload.copy_from_slice(&mapped[..payload_len]);
-                    ensure_sparse_packed_chunk_huff_lut(&mut payload)
-                        .map_err(|err| with_gpu_stage("integrated/ensure-huff-lut", err))?;
-                    if gpu_sparse_payload_validate_enabled() {
-                        let mut validate_out = vec![0u8; state.chunk_len];
-                        if let Err(err) = super::decompress_chunk_into(&payload, &mut validate_out) {
-                            match validate_integrated_section_state(idx, state) {
-                                Ok(()) => {
-                                    if GPU_INTEGRATED_FINAL_PROBE_LOGGED
-                                        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                                        .is_ok()
-                                    {
-                                        let table_data_offset =
-                                            usize::try_from(read_le_u32_at(&payload, 20).unwrap_or(0))
-                                                .unwrap_or(0);
-                                        let huff_lut_offset =
-                                            usize::try_from(read_le_u32_at(&payload, 24).unwrap_or(0))
-                                                .unwrap_or(0);
-                                        let section_index_offset =
-                                            usize::try_from(read_le_u32_at(&payload, 28).unwrap_or(0))
-                                                .unwrap_or(0);
-                                        let section_bitstream_offset =
-                                            usize::try_from(read_le_u32_at(&payload, 32).unwrap_or(0))
-                                                .unwrap_or(0);
-                                        let section_index = payload
-                                            .get(section_index_offset..section_bitstream_offset)
-                                            .unwrap_or(&[]);
-                                        let section_cmd =
-                                            payload.get(section_bitstream_offset..).unwrap_or(&[]);
-                                        let mut section_idx_cursor = 0usize;
-                                        let mut cmd_cursor = 0usize;
-                                        let mut fail_sec = usize::MAX;
-                                        let mut fail_bit_len = 0usize;
-                                        for sec in 0..state.prep.section_count {
-                                            match super::read_varint_u32(
-                                                section_index,
-                                                &mut section_idx_cursor,
-                                            ) {
-                                                Ok(sec_bit_len_u32) => {
-                                                    let sec_bit_len = usize::try_from(sec_bit_len_u32)
-                                                        .unwrap_or(usize::MAX);
-                                                    fail_bit_len = sec_bit_len;
-                                                    match super::section_bit_len_to_byte_len(
-                                                        sec_bit_len_u32 as usize,
-                                                    ) {
-                                                        Ok(sec_cmd_len) => {
-                                                            if let Some(next) =
-                                                                cmd_cursor.checked_add(sec_cmd_len)
-                                                            {
-                                                                if next > section_cmd.len() {
-                                                                    fail_sec = sec;
-                                                                    break;
-                                                                }
-                                                                cmd_cursor = next;
-                                                            } else {
-                                                                fail_sec = sec;
-                                                                break;
-                                                            }
-                                                        }
-                                                        Err(_) => {
-                                                            fail_sec = sec;
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                                Err(_) => {
-                                                    fail_sec = sec;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        eprintln!(
-                                            "[cozip_pdeflate][timing][gpu-integrated-final-probe] chunk_len={} section_count={} payload_len={} table_data_off={} huff_lut_off={} section_index_off={} section_bitstream_off={} section_index_len={} section_cmd_len={} section_idx_cursor={} cmd_cursor={} fail_sec={} fail_bit_len={}",
-                                            state.chunk_len,
-                                            state.prep.section_count,
-                                            payload.len(),
-                                            table_data_offset,
-                                            huff_lut_offset,
-                                            section_index_offset,
-                                            section_bitstream_offset,
-                                            section_index.len(),
-                                            section_cmd.len(),
-                                            section_idx_cursor,
-                                            cmd_cursor,
-                                            fail_sec,
-                                            fail_bit_len,
-                                        );
-                                    }
-                                    return Err(with_gpu_stage("integrated/validate-final-payload", err));
-                                }
-                                Err(section_err) => {
-                                    return Err(with_gpu_stage(
-                                        "integrated/validate-section-cmds",
-                                        section_err,
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    out.push(GpuSparsePackChunkOutput {
-                        payload,
-                        table_count: payload_table_counts[idx],
-                    });
-                }
-                Ok((
-                    out,
-                    predicted_payload_bytes_total,
-                    cap_payload_bytes_total,
-                    actual_payload_bytes_total,
-                    predicted_class_counts,
-                    cap_class_counts,
-                    actual_class_counts,
-                    predicted_underestimate_chunks,
-                    predicted_underestimate_bytes,
-                    predicted_overestimate_bytes,
-                ))
-            })();
-            drop(payload_mapped);
-            payload_readback_buffer.unmap();
-            copy_result?
-        };
-        let sparse_copy_ms = elapsed_ms(t_copy);
-
-        let match_stage_weight =
-            match_table_copy_ms + match_prepare_dispatch_ms + match_kernel_dispatch_ms;
-        let section_stage_weight = section_setup_ms + section_pass_dispatch_ms;
-        let sparse_stage_weight = sparse_prepare_dispatch_ms + sparse_pack_dispatch_ms;
-        let stage_weight_sum = match_stage_weight + section_stage_weight + sparse_stage_weight;
-        let match_submit_ms = if stage_weight_sum > 0.0 {
-            submit_ms * (match_stage_weight / stage_weight_sum)
-        } else {
-            submit_ms
-        };
-        let section_submit_ms = if stage_weight_sum > 0.0 {
-            submit_ms * (section_stage_weight / stage_weight_sum)
-        } else {
-            0.0
-        };
-        let sparse_first_submit_ms = if stage_weight_sum > 0.0 {
-            submit_ms * (sparse_stage_weight / stage_weight_sum)
-        } else {
-            0.0
-        };
-        let sparse_wait_ms = phase1_wait_ms + phase2_wait_ms;
-        let sparse_submit_ms = sparse_first_submit_ms;
-        let sparse_total_ms = sparse_prepare_ms
-            + sparse_scratch_acquire_ms
-            + sparse_submit_ms
-            + sparse_wait_ms
-            + lens_copy_ms
-            + sparse_copy_ms;
-        let sparse_profile = GpuMatchProfile {
-            upload_ms: 0.0,
-            wait_ms: sparse_wait_ms,
-            map_copy_ms: lens_copy_ms + sparse_copy_ms,
-            total_ms: sparse_total_ms,
-        };
-        let sparse_batch_profile = GpuSparsePackBatchProfile {
-            chunks: inputs.len(),
-            lens_bytes_total: direct_states
-                .iter()
-                .fold(0u64, |acc, s| acc.saturating_add(s.out_lens_bytes.max(4))),
-            out_cmd_bytes_total: direct_states
-                .iter()
-                .fold(0u64, |acc, s| acc.saturating_add(s.out_cmd_bytes.max(4))),
-            predicted_payload_bytes_total,
-            cap_payload_bytes_total,
-            actual_payload_bytes_total,
-            predicted_class_counts,
-            cap_class_counts,
-            actual_class_counts,
-            predicted_underestimate_chunks,
-            predicted_underestimate_bytes,
-            predicted_overestimate_bytes,
-            lens_submit_ms: sparse_submit_ms,
-            lens_submit_done_wait_ms: sparse_wait_ms,
-            lens_map_after_done_ms: 0.0,
-            lens_poll_calls: 0,
-            lens_yield_calls: 0,
-            lens_wait_ms: sparse_wait_ms,
-            lens_copy_ms,
-            prepare_ms: sparse_prepare_ms,
-            table_size_resolve_ms,
-            prepare_misc_ms: (sparse_prepare_ms - table_size_resolve_ms).max(0.0),
-            scratch_acquire_ms: sparse_scratch_acquire_ms,
-            upload_dispatch_ms: 0.0,
-            submit_ms: sparse_submit_ms,
-            wait_ms: sparse_wait_ms,
-            copy_ms: sparse_copy_ms,
-            total_ms: sparse_total_ms,
-        };
-
-        if sparse_lens_wait_probe {
-            let seq = SPARSE_LENS_WAIT_PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
-            if table_stage_probe_should_log(seq) {
-                let readback_bytes = result_readback_bytes.saturating_add(payload_readback_bytes);
-                let build_id_range = if sparse_prebuild_build_id_min != u64::MAX {
-                    format!(
-                        "{}..{}",
-                        sparse_prebuild_build_id_min, sparse_prebuild_build_id_max
-                    )
-                } else {
-                    "none".to_string()
-                };
-                let submit_seq_range = if sparse_prebuild_submit_seq_min != u64::MAX {
-                    format!(
-                        "{}..{}",
-                        sparse_prebuild_submit_seq_min, sparse_prebuild_submit_seq_max
-                    )
-                } else {
-                    "none".to_string()
-                };
-                let build_ids = if sparse_build_ids.is_empty() {
-                    "none".to_string()
-                } else {
-                    sparse_build_ids
-                        .iter()
-                        .map(|v| v.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                };
-                let (latest_build_submit_seq, latest_build_id) = sparse_latest_build_submit
-                    .as_ref()
-                    .map(|(submit_seq, build_id, _)| (*submit_seq, *build_id))
-                    .unwrap_or((0, 0));
-                eprintln!(
-                    "[cozip_pdeflate][timing][sparse-lens-wait-breakdown] seq={} chunks={} pending_maps={} readback_kib={:.1} payload_readback_kib={:.1} build_id_range={} build_submit_seq_range={} build_ids={} latest_build_submit_seq={} latest_build_id={} sparse_submit_seq=0 sparse_submit_seq_last=0 sparse_submit_count=1 payload_submit_seq=0 pre_wait_latest_build_submit_ms=0.000 submit_done_wait_sparse_ms={:.3} submit_done_wait_payload_ms={:.3} submit_done_wait_ms={:.3} map_callback_wait_sparse_ms=0.000 map_callback_wait_payload_ms=0.000 map_callback_wait_ms=0.000 sparse_wait_calls={} payload_wait_calls={} sparse_wait_max_ms={:.3} payload_wait_max_ms={:.3} sparse_wait_ready={} payload_wait_ready={} sparse_ts_prepare_kernel_ms=0.000 sparse_ts_kernel_ms=0.000 sparse_ts_kernel_total_ms=0.000 sparse_ts_parse_ms=0.000 sparse_ts_queue_stall_est_ms=0.000 sparse_ts_status={} lens_wait_ms={:.3}",
-                    seq,
-                    inputs.len(),
-                    2,
-                    (readback_bytes as f64) / 1024.0,
-                    (payload_readback_bytes as f64) / 1024.0,
-                    build_id_range,
-                    submit_seq_range,
-                    build_ids,
-                    latest_build_submit_seq,
-                    latest_build_id,
-                    phase1_submit_done_wait_ms,
-                    0.0,
-                    phase1_wait_ms + phase2_wait_ms,
-                    phase1_result_wait_calls,
-                    phase1_payload_wait_calls,
-                    0.0,
-                    0.0,
-                    phase1_result_ready_hits,
-                    phase1_payload_ready_hits,
-                    if sparse_kernel_ts_probe { "on" } else { "off" },
-                    phase1_wait_ms + phase2_wait_ms,
-                );
-            }
-        }
-        if profile_enabled() {
-            let chunks_f = (inputs.len() as f64).max(1.0);
-            eprintln!(
-                "[cozip_pdeflate][timing][sparse-class-breakdown] chunks={} mode={:?} predicted_hist={} actual_hist={} cap_hist={} predicted_avg_kib={:.1} actual_avg_kib={:.1} cap_avg_kib={:.1} predicted_under_chunks={} predicted_under_mib={:.3} predicted_over_mib={:.3}",
-                inputs.len(),
-                compression_mode,
-                format_sparse_payload_class_counts(&predicted_class_counts),
-                format_sparse_payload_class_counts(&actual_class_counts),
-                format_sparse_payload_class_counts(&cap_class_counts),
-                (predicted_payload_bytes_total as f64) / chunks_f / 1024.0,
-                (actual_payload_bytes_total as f64) / chunks_f / 1024.0,
-                (cap_payload_bytes_total as f64) / chunks_f / 1024.0,
-                predicted_underestimate_chunks,
-                (predicted_underestimate_bytes as f64) / (1024.0 * 1024.0),
-                (predicted_overestimate_bytes as f64) / (1024.0 * 1024.0),
-            );
-        }
-        if gpu_call_unaccounted_probe {
-            let seq = GPU_CALL_UNACCOUNTED_SEQ.fetch_add(1, Ordering::Relaxed);
-            if table_stage_probe_should_log(seq) {
-                let host_unaccounted_ms = encoder_create_ms
-                    + pack_bind_group_ms
-                    + table_stream_copy_ms
-                    + match_clear_ms
-                    + sparse_prepare_dispatch_ms
-                    + sparse_pack_dispatch_ms
-                    + result_readback_setup_ms
-                    + payload_readback_setup_ms;
-                eprintln!(
-                    "[cozip_pdeflate][timing][gpu-call-unaccounted-breakdown] seq={} chunks={} pack_bind_group_ms={:.3} encoder_create_ms={:.3} table_stream_copy_ms={:.3} match_clear_ms={:.3} sparse_prepare_dispatch_ms={:.3} sparse_pack_dispatch_ms={:.3} result_readback_setup_ms={:.3} payload_readback_setup_ms={:.3} host_unaccounted_ms={:.3} profile_call_ms={:.3} profile_total_ms={:.3} call_minus_profile_total_ms={:.3}",
-                    seq,
-                    inputs.len(),
-                    pack_bind_group_ms,
-                    encoder_create_ms,
-                    table_stream_copy_ms,
-                    match_clear_ms,
-                    sparse_prepare_dispatch_ms,
-                    sparse_pack_dispatch_ms,
-                    result_readback_setup_ms,
-                    payload_readback_setup_ms,
-                    host_unaccounted_ms,
-                    match_upload_ms
-                        + match_table_copy_ms
-                        + match_prepare_dispatch_ms
-                        + match_kernel_dispatch_ms
-                        + section_upload_ms
-                        + section_setup_ms
-                        + section_pass_dispatch_ms
-                        + sparse_total_ms,
-                    match_upload_ms
-                        + section_upload_ms
-                        + sparse_profile.upload_ms
-                        + sparse_profile.wait_ms
-                        + sparse_profile.map_copy_ms,
-                    (match_upload_ms
-                        + match_table_copy_ms
-                        + match_prepare_dispatch_ms
-                        + match_kernel_dispatch_ms
-                        + section_upload_ms
-                        + section_setup_ms
-                        + section_pass_dispatch_ms
-                        + sparse_total_ms
-                        - (match_upload_ms
-                            + section_upload_ms
-                            + sparse_profile.upload_ms
-                            + sparse_profile.wait_ms
-                            + sparse_profile.map_copy_ms))
-                        .max(0.0),
-                );
-            }
-        }
         let _ = sparse_wait_attr_probe;
-
-        Ok(GpuBatchSparsePackOutput {
-            chunks: out,
-            match_profile: GpuMatchProfile {
-                upload_ms: match_upload_ms,
-                wait_ms: 0.0,
-                map_copy_ms: 0.0,
-                total_ms: match_upload_ms
-                    + match_table_copy_ms
-                    + match_prepare_dispatch_ms
-                    + match_kernel_dispatch_ms
-                    + match_submit_ms,
-            },
-            section_profile: GpuSectionEncodeProfile {
-                upload_ms: section_upload_ms,
-                wait_ms: 0.0,
-                map_copy_ms: 0.0,
-                total_ms: section_upload_ms
-                    + section_setup_ms
-                    + section_pass_dispatch_ms
-                    + section_submit_ms
-                    + section_meta_dispatch_ms,
-            },
-            sparse_profile,
-            sparse_batch_profile,
-            kernel_profile: GpuBatchKernelProfile {
-                pack_inputs_ms,
-                pack_alloc_setup_ms: pack_profile.alloc_setup_ms,
-                pack_resolve_sizes_ms: pack_profile.resolve_sizes_ms,
-                pack_resolve_scan_ms: pack_profile.resolve_scan_ms,
-                pack_resolve_readback_setup_ms: pack_profile.resolve_readback_setup_ms,
-                pack_resolve_submit_ms: pack_profile.resolve_submit_ms,
-                pack_resolve_map_wait_ms: pack_profile.resolve_map_wait_ms,
-                pack_resolve_parse_ms: pack_profile.resolve_parse_ms,
-                pack_src_copy_ms: pack_profile.src_copy_ms,
-                pack_metadata_loop_ms: pack_profile.metadata_loop_ms,
-                pack_host_copy_ms: pack_profile.host_copy_ms,
-                pack_device_copy_plan_ms: pack_profile.device_copy_plan_ms,
-                pack_finalize_ms: pack_profile.finalize_ms,
-                scratch_acquire_ms: batch_scratch_acquire_ms,
-                match_table_copy_ms,
-                match_prepare_dispatch_ms,
-                match_kernel_dispatch_ms,
-                match_submit_ms,
-                section_setup_ms,
-                section_pass_dispatch_ms,
-                section_tokenize_dispatch_ms,
-                section_prefix_dispatch_ms,
-                section_scatter_dispatch_ms,
-                section_pack_dispatch_ms,
-                section_meta_dispatch_ms,
-                section_submit_ms,
-                sparse_prepare_ms,
-                sparse_scratch_acquire_ms,
-                sparse_submit_ms,
-                sparse_lens_submit_ms: sparse_submit_ms,
-                sparse_lens_submit_done_wait_ms: sparse_wait_ms,
-                sparse_lens_map_after_done_ms: 0.0,
-                sparse_lens_poll_calls: 0,
-                sparse_lens_yield_calls: 0,
-                sparse_lens_wait_ms: sparse_wait_ms,
-                sparse_lens_copy_ms: lens_copy_ms,
-                sparse_wait_ms,
-                sparse_copy_ms,
-                sparse_total_ms,
-                call_pack_bind_group_ms: pack_bind_group_ms,
-                call_encoder_create_ms: encoder_create_ms,
-                call_table_stream_copy_ms: table_stream_copy_ms,
-                call_match_clear_ms: match_clear_ms,
-                call_sparse_prepare_dispatch_ms: sparse_prepare_dispatch_ms,
-                call_sparse_pack_dispatch_ms: sparse_pack_dispatch_ms,
-                call_result_readback_setup_ms: result_readback_setup_ms,
-                call_payload_readback_setup_ms: payload_readback_setup_ms,
-                ..GpuBatchKernelProfile::default()
-            },
+        let (sparse_latest_build_submit_seq, sparse_latest_build_id) = sparse_latest_build_submit
+            .as_ref()
+            .map(|(submit_seq, build_id, _)| (*submit_seq, *build_id))
+            .unwrap_or((0, 0));
+        Ok(PendingGpuSparsePackBatch {
+            inputs_len: inputs.len(),
+            compression_mode,
+            direct_states,
+            payload_readback_offsets,
+            payload_readback_plan_bytes,
+            result_readback_bytes,
+            payload_readback_bytes,
+            sparse_prebuild_build_id_min,
+            sparse_prebuild_build_id_max,
+            sparse_prebuild_submit_seq_min,
+            sparse_prebuild_submit_seq_max,
+            sparse_latest_build_submit_seq,
+            sparse_latest_build_id,
+            sparse_build_ids,
+            result_rx,
+            payload_rx: out_rx,
+            result_ready: false,
+            payload_ready: false,
+            submit_at: Instant::now(),
+            pack_alloc_setup_ms: pack_profile.alloc_setup_ms,
+            pack_resolve_sizes_ms: pack_profile.resolve_sizes_ms,
+            pack_resolve_scan_ms: pack_profile.resolve_scan_ms,
+            pack_resolve_readback_setup_ms: pack_profile.resolve_readback_setup_ms,
+            pack_resolve_submit_ms: pack_profile.resolve_submit_ms,
+            pack_resolve_map_wait_ms: pack_profile.resolve_map_wait_ms,
+            pack_resolve_parse_ms: pack_profile.resolve_parse_ms,
+            pack_src_copy_ms: pack_profile.src_copy_ms,
+            pack_metadata_loop_ms: pack_profile.metadata_loop_ms,
+            pack_host_copy_ms: pack_profile.host_copy_ms,
+            pack_device_copy_plan_ms: pack_profile.device_copy_plan_ms,
+            pack_finalize_ms: pack_profile.finalize_ms,
+            match_upload_ms,
+            match_table_copy_ms,
+            match_prepare_dispatch_ms,
+            match_kernel_dispatch_ms,
+            section_upload_ms,
+            section_setup_ms,
+            section_pass_dispatch_ms,
+            section_tokenize_dispatch_ms,
+            section_prefix_dispatch_ms,
+            section_scatter_dispatch_ms,
+            section_pack_dispatch_ms,
+            section_meta_dispatch_ms,
+            pack_inputs_ms,
+            batch_scratch_acquire_ms,
+            sparse_scratch_acquire_ms,
+            sparse_prepare_ms,
+            table_size_resolve_ms,
+            pack_bind_group_ms,
+            encoder_create_ms,
+            table_stream_copy_ms,
+            match_clear_ms,
+            sparse_prepare_dispatch_ms,
+            sparse_pack_dispatch_ms,
+            result_readback_setup_ms,
+            payload_readback_setup_ms,
+            submit_ms,
+            phase1_submit_done_wait_ms: 0.0,
+            phase1_result_wait_calls: 0,
+            phase1_payload_wait_calls: 0,
+            phase1_result_ready_hits: 0,
+            phase1_payload_ready_hits: 0,
+            phase1_yield_calls: 0,
+            batch_scratch: Some(batch_scratch),
+            sparse_scratch: Some(scratch),
         })
     })();
 
-    release_sparse_pack_scratch(r, scratch);
-    release_batch_scratch(r, batch_scratch);
-    result
+    match result {
+        Ok(pending) => Ok(pending),
+        Err(err) => {
+            if let Some(scratch) = scratch_slot.take() {
+                release_sparse_pack_scratch(r, scratch);
+            }
+            if let Some(batch_scratch) = batch_scratch_slot.take() {
+                release_batch_scratch(r, batch_scratch);
+            }
+            Err(err)
+        }
+    }
+}
+
+fn release_pending_gpu_sparse_pack_batch(
+    runtime: &GpuMatchRuntime,
+    pending: &mut PendingGpuSparsePackBatch,
+) {
+    if let Some(scratch) = pending.sparse_scratch.take() {
+        release_sparse_pack_scratch(runtime, scratch);
+    }
+    if let Some(scratch) = pending.batch_scratch.take() {
+        release_batch_scratch(runtime, scratch);
+    }
+}
+
+fn update_pending_map_ready(
+    pending: &mut PendingGpuSparsePackBatch,
+) -> Result<(), PDeflateError> {
+    if !pending.result_ready {
+        match pending.result_rx.try_recv() {
+            Ok(Ok(())) => {
+                pending.result_ready = true;
+                pending.phase1_result_ready_hits =
+                    pending.phase1_result_ready_hits.saturating_add(1);
+            }
+            Ok(Err(e)) => {
+                return Err(PDeflateError::Gpu(format!(
+                    "integrated/result-readback-map: map_async failed: {e}"
+                )));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(PDeflateError::Gpu(
+                    "integrated/result-readback-map: channel closed while waiting".to_string(),
+                ));
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+    if !pending.payload_ready {
+        match pending.payload_rx.try_recv() {
+            Ok(Ok(())) => {
+                pending.payload_ready = true;
+                pending.phase1_payload_ready_hits =
+                    pending.phase1_payload_ready_hits.saturating_add(1);
+            }
+            Ok(Err(e)) => {
+                return Err(PDeflateError::Gpu(format!(
+                    "integrated/payload-readback-map: map_async failed: {e}"
+                )));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(PDeflateError::Gpu(
+                    "integrated/payload-readback-map: channel closed while waiting".to_string(),
+                ));
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+    Ok(())
+}
+
+fn collect_pending_gpu_sparse_pack_batch(
+    pending: &mut PendingGpuSparsePackBatch,
+    block: bool,
+) -> Result<Option<GpuBatchSparsePackOutput>, PDeflateError> {
+    if pending.inputs_len == 0 {
+        return Ok(Some(GpuBatchSparsePackOutput {
+            chunks: Vec::new(),
+            match_profile: GpuMatchProfile::default(),
+            section_profile: GpuSectionEncodeProfile::default(),
+            sparse_profile: GpuMatchProfile::default(),
+            sparse_batch_profile: GpuSparsePackBatchProfile::default(),
+            kernel_profile: GpuBatchKernelProfile::default(),
+        }));
+    }
+
+    let r = runtime()?;
+    r.device.poll(wgpu::Maintain::Poll);
+    update_pending_map_ready(pending)?;
+    if !(pending.result_ready && pending.payload_ready) {
+        if !block {
+            return Ok(None);
+        }
+        let spin_polls_before_wait = sparse_ready_first_spin_polls();
+        let yield_rounds_before_wait = sparse_ready_first_yield_rounds();
+        let mut yield_rounds = 0usize;
+        while !(pending.result_ready && pending.payload_ready) {
+            for _ in 0..spin_polls_before_wait {
+                r.device.poll(wgpu::Maintain::Poll);
+                update_pending_map_ready(pending)?;
+                if pending.result_ready && pending.payload_ready {
+                    break;
+                }
+            }
+            if pending.result_ready && pending.payload_ready {
+                break;
+            }
+            if yield_rounds < yield_rounds_before_wait {
+                std::thread::yield_now();
+                pending.phase1_yield_calls = pending.phase1_yield_calls.saturating_add(1);
+                yield_rounds = yield_rounds.saturating_add(1);
+                continue;
+            }
+            if !pending.result_ready {
+                pending.phase1_result_wait_calls =
+                    pending.phase1_result_wait_calls.saturating_add(1);
+            }
+            if !pending.payload_ready {
+                pending.phase1_payload_wait_calls =
+                    pending.phase1_payload_wait_calls.saturating_add(1);
+            }
+            let t_wait = Instant::now();
+            r.device.poll(wgpu::Maintain::Wait);
+            pending.phase1_submit_done_wait_ms += elapsed_ms(t_wait);
+            yield_rounds = 0;
+            update_pending_map_ready(pending)?;
+        }
+    }
+
+    let Some(sparse_scratch) = pending.sparse_scratch.as_mut() else {
+        return Err(PDeflateError::Gpu(
+            "integrated/collect: sparse scratch missing".to_string(),
+        ));
+    };
+    let Some(_batch_scratch) = pending.batch_scratch.as_ref() else {
+        return Err(PDeflateError::Gpu(
+            "integrated/collect: batch scratch missing".to_string(),
+        ));
+    };
+
+    let result_slice = sparse_scratch
+        .result_readback_buffer
+        .slice(..pending.result_readback_bytes.max(4));
+    let payload_slice = sparse_scratch
+        .payload_readback_buffer
+        .slice(..pending.payload_readback_bytes.max(4));
+
+    let t_lens_copy = Instant::now();
+    let (payload_lens, payload_table_counts, payload_copy_bytes) = {
+        let result_mapped = result_slice.get_mapped_range();
+        let result_words: &[u32] = bytemuck::cast_slice(&result_mapped);
+        let parse_result = (|| -> Result<_, PDeflateError> {
+            let mut payload_lens = Vec::<usize>::with_capacity(pending.inputs_len);
+            let mut payload_table_counts = Vec::<usize>::with_capacity(pending.inputs_len);
+            let mut payload_copy_bytes = Vec::<u64>::with_capacity(pending.inputs_len);
+            for (idx, state) in pending.direct_states.iter().enumerate() {
+                let base = idx * GPU_SPARSE_PACK_BATCH_RESULT_WORDS;
+                let total_len_u32 = *result_words.get(base + 2).unwrap_or(&0xffff_ffff);
+                let total_words_u32 = *result_words.get(base + 3).unwrap_or(&0);
+                if total_len_u32 == 0xffff_ffff || total_words_u32 == 0 {
+                    return Err(PDeflateError::Gpu(
+                        "integrated/result-parse: sparse size prepare overflow while packing"
+                            .to_string(),
+                    ));
+                }
+                let total_len =
+                    usize::try_from(total_len_u32).map_err(|_| PDeflateError::NumericOverflow)?;
+                let total_copy_len = align_up4(total_len);
+                let total_copy_bytes = u64::try_from(total_copy_len)
+                    .map_err(|_| PDeflateError::NumericOverflow)?;
+                if total_copy_bytes > state.prep.total_bytes_cap {
+                    return Err(PDeflateError::Gpu(
+                        "gpu sparse pack produced oversized aligned payload".to_string(),
+                    ));
+                }
+                if total_copy_bytes > pending.payload_readback_plan_bytes[idx] {
+                    return Err(PDeflateError::Gpu(format!(
+                        "integrated/result-parse: planned payload readback too small idx={} planned={} actual={}",
+                        idx,
+                        pending.payload_readback_plan_bytes[idx],
+                        total_copy_bytes,
+                    )));
+                }
+                payload_copy_bytes.push(total_copy_bytes);
+                payload_lens.push(total_len);
+                payload_table_counts.push(state.prep.table_count);
+            }
+            Ok((payload_lens, payload_table_counts, payload_copy_bytes))
+        })();
+        drop(result_mapped);
+        sparse_scratch.result_readback_buffer.unmap();
+        parse_result?
+    };
+    let lens_copy_ms = elapsed_ms(t_lens_copy);
+
+    let t_copy = Instant::now();
+    let (
+        out,
+        predicted_payload_bytes_total,
+        cap_payload_bytes_total,
+        actual_payload_bytes_total,
+        predicted_class_counts,
+        cap_class_counts,
+        actual_class_counts,
+        predicted_underestimate_chunks,
+        predicted_underestimate_bytes,
+        predicted_overestimate_bytes,
+    ) = {
+        let payload_mapped = payload_slice.get_mapped_range();
+        let payload_bytes: &[u8] = &payload_mapped;
+        let copy_result = (|| -> Result<_, PDeflateError> {
+            let mut out = Vec::<GpuSparsePackChunkOutput>::with_capacity(pending.inputs_len);
+            let mut predicted_payload_bytes_total = 0u64;
+            let mut cap_payload_bytes_total = 0u64;
+            let mut actual_payload_bytes_total = 0u64;
+            let mut predicted_class_counts = [0u32; GPU_SPARSE_PAYLOAD_CLASS_COUNT];
+            let mut cap_class_counts = [0u32; GPU_SPARSE_PAYLOAD_CLASS_COUNT];
+            let mut actual_class_counts = [0u32; GPU_SPARSE_PAYLOAD_CLASS_COUNT];
+            let mut predicted_underestimate_chunks = 0u32;
+            let mut predicted_underestimate_bytes = 0u64;
+            let mut predicted_overestimate_bytes = 0u64;
+            for (idx, state) in pending.direct_states.iter().enumerate() {
+                let chunk_base = usize::try_from(pending.payload_readback_offsets[idx])
+                    .map_err(|_| PDeflateError::NumericOverflow)?;
+                let chunk_end = chunk_base
+                    .checked_add(
+                        usize::try_from(payload_copy_bytes[idx])
+                            .map_err(|_| PDeflateError::NumericOverflow)?,
+                    )
+                    .ok_or(PDeflateError::NumericOverflow)?;
+                let mapped = payload_bytes.get(chunk_base..chunk_end).ok_or_else(|| {
+                    PDeflateError::Gpu(format!(
+                        "integrated/payload-readback-copy: payload batch readback truncated idx={} chunk_base={} chunk_copy_len={} payload_len={} payload_readback_bytes={} mapped_len={} out_base_word={}",
+                        idx,
+                        chunk_base,
+                        payload_copy_bytes[idx],
+                        payload_lens[idx],
+                        pending.payload_readback_bytes,
+                        payload_bytes.len(),
+                        state.host.out_base_word,
+                    ))
+                })?;
+                let payload_len = payload_lens[idx];
+                let actual_payload_class = classify_sparse_payload_bytes(payload_len);
+                predicted_payload_bytes_total = predicted_payload_bytes_total
+                    .saturating_add(u64::try_from(state.predicted_payload_bytes).unwrap_or(u64::MAX));
+                cap_payload_bytes_total =
+                    cap_payload_bytes_total.saturating_add(state.prep.total_bytes_cap);
+                actual_payload_bytes_total = actual_payload_bytes_total
+                    .saturating_add(u64::try_from(payload_len).unwrap_or(u64::MAX));
+                predicted_class_counts[state.predicted_payload_class.idx()] =
+                    predicted_class_counts[state.predicted_payload_class.idx()].saturating_add(1);
+                cap_class_counts[state.cap_payload_class.idx()] =
+                    cap_class_counts[state.cap_payload_class.idx()].saturating_add(1);
+                actual_class_counts[actual_payload_class.idx()] =
+                    actual_class_counts[actual_payload_class.idx()].saturating_add(1);
+                if state.predicted_payload_bytes < payload_len {
+                    predicted_underestimate_chunks =
+                        predicted_underestimate_chunks.saturating_add(1);
+                    predicted_underestimate_bytes = predicted_underestimate_bytes.saturating_add(
+                        u64::try_from(payload_len - state.predicted_payload_bytes)
+                            .unwrap_or(u64::MAX),
+                    );
+                } else {
+                    predicted_overestimate_bytes = predicted_overestimate_bytes.saturating_add(
+                        u64::try_from(state.predicted_payload_bytes - payload_len)
+                            .unwrap_or(u64::MAX),
+                    );
+                }
+                let mut payload = vec![0u8; payload_len];
+                payload.copy_from_slice(&mapped[..payload_len]);
+                ensure_sparse_packed_chunk_huff_lut(&mut payload)?;
+                if gpu_sparse_payload_validate_enabled() {
+                    let mut validate_out = vec![0u8; state.chunk_len];
+                    super::decompress_chunk_into(&payload, &mut validate_out).map_err(|err| {
+                        PDeflateError::Gpu(format!(
+                            "integrated/validate-final-payload: {err}"
+                        ))
+                    })?;
+                }
+                out.push(GpuSparsePackChunkOutput {
+                    payload,
+                    table_count: payload_table_counts[idx],
+                });
+            }
+            Ok((
+                out,
+                predicted_payload_bytes_total,
+                cap_payload_bytes_total,
+                actual_payload_bytes_total,
+                predicted_class_counts,
+                cap_class_counts,
+                actual_class_counts,
+                predicted_underestimate_chunks,
+                predicted_underestimate_bytes,
+                predicted_overestimate_bytes,
+            ))
+        })();
+        drop(payload_mapped);
+        sparse_scratch.payload_readback_buffer.unmap();
+        copy_result?
+    };
+    let sparse_copy_ms = elapsed_ms(t_copy);
+
+    let match_stage_weight =
+        pending.match_table_copy_ms + pending.match_prepare_dispatch_ms + pending.match_kernel_dispatch_ms;
+    let section_stage_weight = pending.section_setup_ms + pending.section_pass_dispatch_ms;
+    let sparse_stage_weight = pending.sparse_prepare_dispatch_ms + pending.sparse_pack_dispatch_ms;
+    let stage_weight_sum = match_stage_weight + section_stage_weight + sparse_stage_weight;
+    let match_submit_ms = if stage_weight_sum > 0.0 {
+        pending.submit_ms * (match_stage_weight / stage_weight_sum)
+    } else {
+        pending.submit_ms
+    };
+    let section_submit_ms = if stage_weight_sum > 0.0 {
+        pending.submit_ms * (section_stage_weight / stage_weight_sum)
+    } else {
+        0.0
+    };
+    let sparse_submit_ms = if stage_weight_sum > 0.0 {
+        pending.submit_ms * (sparse_stage_weight / stage_weight_sum)
+    } else {
+        0.0
+    };
+    let sparse_wait_ms = pending.phase1_submit_done_wait_ms;
+    let sparse_total_ms = pending.sparse_prepare_ms
+        + pending.sparse_scratch_acquire_ms
+        + sparse_submit_ms
+        + sparse_wait_ms
+        + lens_copy_ms
+        + sparse_copy_ms;
+    let sparse_profile = GpuMatchProfile {
+        upload_ms: 0.0,
+        wait_ms: sparse_wait_ms,
+        map_copy_ms: lens_copy_ms + sparse_copy_ms,
+        total_ms: sparse_total_ms,
+    };
+    let sparse_batch_profile = GpuSparsePackBatchProfile {
+        chunks: pending.inputs_len,
+        lens_bytes_total: pending
+            .direct_states
+            .iter()
+            .fold(0u64, |acc, s| acc.saturating_add(s.out_lens_bytes.max(4))),
+        out_cmd_bytes_total: pending
+            .direct_states
+            .iter()
+            .fold(0u64, |acc, s| acc.saturating_add(s.out_cmd_bytes.max(4))),
+        predicted_payload_bytes_total,
+        cap_payload_bytes_total,
+        actual_payload_bytes_total,
+        predicted_class_counts,
+        cap_class_counts,
+        actual_class_counts,
+        predicted_underestimate_chunks,
+        predicted_underestimate_bytes,
+        predicted_overestimate_bytes,
+        lens_submit_ms: sparse_submit_ms,
+        lens_submit_done_wait_ms: sparse_wait_ms,
+        lens_map_after_done_ms: 0.0,
+        lens_poll_calls: 0,
+        lens_yield_calls: pending.phase1_yield_calls,
+        lens_wait_ms: sparse_wait_ms,
+        lens_copy_ms,
+        prepare_ms: pending.sparse_prepare_ms,
+        table_size_resolve_ms: pending.table_size_resolve_ms,
+        prepare_misc_ms: (pending.sparse_prepare_ms - pending.table_size_resolve_ms).max(0.0),
+        scratch_acquire_ms: pending.sparse_scratch_acquire_ms,
+        upload_dispatch_ms: 0.0,
+        submit_ms: sparse_submit_ms,
+        wait_ms: sparse_wait_ms,
+        copy_ms: sparse_copy_ms,
+        total_ms: sparse_total_ms,
+    };
+
+    let sparse_kernel_ts_probe = sparse_kernel_ts_probe_enabled() && r.supports_timestamp_query;
+    if sparse_lens_wait_probe_enabled() {
+        let seq = SPARSE_LENS_WAIT_PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+        if table_stage_probe_should_log(seq) {
+            let readback_bytes =
+                pending.result_readback_bytes.saturating_add(pending.payload_readback_bytes);
+            let build_id_range = if pending.sparse_prebuild_build_id_min != u64::MAX {
+                format!(
+                    "{}..{}",
+                    pending.sparse_prebuild_build_id_min, pending.sparse_prebuild_build_id_max
+                )
+            } else {
+                "none".to_string()
+            };
+            let submit_seq_range = if pending.sparse_prebuild_submit_seq_min != u64::MAX {
+                format!(
+                    "{}..{}",
+                    pending.sparse_prebuild_submit_seq_min, pending.sparse_prebuild_submit_seq_max
+                )
+            } else {
+                "none".to_string()
+            };
+            let build_ids = if pending.sparse_build_ids.is_empty() {
+                "none".to_string()
+            } else {
+                pending
+                    .sparse_build_ids
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            eprintln!(
+                "[cozip_pdeflate][timing][sparse-lens-wait-breakdown] seq={} chunks={} pending_maps={} readback_kib={:.1} payload_readback_kib={:.1} build_id_range={} build_submit_seq_range={} build_ids={} latest_build_submit_seq={} latest_build_id={} sparse_submit_seq=0 sparse_submit_seq_last=0 sparse_submit_count=1 payload_submit_seq=0 pre_wait_latest_build_submit_ms=0.000 submit_done_wait_sparse_ms={:.3} submit_done_wait_payload_ms={:.3} submit_done_wait_ms={:.3} map_callback_wait_sparse_ms=0.000 map_callback_wait_payload_ms=0.000 map_callback_wait_ms=0.000 sparse_wait_calls={} payload_wait_calls={} sparse_wait_max_ms={:.3} payload_wait_max_ms={:.3} sparse_wait_ready={} payload_wait_ready={} sparse_ts_prepare_kernel_ms=0.000 sparse_ts_kernel_ms=0.000 sparse_ts_kernel_total_ms=0.000 sparse_ts_parse_ms=0.000 sparse_ts_queue_stall_est_ms=0.000 sparse_ts_status={} lens_wait_ms={:.3}",
+                seq,
+                pending.inputs_len,
+                2,
+                (readback_bytes as f64) / 1024.0,
+                (pending.payload_readback_bytes as f64) / 1024.0,
+                build_id_range,
+                submit_seq_range,
+                build_ids,
+                pending.sparse_latest_build_submit_seq,
+                pending.sparse_latest_build_id,
+                pending.phase1_submit_done_wait_ms,
+                0.0,
+                sparse_wait_ms,
+                pending.phase1_result_wait_calls,
+                pending.phase1_payload_wait_calls,
+                0.0,
+                0.0,
+                pending.phase1_result_ready_hits,
+                pending.phase1_payload_ready_hits,
+                if sparse_kernel_ts_probe { "on" } else { "off" },
+                sparse_wait_ms,
+            );
+        }
+    }
+    if profile_enabled() {
+        let chunks_f = (pending.inputs_len as f64).max(1.0);
+        eprintln!(
+            "[cozip_pdeflate][timing][sparse-class-breakdown] chunks={} mode={:?} predicted_hist={} actual_hist={} cap_hist={} predicted_avg_kib={:.1} actual_avg_kib={:.1} cap_avg_kib={:.1} predicted_under_chunks={} predicted_under_mib={:.3} predicted_over_mib={:.3}",
+            pending.inputs_len,
+            pending.compression_mode,
+            format_sparse_payload_class_counts(&predicted_class_counts),
+            format_sparse_payload_class_counts(&actual_class_counts),
+            format_sparse_payload_class_counts(&cap_class_counts),
+            (predicted_payload_bytes_total as f64) / chunks_f / 1024.0,
+            (actual_payload_bytes_total as f64) / chunks_f / 1024.0,
+            (cap_payload_bytes_total as f64) / chunks_f / 1024.0,
+            predicted_underestimate_chunks,
+            (predicted_underestimate_bytes as f64) / (1024.0 * 1024.0),
+            (predicted_overestimate_bytes as f64) / (1024.0 * 1024.0),
+        );
+    }
+    if gpu_call_unaccounted_probe_enabled() {
+        let seq = GPU_CALL_UNACCOUNTED_SEQ.fetch_add(1, Ordering::Relaxed);
+        if table_stage_probe_should_log(seq) {
+            let host_unaccounted_ms = pending.encoder_create_ms
+                + pending.pack_bind_group_ms
+                + pending.table_stream_copy_ms
+                + pending.match_clear_ms
+                + pending.sparse_prepare_dispatch_ms
+                + pending.sparse_pack_dispatch_ms
+                + pending.result_readback_setup_ms
+                + pending.payload_readback_setup_ms;
+            eprintln!(
+                "[cozip_pdeflate][timing][gpu-call-unaccounted-breakdown] seq={} chunks={} pack_bind_group_ms={:.3} encoder_create_ms={:.3} table_stream_copy_ms={:.3} match_clear_ms={:.3} sparse_prepare_dispatch_ms={:.3} sparse_pack_dispatch_ms={:.3} result_readback_setup_ms={:.3} payload_readback_setup_ms={:.3} host_unaccounted_ms={:.3} profile_call_ms={:.3} profile_total_ms={:.3} call_minus_profile_total_ms={:.3}",
+                seq,
+                pending.inputs_len,
+                pending.pack_bind_group_ms,
+                pending.encoder_create_ms,
+                pending.table_stream_copy_ms,
+                pending.match_clear_ms,
+                pending.sparse_prepare_dispatch_ms,
+                pending.sparse_pack_dispatch_ms,
+                pending.result_readback_setup_ms,
+                pending.payload_readback_setup_ms,
+                host_unaccounted_ms,
+                pending.match_upload_ms
+                    + pending.match_table_copy_ms
+                    + pending.match_prepare_dispatch_ms
+                    + pending.match_kernel_dispatch_ms
+                    + pending.section_upload_ms
+                    + pending.section_setup_ms
+                    + pending.section_pass_dispatch_ms
+                    + sparse_total_ms,
+                pending.match_upload_ms + pending.section_upload_ms + sparse_profile.total_ms,
+                (pending.match_upload_ms
+                    + pending.match_table_copy_ms
+                    + pending.match_prepare_dispatch_ms
+                    + pending.match_kernel_dispatch_ms
+                    + pending.section_upload_ms
+                    + pending.section_setup_ms
+                    + pending.section_pass_dispatch_ms
+                    + sparse_total_ms
+                    - (pending.match_upload_ms + pending.section_upload_ms + sparse_profile.total_ms))
+                    .max(0.0),
+            );
+        }
+    }
+
+    let out_result = GpuBatchSparsePackOutput {
+        chunks: out,
+        match_profile: GpuMatchProfile {
+            upload_ms: pending.match_upload_ms,
+            wait_ms: 0.0,
+            map_copy_ms: 0.0,
+            total_ms: pending.match_upload_ms
+                + pending.match_table_copy_ms
+                + pending.match_prepare_dispatch_ms
+                + pending.match_kernel_dispatch_ms
+                + match_submit_ms,
+        },
+        section_profile: GpuSectionEncodeProfile {
+            upload_ms: pending.section_upload_ms,
+            wait_ms: 0.0,
+            map_copy_ms: 0.0,
+            total_ms: pending.section_upload_ms
+                + pending.section_setup_ms
+                + pending.section_pass_dispatch_ms
+                + section_submit_ms
+                + pending.section_meta_dispatch_ms,
+        },
+        sparse_profile,
+        sparse_batch_profile,
+        kernel_profile: GpuBatchKernelProfile {
+            pack_inputs_ms: pending.pack_inputs_ms,
+            pack_alloc_setup_ms: pending.pack_alloc_setup_ms,
+            pack_resolve_sizes_ms: pending.pack_resolve_sizes_ms,
+            pack_resolve_scan_ms: pending.pack_resolve_scan_ms,
+            pack_resolve_readback_setup_ms: pending.pack_resolve_readback_setup_ms,
+            pack_resolve_submit_ms: pending.pack_resolve_submit_ms,
+            pack_resolve_map_wait_ms: pending.pack_resolve_map_wait_ms,
+            pack_resolve_parse_ms: pending.pack_resolve_parse_ms,
+            pack_src_copy_ms: pending.pack_src_copy_ms,
+            pack_metadata_loop_ms: pending.pack_metadata_loop_ms,
+            pack_host_copy_ms: pending.pack_host_copy_ms,
+            pack_device_copy_plan_ms: pending.pack_device_copy_plan_ms,
+            pack_finalize_ms: pending.pack_finalize_ms,
+            scratch_acquire_ms: pending.batch_scratch_acquire_ms,
+            match_table_copy_ms: pending.match_table_copy_ms,
+            match_prepare_dispatch_ms: pending.match_prepare_dispatch_ms,
+            match_kernel_dispatch_ms: pending.match_kernel_dispatch_ms,
+            match_submit_ms,
+            section_setup_ms: pending.section_setup_ms,
+            section_pass_dispatch_ms: pending.section_pass_dispatch_ms,
+            section_tokenize_dispatch_ms: pending.section_tokenize_dispatch_ms,
+            section_prefix_dispatch_ms: pending.section_prefix_dispatch_ms,
+            section_scatter_dispatch_ms: pending.section_scatter_dispatch_ms,
+            section_pack_dispatch_ms: pending.section_pack_dispatch_ms,
+            section_meta_dispatch_ms: pending.section_meta_dispatch_ms,
+            section_submit_ms,
+            sparse_prepare_ms: pending.sparse_prepare_ms,
+            sparse_scratch_acquire_ms: pending.sparse_scratch_acquire_ms,
+            sparse_submit_ms,
+            sparse_lens_submit_ms: sparse_submit_ms,
+            sparse_lens_submit_done_wait_ms: sparse_wait_ms,
+            sparse_lens_map_after_done_ms: 0.0,
+            sparse_lens_poll_calls: 0,
+            sparse_lens_yield_calls: pending.phase1_yield_calls,
+            sparse_lens_wait_ms: sparse_wait_ms,
+            sparse_lens_copy_ms: lens_copy_ms,
+            sparse_wait_ms,
+            sparse_copy_ms,
+            sparse_total_ms,
+            call_pack_bind_group_ms: pending.pack_bind_group_ms,
+            call_encoder_create_ms: pending.encoder_create_ms,
+            call_table_stream_copy_ms: pending.table_stream_copy_ms,
+            call_match_clear_ms: pending.match_clear_ms,
+            call_sparse_prepare_dispatch_ms: pending.sparse_prepare_dispatch_ms,
+            call_sparse_pack_dispatch_ms: pending.sparse_pack_dispatch_ms,
+            call_result_readback_setup_ms: pending.result_readback_setup_ms,
+            call_payload_readback_setup_ms: pending.payload_readback_setup_ms,
+            ..GpuBatchKernelProfile::default()
+        },
+    };
+    release_pending_gpu_sparse_pack_batch(r, pending);
+    Ok(Some(out_result))
+}
+
+pub(crate) fn try_collect_matches_encode_and_pack_sparse_batch(
+    pending: &mut PendingGpuSparsePackBatch,
+) -> Result<Option<GpuBatchSparsePackOutput>, PDeflateError> {
+    let r = runtime()?;
+    match collect_pending_gpu_sparse_pack_batch(pending, false) {
+        Ok(out) => Ok(out),
+        Err(err) => {
+            release_pending_gpu_sparse_pack_batch(r, pending);
+            Err(err)
+        }
+    }
+}
+
+pub(crate) fn collect_matches_encode_and_pack_sparse_batch(
+    mut pending: PendingGpuSparsePackBatch,
+) -> Result<GpuBatchSparsePackOutput, PDeflateError> {
+    let r = runtime()?;
+    match collect_pending_gpu_sparse_pack_batch(&mut pending, true) {
+        Ok(Some(out)) => Ok(out),
+        Ok(None) => Err(PDeflateError::Gpu(
+            "integrated/collect: pending batch was not ready after blocking collect".to_string(),
+        )),
+        Err(err) => {
+            release_pending_gpu_sparse_pack_batch(r, &mut pending);
+            Err(err)
+        }
+    }
+}
+
+pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
+    inputs: &[GpuMatchInput<'_>],
+    section_count: usize,
+    max_cmd_len: usize,
+) -> Result<GpuBatchSparsePackOutput, PDeflateError> {
+    let pending = submit_matches_encode_and_pack_sparse_batch(inputs, section_count, max_cmd_len)?;
+    collect_matches_encode_and_pack_sparse_batch(pending)
 }
 
 pub(crate) fn compute_matches(input: &GpuMatchInput<'_>) -> Result<GpuMatchOutput, PDeflateError> {

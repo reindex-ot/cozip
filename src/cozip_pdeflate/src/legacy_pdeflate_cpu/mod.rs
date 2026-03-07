@@ -4,7 +4,6 @@ use std::collections::{BinaryHeap, VecDeque};
 use std::ptr;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -3059,129 +3058,136 @@ fn compress_chunk_gpu_batch(
                 }
             };
 
-        let scoped_result: Result<(), PDeflateError> = thread::scope(|scope| {
-            let (tx, rx) = mpsc::channel::<(
-                Vec<usize>,
-                Result<gpu::GpuBatchSparsePackOutput, PDeflateError>,
-            )>();
-            let mut inflight = 0usize;
-            let mut drain_ready = |inflight: &mut usize,
-                                   ready: &mut Vec<(
-                Vec<usize>,
-                Result<gpu::GpuBatchSparsePackOutput, PDeflateError>,
-            )>|
-             -> Result<usize, PDeflateError> {
-                let mut drained = 0usize;
-                loop {
-                    match rx.try_recv() {
-                        Ok((prep_indices, batch_res)) => {
-                            *inflight = inflight.saturating_sub(1);
-                            drained = drained.saturating_add(1);
-                            ready.push((prep_indices, batch_res));
-                        }
-                        Err(mpsc::TryRecvError::Empty) => break,
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            return Err(PDeflateError::Gpu(
-                                "gpu sparse batch worker channel closed unexpectedly".to_string(),
-                            ));
-                        }
-                    }
-                }
-                Ok(drained)
-            };
-            let mut ready_batches = Vec::new();
-
-            for job_group in gpu_job_indices.chunks(submit_group) {
-                let _ = drain_ready(&mut inflight, &mut ready_batches)?;
-                for (prep_indices, batch_res) in ready_batches.drain(..) {
-                    handle_integrated_batch(prep_indices, batch_res);
-                }
-                let prep_indices = job_group.to_vec();
-                let gpu_inputs: Vec<gpu::GpuMatchInput<'_>> = prep_indices
-                    .iter()
-                    .map(|&idx| {
-                        let p = &prepared[idx];
-                        gpu::GpuMatchInput {
-                            src: p.chunk,
-                            table: p.table.as_deref().unwrap_or(&[]),
-                            table_gpu: p.gpu_table.as_ref(),
-                            table_index: Some(&p.table_index),
-                            table_data: Some(&p.table_data),
-                            max_ref_len: p.max_ref_len,
-                            min_ref_len: options.min_ref_len,
-                            section_count: options.section_count,
-                            compression_mode: options.compression_mode,
-                        }
-                    })
-                    .collect();
-                let tx_batch = tx.clone();
-                scope.spawn(move || {
-                    let res = gpu::compute_matches_encode_and_pack_sparse_batch(
-                        &gpu_inputs,
-                        options.section_count,
-                        gpu_max_cmd_len,
-                    );
-                    let _ = tx_batch.send((prep_indices, res));
-                });
-                inflight = inflight.saturating_add(1);
-                let _ = drain_ready(&mut inflight, &mut ready_batches)?;
-                for (prep_indices, batch_res) in ready_batches.drain(..) {
-                    handle_integrated_batch(prep_indices, batch_res);
-                }
-                if inflight >= wait_high_watermark {
-                    let (prep_indices, batch_res) = rx.recv().map_err(|_| {
-                        PDeflateError::Gpu(
-                            "gpu sparse batch worker channel closed unexpectedly".to_string(),
-                        )
-                    })?;
-                    inflight = inflight.saturating_sub(1);
-                    handle_integrated_batch(prep_indices, batch_res);
-                    let _ = drain_ready(&mut inflight, &mut ready_batches)?;
-                    for (prep_indices, batch_res) in ready_batches.drain(..) {
-                        handle_integrated_batch(prep_indices, batch_res);
-                    }
-                } else if inflight >= target_inflight {
-                    let drained = drain_ready(&mut inflight, &mut ready_batches)?;
-                    for (prep_indices, batch_res) in ready_batches.drain(..) {
-                        handle_integrated_batch(prep_indices, batch_res);
-                    }
-                    if drained == 0 {
-                        let (prep_indices, batch_res) = rx.recv().map_err(|_| {
+        let mut pending_batches = VecDeque::<(
+            Vec<usize>,
+            gpu::PendingGpuSparsePackBatch,
+        )>::new();
+        let drain_ready = |pending_batches: &mut VecDeque<(
+            Vec<usize>,
+            gpu::PendingGpuSparsePackBatch,
+        )>|
+         -> Result<Vec<(
+            Vec<usize>,
+            Result<gpu::GpuBatchSparsePackOutput, PDeflateError>,
+        )>, PDeflateError> {
+            let mut ready = Vec::new();
+            let mut idx = 0usize;
+            while idx < pending_batches.len() {
+                let collect_res = {
+                    let (_, pending) = pending_batches
+                        .get_mut(idx)
+                        .ok_or_else(|| {
                             PDeflateError::Gpu(
-                                "gpu sparse batch worker channel closed unexpectedly".to_string(),
+                                "gpu sparse pending batch queue corrupted".to_string(),
                             )
                         })?;
-                        inflight = inflight.saturating_sub(1);
-                        handle_integrated_batch(prep_indices, batch_res);
+                    gpu::try_collect_matches_encode_and_pack_sparse_batch(pending)
+                };
+                match collect_res {
+                    Ok(Some(batch)) => {
+                        let (prep_indices, _) = pending_batches.remove(idx).ok_or_else(|| {
+                            PDeflateError::Gpu(
+                                "gpu sparse pending batch removal failed".to_string(),
+                            )
+                        })?;
+                        ready.push((prep_indices, Ok(batch)));
+                    }
+                    Ok(None) => {
+                        idx = idx.saturating_add(1);
+                    }
+                    Err(err) => {
+                        let (prep_indices, _) = pending_batches.remove(idx).ok_or_else(|| {
+                            PDeflateError::Gpu(
+                                "gpu sparse pending batch removal failed".to_string(),
+                            )
+                        })?;
+                        ready.push((prep_indices, Err(err)));
                     }
                 }
             }
-            drop(tx);
-            while inflight > 0 {
-                let drained = drain_ready(&mut inflight, &mut ready_batches)?;
-                for (prep_indices, batch_res) in ready_batches.drain(..) {
-                    handle_integrated_batch(prep_indices, batch_res);
-                }
-                if drained > 0 {
-                    continue;
-                }
-                let (prep_indices, batch_res) = rx.recv().map_err(|_| {
-                    PDeflateError::Gpu(
-                        "gpu sparse batch worker channel closed unexpectedly".to_string(),
-                    )
-                })?;
-                inflight = inflight.saturating_sub(1);
+            Ok(ready)
+        };
+
+        for job_group in gpu_job_indices.chunks(submit_group) {
+            for (prep_indices, batch_res) in drain_ready(&mut pending_batches)? {
                 handle_integrated_batch(prep_indices, batch_res);
             }
-            Ok(())
-        });
-        if let Err(err) = scoped_result {
-            fallback_integrated_error_chunks =
-                fallback_integrated_error_chunks.saturating_add(gpu_job_indices.len());
-            if fallback_integrated_error_example.is_none() {
-                fallback_integrated_error_example = Some(err.to_string());
+            while pending_batches.len() >= target_inflight {
+                let ready = drain_ready(&mut pending_batches)?;
+                let drained = ready.len();
+                for (prep_indices, batch_res) in ready {
+                    handle_integrated_batch(prep_indices, batch_res);
+                }
+                if drained > 0 && pending_batches.len() < target_inflight {
+                    break;
+                }
+                if pending_batches.len() >= wait_high_watermark || drained == 0 {
+                    let Some((prep_indices, pending)) = pending_batches.pop_front() else {
+                        break;
+                    };
+                    let batch_res =
+                        gpu::collect_matches_encode_and_pack_sparse_batch(pending);
+                    handle_integrated_batch(prep_indices, batch_res);
+                }
             }
-            fallback_match_job_indices.extend(gpu_job_indices.iter().copied());
+
+            let prep_indices = job_group.to_vec();
+            let gpu_inputs: Vec<gpu::GpuMatchInput<'_>> = prep_indices
+                .iter()
+                .map(|&idx| {
+                    let p = &prepared[idx];
+                    gpu::GpuMatchInput {
+                        src: p.chunk,
+                        table: p.table.as_deref().unwrap_or(&[]),
+                        table_gpu: p.gpu_table.as_ref(),
+                        table_index: Some(&p.table_index),
+                        table_data: Some(&p.table_data),
+                        max_ref_len: p.max_ref_len,
+                        min_ref_len: options.min_ref_len,
+                        section_count: options.section_count,
+                        compression_mode: options.compression_mode,
+                    }
+                })
+                .collect();
+            match gpu::submit_matches_encode_and_pack_sparse_batch(
+                &gpu_inputs,
+                options.section_count,
+                gpu_max_cmd_len,
+            ) {
+                Ok(pending) => {
+                    pending_batches.push_back((prep_indices, pending));
+                }
+                Err(err) => {
+                    handle_integrated_batch(prep_indices, Err(err));
+                }
+            }
+            for (prep_indices, batch_res) in drain_ready(&mut pending_batches)? {
+                handle_integrated_batch(prep_indices, batch_res);
+            }
+            while pending_batches.len() >= wait_high_watermark {
+                let Some((prep_indices, pending)) = pending_batches.pop_front() else {
+                    break;
+                };
+                let batch_res = gpu::collect_matches_encode_and_pack_sparse_batch(pending);
+                handle_integrated_batch(prep_indices, batch_res);
+                for (prep_indices, batch_res) in drain_ready(&mut pending_batches)? {
+                    handle_integrated_batch(prep_indices, batch_res);
+                }
+            }
+        }
+        while !pending_batches.is_empty() {
+            let ready = drain_ready(&mut pending_batches)?;
+            if !ready.is_empty() {
+                for (prep_indices, batch_res) in ready {
+                    handle_integrated_batch(prep_indices, batch_res);
+                }
+                continue;
+            }
+            let Some((prep_indices, pending)) = pending_batches.pop_front() else {
+                break;
+            };
+            let batch_res = gpu::collect_matches_encode_and_pack_sparse_batch(pending);
+            handle_integrated_batch(prep_indices, batch_res);
         }
 
         if !fallback_match_job_indices.is_empty() {
