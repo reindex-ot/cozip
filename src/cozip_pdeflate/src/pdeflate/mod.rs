@@ -13,6 +13,7 @@ use thiserror::Error;
 
 mod gpu;
 mod shaders;
+mod stream;
 
 const STREAM_MAGIC: [u8; 4] = *b"PDS0";
 const CHUNK_MAGIC: [u8; 4] = *b"PDF0";
@@ -218,7 +219,7 @@ impl Default for PDeflateOptions {
             hash_history_limit: 16,
             table_sample_stride: 4,
             gpu_table_sample_stride: 16,
-            gpu_compress_enabled: false,
+            gpu_compress_enabled: true,
             gpu_decompress_enabled: true,
             gpu_decompress_force_gpu: false,
             gpu_workers: 1,
@@ -640,272 +641,44 @@ pub(crate) fn pdeflate_compress_reader_with_stats<R: Read + Send, W: Write>(
     target_buffered_bytes: usize,
     low_watermark_bytes: usize,
 ) -> Result<PDeflateStats, PDeflateError> {
-    validate_options(options)?;
-
-    let mut input_bytes = 0u64;
-    let mut output_bytes =
-        u64::try_from(STREAM_HEADER_SIZE).map_err(|_| PDeflateError::NumericOverflow)?;
-    let mut chunk_count = 0usize;
-    let mut table_entries_total = 0usize;
-    let mut section_count_total = 0usize;
-    let chunk_size = options.chunk_size.max(1);
-    let target_buffered_bytes = target_buffered_bytes.max(chunk_size);
-    let low_watermark_bytes = low_watermark_bytes.max(chunk_size).min(target_buffered_bytes);
-
-    #[derive(Default)]
-    struct StreamQueueState {
-        queue: VecDeque<Vec<u8>>,
-        buffered_bytes: usize,
-        eof: bool,
-        error: Option<std::io::Error>,
-        stopped: bool,
-    }
-
-    let queue = Arc::new((Mutex::new(StreamQueueState::default()), Condvar::new()));
-    let mut header = Vec::with_capacity(STREAM_HEADER_SIZE);
-    header.extend_from_slice(&STREAM_MAGIC);
-    write_u16_le(&mut header, STREAM_VERSION);
-    write_u16_le(&mut header, 0);
-    write_u32_le(
-        &mut header,
-        u32::try_from(options.chunk_size).map_err(|_| PDeflateError::NumericOverflow)?,
-    );
-    writer.write_all(&header)?;
-
-    thread::scope(|scope| -> Result<(), PDeflateError> {
-        let queue_ref = Arc::clone(&queue);
-        scope.spawn(move || {
-            loop {
-                let (lock, cv) = &*queue_ref;
-                let mut state = match lock.lock() {
-                    Ok(guard) => guard,
-                    Err(_) => return,
-                };
-                while state.buffered_bytes >= target_buffered_bytes
-                    && state.error.is_none()
-                    && !state.stopped
-                {
-                    state = match cv.wait(state) {
-                        Ok(guard) => guard,
-                        Err(_) => return,
-                    };
-                }
-                if state.stopped || state.error.is_some() {
-                    return;
-                }
-                drop(state);
-
-                let mut buffer = vec![0u8; chunk_size];
-                let mut filled = 0usize;
-                while filled < chunk_size {
-                    match reader.read(&mut buffer[filled..]) {
-                        Ok(0) => break,
-                        Ok(read) => filled = filled.saturating_add(read),
-                        Err(err) => {
-                            let (lock, cv) = &*queue_ref;
-                            if let Ok(mut state) = lock.lock() {
-                                state.error = Some(err);
-                                state.stopped = true;
-                                cv.notify_all();
-                            }
-                            return;
-                        }
-                    }
-                }
-
-                let (lock, cv) = &*queue_ref;
-                let mut state = match lock.lock() {
-                    Ok(guard) => guard,
-                    Err(_) => return,
-                };
-                if filled == 0 {
-                    state.eof = true;
-                    cv.notify_all();
-                    return;
-                }
-                buffer.truncate(filled);
-                state.buffered_bytes = state.buffered_bytes.saturating_add(filled);
-                state.queue.push_back(buffer);
-                cv.notify_all();
-            }
-        });
-
-        let mut pending_encoded: Option<ChunkCompressed> = None;
-        loop {
-            let chunk = {
-                let (lock, cv) = &*queue;
-                let mut state = lock
-                    .lock()
-                    .map_err(|_| PDeflateError::InvalidStream("stream queue poisoned"))?;
-                loop {
-                    if let Some(err) = state.error.take() {
-                        state.stopped = true;
-                        cv.notify_all();
-                        return Err(PDeflateError::Io(err));
-                    }
-                    if let Some(chunk) = state.queue.pop_front() {
-                        state.buffered_bytes = state.buffered_bytes.saturating_sub(chunk.len());
-                        if state.buffered_bytes < low_watermark_bytes {
-                            cv.notify_all();
-                        }
-                        break Some(chunk);
-                    }
-                    if state.eof {
-                        state.stopped = true;
-                        cv.notify_all();
-                        break None;
-                    }
-                    state = cv
-                        .wait(state)
-                        .map_err(|_| PDeflateError::InvalidStream("stream queue poisoned"))?;
-                }
-            };
-
-            let Some(chunk) = chunk else {
-                break;
-            };
-
-            input_bytes = input_bytes
-                .checked_add(u64::try_from(chunk.len()).map_err(|_| PDeflateError::NumericOverflow)?)
-                .ok_or(PDeflateError::NumericOverflow)?;
-
-            let encoded = compress_chunk(&chunk, options)?;
-            chunk_count = chunk_count.saturating_add(1);
-            table_entries_total = table_entries_total.saturating_add(encoded.table_entries);
-            section_count_total = section_count_total.saturating_add(encoded.section_count);
-            if let Some(prev) = pending_encoded.take() {
-                write_stream_chunk_frame(writer, &prev.payload)?;
-                output_bytes = output_bytes
-                    .checked_add(4)
-                    .and_then(|n| {
-                        n.checked_add(
-                            u64::try_from(prev.payload.len())
-                                .map_err(|_| PDeflateError::NumericOverflow)
-                                .ok()?,
-                        )
-                    })
-                    .ok_or(PDeflateError::NumericOverflow)?;
-            }
-            pending_encoded = Some(encoded);
-        }
-        if let Some(mut final_chunk) = pending_encoded.take() {
-            set_chunk_final_stream_flag(&mut final_chunk.payload, true)?;
-            write_stream_chunk_frame(writer, &final_chunk.payload)?;
-            output_bytes = output_bytes
-                .checked_add(4)
-                .and_then(|n| {
-                    n.checked_add(
-                        u64::try_from(final_chunk.payload.len())
-                            .map_err(|_| PDeflateError::NumericOverflow)
-                            .ok()?,
-                    )
-                })
-                .ok_or(PDeflateError::NumericOverflow)?;
-        }
-        Ok(())
-    })?;
-    Ok(PDeflateStats {
-        input_bytes,
-        output_bytes,
-        chunk_count,
-        table_entries_total,
-        section_count_total,
-    })
+    stream::compress_reader_with_stats(
+        reader,
+        writer,
+        options,
+        target_buffered_bytes,
+        low_watermark_bytes,
+    )
 }
 
-pub(crate) fn pdeflate_decompress_reader_with_stats<R: Read, W: Write>(
+fn compress_stream_chunk_batch(
+    chunks: &[Vec<u8>],
+    options: &PDeflateOptions,
+) -> Result<Vec<ChunkCompressed>, PDeflateError> {
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let chunk_size = options.chunk_size.max(1);
+    let mut flat_input =
+        Vec::with_capacity(chunks.iter().map(|chunk| chunk.len()).sum::<usize>().max(chunk_size));
+    for (idx, chunk) in chunks.iter().enumerate() {
+        if idx + 1 != chunks.len() && chunk.len() != chunk_size {
+            return Err(PDeflateError::InvalidStream(
+                "non-final stream chunk shorter than chunk size",
+            ));
+        }
+        flat_input.extend_from_slice(chunk);
+    }
+
+    compress_chunks_hybrid(&flat_input, chunk_size, chunks.len(), options)
+}
+
+pub(crate) fn pdeflate_decompress_reader_with_stats<R: Read + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     options: &PDeflateOptions,
 ) -> Result<PDeflateStats, PDeflateError> {
-    validate_options(options)?;
-
-    let mut header = [0u8; STREAM_HEADER_SIZE];
-    reader.read_exact(&mut header)?;
-    let mut cursor = 0usize;
-    let magic = read_exact(&header, &mut cursor, 4)?;
-    if magic != STREAM_MAGIC {
-        return Err(PDeflateError::InvalidStream("bad stream magic"));
-    }
-    let version = read_u16_le(&header, &mut cursor)?;
-    if version != STREAM_VERSION {
-        return Err(PDeflateError::InvalidStream("unsupported stream version"));
-    }
-    let _flags = read_u16_le(&header, &mut cursor)?;
-    let _chunk_size = read_u32_le(&header, &mut cursor)? as usize;
-
-    let mut input_bytes =
-        u64::try_from(header.len()).map_err(|_| PDeflateError::NumericOverflow)?;
-    let mut output_bytes = 0u64;
-    let mut chunk_count = 0usize;
-    let mut table_entries_total = 0usize;
-    let mut section_count_total = 0usize;
-
-    let mut saw_final_chunk = false;
-    loop {
-        let mut len_buf = [0u8; 4];
-        match reader.read_exact(&mut len_buf) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                if chunk_count == 0 {
-                    break;
-                }
-                return Err(PDeflateError::InvalidStream("missing final chunk"));
-            }
-            Err(err) => return Err(PDeflateError::Io(err)),
-        }
-        input_bytes = input_bytes
-            .checked_add(4)
-            .ok_or(PDeflateError::NumericOverflow)?;
-        let mut len_cursor = 0usize;
-        let payload_len = read_u32_le(&len_buf, &mut len_cursor)? as usize;
-        let mut payload = vec![0u8; payload_len];
-        reader.read_exact(&mut payload)?;
-        input_bytes = input_bytes
-            .checked_add(u64::try_from(payload_len).map_err(|_| PDeflateError::NumericOverflow)?)
-            .ok_or(PDeflateError::NumericOverflow)?;
-
-        if payload.len() < CHUNK_HEADER_SIZE {
-            return Err(PDeflateError::InvalidStream("chunk header truncated"));
-        }
-        let chunk_uncompressed_len = usize::try_from(u32::from_le_bytes(
-            payload[8..12]
-                .try_into()
-                .map_err(|_| PDeflateError::InvalidStream("chunk length parse failed"))?,
-        ))
-        .map_err(|_| PDeflateError::NumericOverflow)?;
-        let mut restored = vec![0u8; chunk_uncompressed_len];
-        let stats = decompress_chunk_into(&payload, &mut restored)?;
-        writer.write_all(&restored)?;
-        chunk_count = chunk_count.saturating_add(1);
-        output_bytes = output_bytes
-            .checked_add(
-                u64::try_from(restored.len()).map_err(|_| PDeflateError::NumericOverflow)?,
-            )
-            .ok_or(PDeflateError::NumericOverflow)?;
-        table_entries_total = table_entries_total.saturating_add(stats.table_entries);
-        section_count_total = section_count_total.saturating_add(stats.section_count);
-        if chunk_final_stream_enabled(read_chunk_flags(&payload)?) {
-            saw_final_chunk = true;
-            let mut trailing = [0u8; 1];
-            if reader.read(&mut trailing)? != 0 {
-                return Err(PDeflateError::InvalidStream("trailing bytes in stream"));
-            }
-            break;
-        }
-    }
-
-    if chunk_count > 0 && !saw_final_chunk {
-        return Err(PDeflateError::InvalidStream("missing final chunk"));
-    }
-
-    Ok(PDeflateStats {
-        input_bytes,
-        output_bytes,
-        chunk_count,
-        table_entries_total,
-        section_count_total,
-    })
+    stream::decompress_reader_with_stats(reader, writer, options)
 }
 
 pub fn pdeflate_decompress(stream: &[u8]) -> Result<Vec<u8>, PDeflateError> {

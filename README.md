@@ -3,7 +3,7 @@
 A set of Rust libraries and compression/decompression software tools.
 
 - `cozip_deflate`: custom frame format (`CZDF`) with CPU/GPU-assisted **compression** and CPU **decompression**.
-- `cozip`: ZIP wrapper/orchestrator for file and directory compression APIs, built on top of `cozip_deflate` CPU deflate/inflate.
+- `cozip`: ZIP/PDeflate wrapper-orchestrator for file and directory compression APIs.
 
 日本語: [README.ja.md](./README.ja.md)
 
@@ -93,6 +93,8 @@ let _ = cozip
 # }
 # Ok::<(), cozip::CoZipError>(())
 ```
+
+PDeflate backend also supports directory mode. In that case `cozip` first packs the directory into an internal streaming archive and then applies PDeflate compression, similar to `tar.gz`'s `archive -> compress` order. `decompress_auto*` also detects this archive form and routes to directory extraction automatically.
 
 ## Benchmark
 

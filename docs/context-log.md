@@ -1950,3 +1950,9 @@ mode別GPU品質パラメータ:
 確認:
 - `cargo check -p cozip_pdeflate` 通過。
 - `cargo build --release --example bench_pdeflate -p cozip_pdeflate` 通過。
+## 2026-03-08 CoZip PDeflate directory mode
+
+- `cozip` の `PDeflate` backend に directory compress/decompress を追加した
+- 実装方式は ZIP 互換ではなく、`cozip` 内部の streaming archive を先に作ってから PDeflate へ流す `archive -> compress` 方式
+- 解凍はその逆で、PDeflate を stream 解凍しつつ内部 archive を逐次展開する
+- これにより一時 spool file なしで directory mode を扱える

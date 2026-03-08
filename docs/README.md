@@ -22,9 +22,9 @@
 - `pdeflate-v0-baseline.md`: 比較用ベンチコマンドとベースライン結果
 - `pdeflate-gpu-decompress-design.md`: PDeflate GPU解凍設計
 - `pdeflate-gpu-sparse-direct-output-design.md`: PDeflate GPU圧縮の sparse direct output 化設計
+- `context-log.md`: CoZip の ZIP/PDeflate 両 backend を含む作業ログ。PDeflate の directory mode は `archive -> pdeflate` で動く
 - `tasks/pdeflate-v0-huffman-lut-tasks.md`: PDeflate v0実装タスク分解
 - `tasks/pdeflate-gpu-sparse-direct-output-tasks.md`: PDeflate GPU圧縮の sparse direct output タスク分解
-- `context-log.md`: 作業ログ・決定事項・未決事項
 
 ## 運用ルール
 

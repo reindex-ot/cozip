@@ -162,7 +162,7 @@ impl CoZipDeflate {
         self.init_stats.gpu_context_init_ms
     }
 
-    pub fn deflate_compress_stream_zip_compatible<R: Read, W: Write>(
+    pub fn deflate_compress_stream_zip_compatible<R: Read + Send, W: Write>(
         &self,
         reader: &mut R,
         writer: &mut W,
@@ -176,7 +176,7 @@ impl CoZipDeflate {
         Ok(result.stats)
     }
 
-    pub fn deflate_compress_stream_zip_compatible_with_index<R: Read, W: Write>(
+    pub fn deflate_compress_stream_zip_compatible_with_index<R: Read + Send, W: Write>(
         &self,
         reader: &mut R,
         writer: &mut W,
@@ -189,7 +189,7 @@ impl CoZipDeflate {
         )
     }
 
-    pub fn deflate_decompress_stream_zip_compatible_with_index<R: Read, W: Write>(
+    pub fn deflate_decompress_stream_zip_compatible_with_index<R: Read + Send, W: Write>(
         &self,
         reader: &mut R,
         writer: &mut W,
@@ -199,7 +199,7 @@ impl CoZipDeflate {
         deflate_decompress_stream_indexed_on_cpu(reader, writer, index)
     }
 
-    pub fn deflate_decompress_stream_zip_compatible_with_index_cpu<R: Read, W: Write>(
+    pub fn deflate_decompress_stream_zip_compatible_with_index_cpu<R: Read + Send, W: Write>(
         &self,
         reader: &mut R,
         writer: &mut W,
@@ -751,7 +751,7 @@ pub fn deflate_compress_stream_on_cpu<R: Read, W: Write>(
     Ok(stats)
 }
 
-pub fn deflate_compress_stream<R: Read, W: Write>(
+pub fn deflate_compress_stream<R: Read + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     level: u32,
@@ -797,7 +797,7 @@ pub fn deflate_decompress_stream_on_cpu<R: Read, W: Write>(
     Ok(stats)
 }
 
-pub fn deflate_decompress_stream_hybrid_indexed<R: Read, W: Write>(
+pub fn deflate_decompress_stream_hybrid_indexed<R: Read + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     index: &DeflateChunkIndex,
@@ -806,7 +806,7 @@ pub fn deflate_decompress_stream_hybrid_indexed<R: Read, W: Write>(
     deflate_decompress_stream_hybrid_indexed_with_context(reader, writer, index, options, None)
 }
 
-fn deflate_decompress_stream_hybrid_indexed_with_context<R: Read, W: Write>(
+fn deflate_decompress_stream_hybrid_indexed_with_context<R: Read + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     index: &DeflateChunkIndex,
@@ -819,24 +819,27 @@ fn deflate_decompress_stream_hybrid_indexed_with_context<R: Read, W: Write>(
             "chunk_count and entries length mismatch",
         ));
     }
-    // Decode path is CPU-only by design in CoZipDeflate.
     let gpu_enabled = false;
-    let gpu_runtime: Option<Arc<GpuAssist>> = None;
-
-    let mut compressed = Vec::new();
-    reader.read_to_end(&mut compressed)?;
-    if u64::try_from(compressed.len()).unwrap_or(u64::MAX) != index.compressed_size {
-        return Err(CozipDeflateError::InvalidFrame(
-            "indexed compressed size mismatch",
-        ));
-    }
-    let input_crc32 = crc32fast::hash(&compressed);
-
+    let task_count = index.entries.len();
     let entries = Arc::<[DeflateChunkIndexEntry]>::from(index.entries.clone().into_boxed_slice());
-    let compressed = Arc::<[u8]>::from(compressed);
-    let task_count = entries.len();
 
-    let queue_state = Arc::new((Mutex::new(DecodeTaskQueueState::default()), Condvar::new()));
+    #[derive(Debug, Clone)]
+    struct StreamDecodeTask {
+        index: usize,
+        prepared: PreparedIndexedChunk,
+    }
+
+    #[derive(Debug, Default)]
+    struct StreamDecodeTaskQueueState {
+        queue: VecDeque<StreamDecodeTask>,
+        queued_bytes: usize,
+        closed: bool,
+    }
+
+    let queue_state = Arc::new((
+        Mutex::new(StreamDecodeTaskQueueState::default()),
+        Condvar::new(),
+    ));
     let ready_state = Arc::new((
         Mutex::new(DecodeReadyState {
             slots: vec![None; task_count],
@@ -846,139 +849,320 @@ fn deflate_decompress_stream_hybrid_indexed_with_context<R: Read, W: Write>(
     ));
     let error = Arc::new(Mutex::new(None::<CozipDeflateError>));
     let counters = Arc::new(WorkerCounters::default());
-
-    {
-        let (queue_lock, _) = &*queue_state;
-        let mut queue = lock(queue_lock)?;
-        queue.queue.reserve(task_count);
-        for index in 0..task_count {
-            queue.queue.push_back(DecodeTask { index });
-        }
-        queue.closed = true;
-    }
-
+    let total_tasks = Arc::new(AtomicUsize::new(0));
+    let producer_stats = Arc::new(Mutex::new((0_u64, 0_u32)));
     let cpu_workers = cpu_worker_count(gpu_enabled).min(task_count.max(1));
-    let gpu_workers = if gpu_enabled {
-        decode_gpu_worker_count(options, task_count)
+    let decode_queue_byte_cap = if options.stream_max_inflight_bytes > 0 {
+        options.stream_max_inflight_bytes.max(options.chunk_size)
     } else {
-        0
+        options
+            .chunk_size
+            .saturating_mul(cpu_workers.max(1))
+            .saturating_mul(4)
+            .max(options.chunk_size)
     };
-    let mut handles = Vec::with_capacity(cpu_workers + gpu_workers);
-    if let Some(gpu) = gpu_runtime {
-        let total_tasks = Arc::new(AtomicUsize::new(task_count));
-        for _ in 0..gpu_workers {
-            let queue_ref = Arc::clone(&queue_state);
-            let ready_ref = Arc::clone(&ready_state);
-            let err_ref = Arc::clone(&error);
-            let input_ref = Arc::clone(&compressed);
-            let entries_ref = Arc::clone(&entries);
-            let counters_ref = Arc::clone(&counters);
-            let opts = options.clone();
-            let gpu_ref = Arc::clone(&gpu);
-            let total_tasks_ref = Arc::clone(&total_tasks);
-            handles.push(std::thread::spawn(move || {
-                decode_gpu_indexed_worker(
-                    queue_ref,
-                    ready_ref,
-                    err_ref,
-                    input_ref,
-                    entries_ref,
-                    &opts,
-                    gpu_ref,
-                    total_tasks_ref,
-                    counters_ref,
-                )
-            }));
-        }
-    }
+    let decode_queue_low_watermark = (decode_queue_byte_cap / 2).max(options.chunk_size);
+    let mut handles = Vec::with_capacity(cpu_workers);
     for _ in 0..cpu_workers {
         let queue_ref = Arc::clone(&queue_state);
         let ready_ref = Arc::clone(&ready_state);
         let err_ref = Arc::clone(&error);
-        let input_ref = Arc::clone(&compressed);
-        let entries_ref = Arc::clone(&entries);
         let counters_ref = Arc::clone(&counters);
-        handles.push(std::thread::spawn(move || {
-            decode_cpu_indexed_worker(
-                queue_ref,
-                ready_ref,
-                err_ref,
-                input_ref,
-                entries_ref,
-                counters_ref,
-            )
+        handles.push(std::thread::spawn(move || loop {
+            if has_error(&err_ref) {
+                break;
+            }
+            let task = {
+                let (queue_lock, queue_cv) = &*queue_ref;
+                let mut state = match lock(queue_lock) {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        set_error(&err_ref, err);
+                        break;
+                    }
+                };
+                loop {
+                    if let Some(task) = state.queue.pop_front() {
+                        state.queued_bytes =
+                            state.queued_bytes.saturating_sub(task.prepared.chunk.len());
+                        if state.queued_bytes < decode_queue_low_watermark {
+                            queue_cv.notify_all();
+                        }
+                        break Some(task);
+                    }
+                    if state.closed {
+                        break None;
+                    }
+                    counters_ref.cpu_yield_events.fetch_add(1, Ordering::Relaxed);
+                    let wait_start = Instant::now();
+                    state = match wait_on_condvar(queue_cv, state) {
+                        Ok(guard) => guard,
+                        Err(err) => {
+                            set_error(&err_ref, err);
+                            return;
+                        }
+                    };
+                    counters_ref.cpu_wait_for_task_ns.fetch_add(
+                        wait_start.elapsed().as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
+                }
+            };
+
+            let Some(task) = task else {
+                counters_ref.cpu_no_task_events.fetch_add(1, Ordering::Relaxed);
+                break;
+            };
+
+            let decode_start = Instant::now();
+            let raw = match decode_prepared_chunk_on_cpu(&task.prepared) {
+                Ok(value) => value,
+                Err(err) => {
+                    set_error(&err_ref, err);
+                    break;
+                }
+            };
+            counters_ref
+                .cpu_busy_ns
+                .fetch_add(decode_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            counters_ref.cpu_chunks.fetch_add(1, Ordering::Relaxed);
+
+            let (ready_lock, ready_cv) = &*ready_ref;
+            let mut ready = match lock(ready_lock) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    set_error(&err_ref, err);
+                    break;
+                }
+            };
+            let slot = match ready.slots.get_mut(task.index) {
+                Some(value) => value,
+                None => {
+                    set_error(
+                        &err_ref,
+                        CozipDeflateError::Internal("decoded chunk index out of range"),
+                    );
+                    break;
+                }
+            };
+            if slot.is_some() {
+                set_error(
+                    &err_ref,
+                    CozipDeflateError::Internal("duplicate decoded chunk index"),
+                );
+                break;
+            }
+            *slot = Some(DecodedChunk {
+                index: task.index,
+                backend: ChunkBackend::Cpu,
+                raw,
+            });
+            ready.ready_count = ready.ready_count.saturating_add(1);
+            ready_cv.notify_all();
         }));
     }
 
     let mut stats = DeflateCpuStreamStats::default();
-    stats.input_bytes = u64::try_from(compressed.len()).unwrap_or(u64::MAX);
-    stats.input_crc32 = input_crc32;
     stats.chunk_count = task_count;
     stats.gpu_available = gpu_enabled;
 
     let mut out = HashingCountWriter::new(writer);
-    let mut next_index = 0usize;
-    while next_index < task_count {
-        if has_error(&error) {
-            break;
-        }
-
-        let mut progressed = false;
-        loop {
-            let ready_len_and_chunk = {
-                let (ready_lock, _) = &*ready_state;
-                let mut ready = lock(ready_lock)?;
-                let ready_len = ready.ready_count;
-                let chunk = ready.slots.get_mut(next_index).and_then(Option::take);
-                if chunk.is_some() {
-                    ready.ready_count = ready.ready_count.saturating_sub(1);
+    std::thread::scope(|scope| -> Result<(), CozipDeflateError> {
+        let queue_ref = Arc::clone(&queue_state);
+        let err_ref = Arc::clone(&error);
+        let entries_ref = Arc::clone(&entries);
+        let total_tasks_ref = Arc::clone(&total_tasks);
+        let producer_stats_ref = Arc::clone(&producer_stats);
+        scope.spawn(move || {
+            let mut compressed = Vec::new();
+            let mut hasher = crc32fast::Hasher::new();
+            let mut bytes_read = 0usize;
+            let mut dropped_prefix_bytes = 0usize;
+            for (idx, entry) in entries_ref.iter().copied().enumerate() {
+                let absolute_start_bit = usize::try_from(entry.comp_bit_off).unwrap_or(usize::MAX);
+                let relative_start_bit =
+                    absolute_start_bit.saturating_sub(dropped_prefix_bytes.saturating_mul(8));
+                let relative_end_bit = relative_start_bit
+                    .saturating_add(usize::try_from(entry.comp_bit_len).unwrap_or(usize::MAX));
+                let required_bytes = relative_end_bit.div_ceil(8);
+                while compressed.len() < required_bytes {
+                    let remaining = required_bytes.saturating_sub(compressed.len());
+                    let mut chunk = vec![0u8; remaining.min(256 * 1024)];
+                    let read = match reader.read(&mut chunk) {
+                        Ok(read) => read,
+                        Err(err) => {
+                            set_error(&err_ref, err.into());
+                            return;
+                        }
+                    };
+                    if read == 0 {
+                        set_error(
+                            &err_ref,
+                            CozipDeflateError::InvalidFrame("indexed compressed size mismatch"),
+                        );
+                        return;
+                    }
+                    hasher.update(&chunk[..read]);
+                    compressed.extend_from_slice(&chunk[..read]);
+                    bytes_read = bytes_read.saturating_add(read);
                 }
-                (ready_len, chunk)
-            };
-            let ready_len = ready_len_and_chunk.0;
-            stats.ready_chunks_max = stats.ready_chunks_max.max(ready_len);
-            let Some(decoded) = ready_len_and_chunk.1 else {
+
+                let mut relative_entry = entry;
+                relative_entry.comp_bit_off = u64::try_from(relative_start_bit)
+                    .map_err(|_| CozipDeflateError::DataTooLarge)
+                    .unwrap_or(u64::MAX);
+                let prepared = match prepare_indexed_chunk_for_decode(&compressed, relative_entry) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        set_error(&err_ref, err);
+                        return;
+                    }
+                };
+                let (queue_lock, queue_cv) = &*queue_ref;
+                let mut state = match lock(queue_lock) {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        set_error(&err_ref, err);
+                        return;
+                    }
+                };
+                while state.queued_bytes >= decode_queue_byte_cap && !state.closed {
+                    state = match wait_on_condvar(queue_cv, state) {
+                        Ok(guard) => guard,
+                        Err(err) => {
+                            set_error(&err_ref, err);
+                            return;
+                        }
+                    };
+                }
+                state.queue.push_back(StreamDecodeTask {
+                    index: idx,
+                    prepared: prepared.clone(),
+                });
+                state.queued_bytes = state.queued_bytes.saturating_add(prepared.chunk.len());
+                total_tasks_ref.store(idx + 1, Ordering::Relaxed);
+                queue_cv.notify_all();
+
+                if let Some(next_entry) = entries_ref.get(idx + 1).copied() {
+                    let next_keep_byte =
+                        usize::try_from(next_entry.comp_bit_off / 8).unwrap_or(usize::MAX);
+                    if next_keep_byte > dropped_prefix_bytes {
+                        let drop_bytes = (next_keep_byte - dropped_prefix_bytes).min(compressed.len());
+                        compressed.drain(0..drop_bytes);
+                        dropped_prefix_bytes = dropped_prefix_bytes.saturating_add(drop_bytes);
+                    }
+                }
+            }
+
+            while bytes_read < index.compressed_size as usize {
+                let remaining = (index.compressed_size as usize).saturating_sub(bytes_read);
+                let mut chunk = vec![0u8; remaining.min(256 * 1024)];
+                let read = match reader.read(&mut chunk) {
+                    Ok(read) => read,
+                    Err(err) => {
+                        set_error(&err_ref, err.into());
+                        return;
+                    }
+                };
+                if read == 0 {
+                    set_error(
+                        &err_ref,
+                        CozipDeflateError::InvalidFrame("indexed compressed size mismatch"),
+                    );
+                    return;
+                }
+                hasher.update(&chunk[..read]);
+                bytes_read = bytes_read.saturating_add(read);
+            }
+
+            let mut trailing = [0u8; 1];
+            match reader.read(&mut trailing) {
+                Ok(0) => {}
+                Ok(_) => {
+                    set_error(
+                        &err_ref,
+                        CozipDeflateError::InvalidFrame("indexed compressed size mismatch"),
+                    );
+                    return;
+                }
+                Err(err) => {
+                    set_error(&err_ref, err.into());
+                    return;
+                }
+            }
+
+            if let Ok(mut producer_stats) = lock(&producer_stats_ref) {
+                *producer_stats = (bytes_read as u64, hasher.finalize());
+            }
+            let (queue_lock, queue_cv) = &*queue_ref;
+            if let Ok(mut state) = lock(queue_lock) {
+                state.closed = true;
+                queue_cv.notify_all();
+            }
+        });
+
+        let mut next_index = 0usize;
+        while next_index < task_count {
+            if has_error(&error) {
                 break;
-            };
-            if decoded.index != next_index {
-                return Err(CozipDeflateError::Internal("decoded chunk index mismatch"));
             }
-            out.write_all(&decoded.raw)?;
-            match decoded.backend {
-                ChunkBackend::Cpu => stats.cpu_chunks = stats.cpu_chunks.saturating_add(1),
-                ChunkBackend::GpuAssisted => stats.gpu_chunks = stats.gpu_chunks.saturating_add(1),
+
+            let mut progressed = false;
+            loop {
+                let ready_len_and_chunk = {
+                    let (ready_lock, _) = &*ready_state;
+                    let mut ready = lock(ready_lock)?;
+                    let ready_len = ready.ready_count;
+                    let chunk = ready.slots.get_mut(next_index).and_then(Option::take);
+                    if chunk.is_some() {
+                        ready.ready_count = ready.ready_count.saturating_sub(1);
+                    }
+                    (ready_len, chunk)
+                };
+                let ready_len = ready_len_and_chunk.0;
+                stats.ready_chunks_max = stats.ready_chunks_max.max(ready_len);
+                let Some(decoded) = ready_len_and_chunk.1 else {
+                    break;
+                };
+                if decoded.index != next_index {
+                    return Err(CozipDeflateError::Internal("decoded chunk index mismatch"));
+                }
+                out.write_all(&decoded.raw)?;
+                stats.cpu_chunks = stats.cpu_chunks.saturating_add(1);
+                next_index = next_index.saturating_add(1);
+                progressed = true;
             }
-            next_index = next_index.saturating_add(1);
-            progressed = true;
+
+            if next_index >= task_count {
+                break;
+            }
+
+            if !progressed {
+                let wait_start = Instant::now();
+                let (ready_lock, ready_cv) = &*ready_state;
+                let guard = lock(ready_lock)?;
+                let ready_len = guard.ready_count;
+                stats.ready_chunks_max = stats.ready_chunks_max.max(ready_len);
+                let hol_wait = ready_len > 0;
+                drop(wait_timeout_on_condvar(
+                    ready_cv,
+                    guard,
+                    Duration::from_millis(2),
+                )?);
+                let wait_ms = elapsed_ms(wait_start);
+                stats.writer_wait_ms += wait_ms;
+                stats.writer_wait_events = stats.writer_wait_events.saturating_add(1);
+                if hol_wait {
+                    stats.writer_hol_wait_ms += wait_ms;
+                    stats.writer_hol_wait_events = stats.writer_hol_wait_events.saturating_add(1);
+                    stats.writer_hol_ready_sum = stats.writer_hol_ready_sum.saturating_add(ready_len);
+                    stats.writer_hol_ready_max = stats.writer_hol_ready_max.max(ready_len);
+                }
+            }
         }
 
-        if next_index >= task_count {
-            break;
-        }
-
-        if !progressed {
-            let wait_start = Instant::now();
-            let (ready_lock, ready_cv) = &*ready_state;
-            let guard = lock(ready_lock)?;
-            let ready_len = guard.ready_count;
-            stats.ready_chunks_max = stats.ready_chunks_max.max(ready_len);
-            let hol_wait = ready_len > 0;
-            drop(wait_timeout_on_condvar(
-                ready_cv,
-                guard,
-                Duration::from_millis(2),
-            )?);
-            let wait_ms = elapsed_ms(wait_start);
-            stats.writer_wait_ms += wait_ms;
-            stats.writer_wait_events = stats.writer_wait_events.saturating_add(1);
-            if hol_wait {
-                stats.writer_hol_wait_ms += wait_ms;
-                stats.writer_hol_wait_events = stats.writer_hol_wait_events.saturating_add(1);
-                stats.writer_hol_ready_sum = stats.writer_hol_ready_sum.saturating_add(ready_len);
-                stats.writer_hol_ready_max = stats.writer_hol_ready_max.max(ready_len);
-            }
-        }
-    }
+        Ok(())
+    })?;
 
     {
         let (ready_lock, ready_cv) = &*ready_state;
@@ -994,6 +1178,9 @@ fn deflate_decompress_stream_hybrid_indexed_with_context<R: Read, W: Write>(
         return Err(err);
     }
 
+    let (input_bytes, input_crc32) = *lock(&producer_stats)?;
+    stats.input_bytes = input_bytes;
+    stats.input_crc32 = input_crc32;
     stats.output_bytes = out.written;
     stats.output_crc32 = out.hasher.finalize();
     if stats.output_bytes != index.uncompressed_size {
@@ -1024,7 +1211,7 @@ fn deflate_decompress_stream_hybrid_indexed_with_context<R: Read, W: Write>(
     Ok(stats)
 }
 
-pub fn deflate_decompress_stream_indexed_on_cpu<R: Read, W: Write>(
+pub fn deflate_decompress_stream_indexed_on_cpu<R: Read + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     index: &DeflateChunkIndex,
@@ -1441,7 +1628,7 @@ fn decode_single_indexed_chunk(
     decode_prepared_chunk_on_cpu(&prepared)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PreparedIndexedChunk {
     chunk: Vec<u8>,
     expected_len: usize,
@@ -2426,7 +2613,7 @@ fn is_gpu_requested(options: &HybridOptions) -> bool {
     options.prefer_gpu
 }
 
-pub fn deflate_compress_stream_hybrid_zip_compatible<R: Read, W: Write>(
+pub fn deflate_compress_stream_hybrid_zip_compatible<R: Read + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     level: u32,
@@ -2435,7 +2622,7 @@ pub fn deflate_compress_stream_hybrid_zip_compatible<R: Read, W: Write>(
     Ok(result.stats)
 }
 
-pub fn deflate_compress_stream_hybrid_zip_compatible_with_index<R: Read, W: Write>(
+pub fn deflate_compress_stream_hybrid_zip_compatible_with_index<R: Read + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     level: u32,
@@ -2454,7 +2641,7 @@ pub fn deflate_compress_stream_hybrid_zip_compatible_with_index<R: Read, W: Writ
     )
 }
 
-fn deflate_compress_stream_hybrid_zip_compatible_with_index_and_context<R: Read, W: Write>(
+fn deflate_compress_stream_hybrid_zip_compatible_with_index_and_context<R: Read + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     options: &HybridOptions,
@@ -2469,7 +2656,7 @@ fn deflate_compress_stream_hybrid_zip_compatible_with_index_and_context<R: Read,
     )
 }
 
-fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read, W: Write>(
+fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     options: &HybridOptions,
@@ -2478,7 +2665,6 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
     let total_start = Instant::now();
     let mut stats = DeflateCpuStreamStats::default();
     let mut chunk_index_entries = Vec::<DeflateChunkIndexEntry>::new();
-    let mut input_crc = crc32fast::Hasher::new();
     let mut output = HashingCountWriter::new(writer);
     let mut bit_writer = DeflateBitWriter::new(&mut output);
 
@@ -2490,6 +2676,9 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
     let error = Arc::new(Mutex::new(None::<CozipDeflateError>));
     let counters = Arc::new(WorkerCounters::default());
     let total_tasks = Arc::new(AtomicUsize::new(0));
+    let written_tasks = Arc::new(AtomicUsize::new(0));
+    let inflight_raw_bytes = Arc::new(AtomicUsize::new(0));
+    let producer_stats = Arc::new(Mutex::new((0_u64, 0_u32)));
 
     let gpu_enabled = gpu_context.is_some() && is_gpu_requested(options);
     let cpu_workers = cpu_worker_count(gpu_enabled);
@@ -2532,163 +2721,237 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
         }));
     }
 
-    let mut reached_eof = false;
-    let mut next_read_index = 0usize;
     let mut next_write_index = 0usize;
-    let mut inflight_raw_bytes = 0usize;
+    std::thread::scope(|scope| -> Result<(), CozipDeflateError> {
+        let queue_ref = Arc::clone(&queue_state);
+        let err_ref = Arc::clone(&error);
+        let total_tasks_ref = Arc::clone(&total_tasks);
+        let written_tasks_ref = Arc::clone(&written_tasks);
+        let inflight_raw_bytes_ref = Arc::clone(&inflight_raw_bytes);
+        let producer_stats_ref = Arc::clone(&producer_stats);
+        scope.spawn(move || {
+            let mut input_crc = crc32fast::Hasher::new();
+            let mut input_bytes = 0u64;
+            let mut next_read_index = 0usize;
+            loop {
+                if has_error(&err_ref) {
+                    break;
+                }
+                {
+                    let (queue_lock, queue_cv) = &*queue_ref;
+                    let mut state = match lock(queue_lock) {
+                        Ok(guard) => guard,
+                        Err(err) => {
+                            set_error(&err_ref, err);
+                            return;
+                        }
+                    };
+                    loop {
+                        let inflight_chunks = total_tasks_ref
+                            .load(Ordering::Relaxed)
+                            .saturating_sub(written_tasks_ref.load(Ordering::Relaxed));
+                        let inflight_bytes = inflight_raw_bytes_ref.load(Ordering::Relaxed);
+                        let chunk_limit_hit = options.stream_max_inflight_chunks > 0
+                            && inflight_chunks >= options.stream_max_inflight_chunks;
+                        let byte_limit_hit = options.stream_max_inflight_bytes > 0
+                            && inflight_bytes >= options.stream_max_inflight_bytes;
+                        if state.closed || !(chunk_limit_hit || byte_limit_hit) {
+                            break;
+                        }
+                        state = match wait_on_condvar(queue_cv, state) {
+                            Ok(guard) => guard,
+                            Err(err) => {
+                                set_error(&err_ref, err);
+                                return;
+                            }
+                        };
+                    }
+                    if state.closed {
+                        return;
+                    }
+                }
 
-    loop {
-        if has_error(&error) {
-            break;
-        }
+                let Some(raw) = (match read_chunk_from_stream(reader, options.chunk_size) {
+                    Ok(chunk) => chunk,
+                    Err(err) => {
+                        set_error(&err_ref, err);
+                        return;
+                    }
+                }) else {
+                    let (queue_lock, queue_cv) = &*queue_ref;
+                    if let Ok(mut state) = lock(queue_lock) {
+                        state.closed = true;
+                        queue_cv.notify_all();
+                    }
+                    break;
+                };
 
-        let mut progressed = false;
-        loop {
-            if reached_eof {
-                break;
-            }
-            let inflight_chunks = next_read_index.saturating_sub(next_write_index);
-            stats.inflight_chunks_max = stats.inflight_chunks_max.max(inflight_chunks);
-            if options.stream_max_inflight_chunks > 0
-                && inflight_chunks >= options.stream_max_inflight_chunks
-            {
-                break;
-            }
-            if options.stream_max_inflight_bytes > 0
-                && inflight_raw_bytes >= options.stream_max_inflight_bytes
-            {
-                break;
-            }
+                input_crc.update(&raw);
+                input_bytes = input_bytes
+                    .saturating_add(u64::try_from(raw.len()).unwrap_or(u64::MAX));
 
-            let Some(raw) = read_chunk_from_stream(reader, options.chunk_size)? else {
-                reached_eof = true;
-                let (queue_lock, queue_cv) = &*queue_state;
-                let mut state = lock(queue_lock)?;
-                state.closed = true;
+                inflight_raw_bytes_ref.fetch_add(raw.len(), Ordering::Relaxed);
+                let task = ChunkTask {
+                    index: next_read_index,
+                    raw,
+                };
+                next_read_index = next_read_index.saturating_add(1);
+                total_tasks_ref.store(next_read_index, Ordering::Relaxed);
+
+                let (queue_lock, queue_cv) = &*queue_ref;
+                let mut state = match lock(queue_lock) {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        set_error(&err_ref, err);
+                        return;
+                    }
+                };
+                state.queued_bytes = state.queued_bytes.saturating_add(task.raw.len());
+                state.queue.push_back(task);
                 queue_cv.notify_all();
-                break;
-            };
+            }
 
-            input_crc.update(&raw);
-            stats.input_bytes = stats
-                .input_bytes
-                .saturating_add(u64::try_from(raw.len()).unwrap_or(u64::MAX));
-
-            let task = ChunkTask {
-                index: next_read_index,
-                raw,
-            };
-            next_read_index = next_read_index.saturating_add(1);
-            total_tasks.store(next_read_index, Ordering::Relaxed);
-            inflight_raw_bytes = inflight_raw_bytes.saturating_add(task.raw.len());
-
-            let (queue_lock, queue_cv) = &*queue_state;
-            let mut state = lock(queue_lock)?;
-            state.queued_bytes = state.queued_bytes.saturating_add(task.raw.len());
-            state.queue.push_back(task);
-            queue_cv.notify_one();
-            progressed = true;
-        }
+            if let Ok(mut stats) = lock(&producer_stats_ref) {
+                *stats = (input_bytes, input_crc.finalize());
+            }
+        });
 
         loop {
-            let (next_ready, ready_len) = {
-                let (ready_lock, _) = &*ready_state;
-                let mut ready = lock(ready_lock)?;
-                let ready_len = ready.len();
-                (ready.remove(&next_write_index), ready_len)
-            };
-            stats.ready_chunks_max = stats.ready_chunks_max.max(ready_len);
-            let Some(ready) = next_ready else {
+            if has_error(&error) {
                 break;
-            };
-            progressed = true;
-
-            let is_final_chunk = reached_eof && next_write_index + 1 == next_read_index;
-            let chunk_start_bit = bit_writer.total_bits();
-            let mut connector_bits = 0_u64;
-            let io_before = bit_writer.io_counters();
-            let write_start = Instant::now();
-            if next_write_index > 0 && bit_writer.used != 0 {
-                append_empty_stored_block_non_final(&mut bit_writer)?;
-                connector_bits = bit_writer.total_bits().saturating_sub(chunk_start_bit);
             }
-            if let Some(non_final_end_bit) = ready.prepared_non_final_end_bit {
-                if is_final_chunk {
-                    write_chunk_bits_with_final_override(
+
+            let mut progressed = false;
+            loop {
+                let (next_ready, ready_len) = {
+                    let (ready_lock, _) = &*ready_state;
+                    let mut ready = lock(ready_lock)?;
+                    let ready_len = ready.len();
+                    (ready.remove(&next_write_index), ready_len)
+                };
+                stats.ready_chunks_max = stats.ready_chunks_max.max(ready_len);
+                let Some(ready) = next_ready else {
+                    break;
+                };
+                progressed = true;
+
+                let total_task_count = total_tasks.load(Ordering::Relaxed);
+                let reached_eof = {
+                    let (queue_lock, _) = &*queue_state;
+                    lock(queue_lock)?.closed
+                };
+                let is_final_chunk = reached_eof && next_write_index + 1 == total_task_count;
+                let chunk_start_bit = bit_writer.total_bits();
+                let mut connector_bits = 0_u64;
+                let io_before = bit_writer.io_counters();
+                let write_start = Instant::now();
+                if next_write_index > 0 && bit_writer.used != 0 {
+                    append_empty_stored_block_non_final(&mut bit_writer)?;
+                    connector_bits = bit_writer.total_bits().saturating_sub(chunk_start_bit);
+                }
+                if let Some(non_final_end_bit) = ready.prepared_non_final_end_bit {
+                    if is_final_chunk {
+                        write_chunk_bits_with_final_override(
+                            &mut bit_writer,
+                            &ready.chunk.compressed,
+                            ready.layout,
+                            1,
+                        )?;
+                    } else {
+                        bit_writer.write_bits_from_slice(
+                            &ready.chunk.compressed,
+                            0,
+                            non_final_end_bit,
+                        )?;
+                    }
+                } else {
+                    append_deflate_chunk_as_block_sequence_with_layout(
                         &mut bit_writer,
                         &ready.chunk.compressed,
                         ready.layout,
-                        1,
-                    )?;
-                } else {
-                    bit_writer.write_bits_from_slice(
-                        &ready.chunk.compressed,
-                        0,
-                        non_final_end_bit,
+                        is_final_chunk,
                     )?;
                 }
-            } else {
-                append_deflate_chunk_as_block_sequence_with_layout(
-                    &mut bit_writer,
-                    &ready.chunk.compressed,
-                    ready.layout,
-                    is_final_chunk,
-                )?;
-            }
-            let write_elapsed = elapsed_ms(write_start);
-            let io_after = bit_writer.io_counters();
-            accumulate_write_stage_metrics(&mut stats, write_elapsed, io_before, io_after);
-            let chunk_end_bit = bit_writer.total_bits();
+                let write_elapsed = elapsed_ms(write_start);
+                let io_after = bit_writer.io_counters();
+                accumulate_write_stage_metrics(&mut stats, write_elapsed, io_before, io_after);
+                let chunk_end_bit = bit_writer.total_bits();
 
-            let final_header_rel_bit = connector_bits
-                .checked_add(u64::try_from(ready.layout.final_header_bit).unwrap_or(u64::MAX))
-                .ok_or(CozipDeflateError::DataTooLarge)?;
-            let comp_bit_len = chunk_end_bit.saturating_sub(chunk_start_bit);
-            chunk_index_entries.push(DeflateChunkIndexEntry {
-                comp_bit_off: chunk_start_bit,
-                comp_bit_len: u32::try_from(comp_bit_len)
-                    .map_err(|_| CozipDeflateError::DataTooLarge)?,
-                final_header_rel_bit: u32::try_from(final_header_rel_bit)
-                    .map_err(|_| CozipDeflateError::DataTooLarge)?,
-                raw_len: ready.chunk.raw_len,
-            });
+                let final_header_rel_bit = connector_bits
+                    .checked_add(u64::try_from(ready.layout.final_header_bit).unwrap_or(u64::MAX))
+                    .ok_or(CozipDeflateError::DataTooLarge)?;
+                let comp_bit_len = chunk_end_bit.saturating_sub(chunk_start_bit);
+                chunk_index_entries.push(DeflateChunkIndexEntry {
+                    comp_bit_off: chunk_start_bit,
+                    comp_bit_len: u32::try_from(comp_bit_len)
+                        .map_err(|_| CozipDeflateError::DataTooLarge)?,
+                    final_header_rel_bit: u32::try_from(final_header_rel_bit)
+                        .map_err(|_| CozipDeflateError::DataTooLarge)?,
+                    raw_len: ready.chunk.raw_len,
+                });
 
-            stats.chunk_count = stats.chunk_count.saturating_add(1);
-            match ready.chunk.backend {
-                ChunkBackend::Cpu => stats.cpu_chunks = stats.cpu_chunks.saturating_add(1),
-                ChunkBackend::GpuAssisted => stats.gpu_chunks = stats.gpu_chunks.saturating_add(1),
+                stats.chunk_count = stats.chunk_count.saturating_add(1);
+                match ready.chunk.backend {
+                    ChunkBackend::Cpu => stats.cpu_chunks = stats.cpu_chunks.saturating_add(1),
+                    ChunkBackend::GpuAssisted => {
+                        stats.gpu_chunks = stats.gpu_chunks.saturating_add(1)
+                    }
+                }
+                inflight_raw_bytes.fetch_sub(ready.chunk.raw_len as usize, Ordering::Relaxed);
+                written_tasks.store(next_write_index + 1, Ordering::Relaxed);
+                {
+                    let (queue_lock, queue_cv) = &*queue_state;
+                    drop(lock(queue_lock)?);
+                    queue_cv.notify_all();
+                }
+                next_write_index = next_write_index.saturating_add(1);
             }
-            inflight_raw_bytes = inflight_raw_bytes.saturating_sub(ready.chunk.raw_len as usize);
-            next_write_index = next_write_index.saturating_add(1);
+
+            let total_task_count = total_tasks.load(Ordering::Relaxed);
+            let reached_eof = {
+                let (queue_lock, _) = &*queue_state;
+                lock(queue_lock)?.closed
+            };
+            let inflight_chunks = total_task_count.saturating_sub(next_write_index);
+            stats.inflight_chunks_max = stats.inflight_chunks_max.max(inflight_chunks);
+            if reached_eof && next_write_index == total_task_count {
+                break;
+            }
+
+            if !progressed {
+                let wait_start = Instant::now();
+                let (ready_lock, ready_cv) = &*ready_state;
+                let guard = lock(ready_lock)?;
+                let ready_len = guard.len();
+                stats.ready_chunks_max = stats.ready_chunks_max.max(ready_len);
+                let hol_wait = ready_len > 0;
+                drop(wait_timeout_on_condvar(
+                    ready_cv,
+                    guard,
+                    Duration::from_millis(2),
+                )?);
+                let wait_ms = elapsed_ms(wait_start);
+                stats.writer_wait_ms += wait_ms;
+                stats.writer_wait_events = stats.writer_wait_events.saturating_add(1);
+                if hol_wait {
+                    stats.writer_hol_wait_ms += wait_ms;
+                    stats.writer_hol_wait_events = stats.writer_hol_wait_events.saturating_add(1);
+                    stats.writer_hol_ready_sum =
+                        stats.writer_hol_ready_sum.saturating_add(ready_len);
+                    stats.writer_hol_ready_max = stats.writer_hol_ready_max.max(ready_len);
+                }
+            }
         }
 
-        if reached_eof && next_write_index == next_read_index {
-            break;
+        {
+            let (queue_lock, queue_cv) = &*queue_state;
+            let mut state = lock(queue_lock)?;
+            state.closed = true;
+            queue_cv.notify_all();
         }
 
-        if !progressed {
-            let wait_start = Instant::now();
-            let (ready_lock, ready_cv) = &*ready_state;
-            let guard = lock(ready_lock)?;
-            let ready_len = guard.len();
-            stats.ready_chunks_max = stats.ready_chunks_max.max(ready_len);
-            let hol_wait = ready_len > 0;
-            drop(wait_timeout_on_condvar(
-                ready_cv,
-                guard,
-                Duration::from_millis(2),
-            )?);
-            let wait_ms = elapsed_ms(wait_start);
-            stats.writer_wait_ms += wait_ms;
-            stats.writer_wait_events = stats.writer_wait_events.saturating_add(1);
-            if hol_wait {
-                stats.writer_hol_wait_ms += wait_ms;
-                stats.writer_hol_wait_events = stats.writer_hol_wait_events.saturating_add(1);
-                stats.writer_hol_ready_sum = stats.writer_hol_ready_sum.saturating_add(ready_len);
-                stats.writer_hol_ready_max = stats.writer_hol_ready_max.max(ready_len);
-            }
-        }
-    }
+        Ok(())
+    })?;
 
     {
         let (queue_lock, queue_cv) = &*queue_state;
@@ -2704,6 +2967,10 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
     if let Some(err) = lock(&error)?.take() {
         return Err(err);
     }
+
+    let (input_bytes, input_crc32) = *lock(&producer_stats)?;
+    stats.input_bytes = input_bytes;
+    stats.input_crc32 = input_crc32;
 
     if stats.chunk_count == 0 {
         let empty = deflate_compress_cpu(&[], options.compression_level)?;
@@ -2734,7 +3001,6 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
     stats.gpu_steal_reserve_chunks += counters.gpu_steal_reserve_chunks;
 
     bit_writer.finish()?;
-    stats.input_crc32 = input_crc.finalize();
     stats.output_bytes = output.written;
     stats.output_crc32 = output.hasher.finalize();
     stats.gpu_available = gpu_enabled;

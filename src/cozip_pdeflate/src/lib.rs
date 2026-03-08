@@ -24,8 +24,8 @@ pub type CoZipPDeflate = CoZipDeflate;
 pub type CoZipPDeflateError = CozipDeflateError;
 
 const DEFAULT_STREAM_IO_BUFFER_SIZE: usize = 8 * 1024 * 1024;
-const DEFAULT_ASYNC_STREAM_BUFFER_CAPACITY: usize = 16 * 1024 * 1024;
-const DEFAULT_ASYNC_STREAM_LOW_WATERMARK: usize = 8 * 1024 * 1024;
+const DEFAULT_ASYNC_STREAM_BUFFER_CAPACITY: usize = 128 * 1024 * 1024;
+const DEFAULT_ASYNC_STREAM_LOW_WATERMARK: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct StreamOptions {
@@ -206,7 +206,7 @@ impl CoZipDeflate {
         .map_err(map_pdeflate_error)
     }
 
-    pub fn decompress_stream<R: Read, W: Write>(
+    pub fn decompress_stream<R: Read + Send, W: Write>(
         &self,
         reader: &mut R,
         writer: &mut W,
@@ -214,7 +214,7 @@ impl CoZipDeflate {
         self.decompress_stream_with_options(reader, writer, StreamOptions::default())
     }
 
-    pub fn decompress_stream_with_options<R: Read, W: Write>(
+    pub fn decompress_stream_with_options<R: Read + Send, W: Write>(
         &self,
         reader: &mut R,
         writer: &mut W,
@@ -522,7 +522,7 @@ impl CoZipDeflate {
         Ok(DeflateHybridCompressResult { stats, index: None })
     }
 
-    pub fn deflate_decompress_stream_zip_compatible_with_index<R: Read, W: Write>(
+    pub fn deflate_decompress_stream_zip_compatible_with_index<R: Read + Send, W: Write>(
         &self,
         reader: &mut R,
         writer: &mut W,
@@ -531,7 +531,7 @@ impl CoZipDeflate {
         self.decompress_stream(reader, writer)
     }
 
-    pub fn deflate_decompress_stream_zip_compatible_with_index_cpu<R: Read, W: Write>(
+    pub fn deflate_decompress_stream_zip_compatible_with_index_cpu<R: Read + Send, W: Write>(
         &self,
         reader: &mut R,
         writer: &mut W,
@@ -544,7 +544,7 @@ impl CoZipDeflate {
             .map_err(map_pdeflate_error)
     }
 
-    pub fn pdeflate_decompress_stream<R: Read, W: Write>(
+    pub fn pdeflate_decompress_stream<R: Read + Send, W: Write>(
         &self,
         reader: &mut R,
         writer: &mut W,
@@ -584,7 +584,7 @@ pub fn deflate_compress_stream_hybrid_zip_compatible_with_index<R: Read + Send, 
     cozip.deflate_compress_stream_zip_compatible_with_index(reader, writer)
 }
 
-pub fn deflate_decompress_stream_indexed_on_cpu<R: Read, W: Write>(
+pub fn deflate_decompress_stream_indexed_on_cpu<R: Read + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     _index: &DeflateChunkIndex,
@@ -596,7 +596,7 @@ pub fn deflate_decompress_stream_indexed_on_cpu<R: Read, W: Write>(
         .map_err(map_pdeflate_error)
 }
 
-pub fn deflate_decompress_stream_hybrid_indexed<R: Read, W: Write>(
+pub fn deflate_decompress_stream_hybrid_indexed<R: Read + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     _index: &DeflateChunkIndex,
