@@ -1,0 +1,50 @@
+[window]
+title = "CoZip Setup"
+
+[header]
+title = "CoZip Setup Wizard"
+subtitle = "This wizard installs CoZip on your computer."
+
+[common]
+install_dir = "Install location"
+start_menu = "Start Menu shortcut"
+start_menu_value = "Create shortcut"
+
+[license]
+title = "License Agreement"
+description = "Please review the license below. You must accept the agreement before continuing."
+accept = "I accept the terms of the license agreement"
+
+[options]
+title = "Installation Options"
+description = "Choose the setup options to apply."
+explorer_menu = "Add to Explorer context menu"
+
+[install]
+title = "Installing"
+description = "Setup is copying files and applying system settings."
+status_preparing = "Preparing installation..."
+status_extracting = "Copying application files..."
+status_shortcuts = "Creating shortcuts..."
+status_explorer = "Updating Explorer menu..."
+status_finalizing = "Finalizing installation..."
+status_completed = "Installation completed."
+
+[complete]
+title = "Completed"
+description = "CoZip has been installed."
+menu_enabled = "Explorer context menu will be added."
+menu_disabled = "Explorer context menu will not be added."
+state = "Wizard flow completed."
+
+[footer]
+license = "Accept the license to continue."
+options = "Review the options, then start installation."
+installing = "Please wait while setup completes."
+complete = "Click Finish to exit setup."
+
+[buttons]
+back = "Back"
+next = "Next"
+install = "Install"
+finish = "Finish"

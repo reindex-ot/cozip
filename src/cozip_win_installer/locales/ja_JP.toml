@@ -1,0 +1,50 @@
+[window]
+title = "CoZip セットアップ"
+
+[header]
+title = "CoZip セットアップウィザード"
+subtitle = "このウィザードは CoZip をコンピューターにインストールします。"
+
+[common]
+install_dir = "インストール先"
+start_menu = "スタートメニュー ショートカット"
+start_menu_value = "ショートカットを作成"
+
+[license]
+title = "ライセンス契約"
+description = "以下のライセンスを確認してください。続行するには同意が必要です。"
+accept = "ライセンス契約の条項に同意します"
+
+[options]
+title = "インストールオプション"
+description = "適用するセットアップオプションを選択してください。"
+explorer_menu = "エクスプローラのコンテキストメニューに追加"
+
+[install]
+title = "インストール中"
+description = "セットアップはファイルのコピーとシステム設定を行っています。"
+status_preparing = "インストールを準備しています..."
+status_extracting = "アプリケーション ファイルをコピーしています..."
+status_shortcuts = "ショートカットを作成しています..."
+status_explorer = "エクスプローラメニューを更新しています..."
+status_finalizing = "最終処理を実行しています..."
+status_completed = "インストールが完了しました。"
+
+[complete]
+title = "完了"
+description = "CoZip のインストールが完了しました。"
+menu_enabled = "エクスプローラのコンテキストメニューに追加します。"
+menu_disabled = "エクスプローラのコンテキストメニューには追加しません。"
+state = "ウィザードの画面遷移が完了しました。"
+
+[footer]
+license = "続行するにはライセンスに同意してください。"
+options = "オプションを確認してからインストールを開始してください。"
+installing = "セットアップが完了するまでお待ちください。"
+complete = "完了を押すとセットアップを終了します。"
+
+[buttons]
+back = "戻る"
+next = "次へ"
+install = "インストール"
+finish = "完了"
