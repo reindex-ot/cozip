@@ -13,6 +13,7 @@ use cozip_pdeflate::{
     CoZipPDeflate, CoZipPDeflateError, StreamOptions as PDeflateStreamOptions,
     pdeflate_stream_suggested_name, pdeflate_stream_uncompressed_size,
 };
+use cozip_util::{ParallelFileWriter, ParallelFileWriterOptions};
 use thiserror::Error;
 
 pub use cozip_pdeflate::PDeflateOptions;
@@ -625,7 +626,8 @@ enum PDeflateArchiveWriteState {
     RecordPath { tag: u8, path_len: usize },
     RecordFileLen { path: PathBuf },
     RecordFileData {
-        file: BufWriter<ProgressWriter<StdFile>>,
+        file: ParallelFileWriter,
+        file_offset: u64,
         remaining: u64,
     },
     Finished,
@@ -638,6 +640,7 @@ struct PDeflateArchiveWriter {
     file_entries: usize,
     output_bytes: u64,
     progress: Option<CoZipProgress>,
+    parallel_write_threads: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -680,7 +683,10 @@ pub struct CoZip {
 #[derive(Debug, Clone)]
 enum CoZipBackend {
     Zip { deflate: CoZipDeflate },
-    PDeflate { pdeflate: CoZipPDeflate },
+    PDeflate {
+        pdeflate: CoZipPDeflate,
+        parallel_write_threads: usize,
+    },
 }
 
 impl CoZip {
@@ -696,8 +702,12 @@ impl CoZip {
                 CoZipBackend::Zip { deflate }
             }
             CoZipOptions::PDeflate { options } => {
+                let parallel_write_threads = options.parallel_write_threads;
                 let pdeflate = CoZipPDeflate::init(options)?;
-                CoZipBackend::PDeflate { pdeflate }
+                CoZipBackend::PDeflate {
+                    pdeflate,
+                    parallel_write_threads,
+                }
             }
         };
         Ok(Self { backend })
@@ -779,7 +789,7 @@ impl CoZip {
                 }
                 Ok(stats)
             }
-            CoZipBackend::PDeflate { pdeflate } => {
+            CoZipBackend::PDeflate { pdeflate, .. } => {
                 let input_len = input_file.metadata()?.len();
                 if let Some(progress) = &progress {
                     progress.start(
@@ -986,7 +996,7 @@ impl CoZip {
                 }
                 Ok(stats)
             }
-            CoZipBackend::PDeflate { pdeflate } => {
+            CoZipBackend::PDeflate { pdeflate, .. } => {
                 let entries = collect_pdeflate_archive_entries_recursively(input_dir)?;
                 let file_entries = entries
                     .iter()
@@ -1117,7 +1127,7 @@ impl CoZip {
                     output_bytes,
                 })
             }
-            CoZipBackend::PDeflate { pdeflate } => {
+            CoZipBackend::PDeflate { pdeflate, .. } => {
                 let expected_output_bytes = match expected_output_bytes {
                     Some(size) => Some(size),
                     None => {
@@ -1545,7 +1555,10 @@ impl CoZip {
                 }
                 Ok(stats)
             }
-            CoZipBackend::PDeflate { pdeflate } => {
+            CoZipBackend::PDeflate {
+                pdeflate,
+                parallel_write_threads,
+            } => {
                 let mut reader = BufReader::new(input_file);
                 let header = read_pdeflate_directory_header(&mut reader)?;
                 if let Some(progress) = &progress {
@@ -1556,7 +1569,11 @@ impl CoZip {
                         header.total_file_bytes,
                     );
                 }
-                let mut archive_writer = PDeflateArchiveWriter::new(output_dir, progress.clone())?;
+                let mut archive_writer = PDeflateArchiveWriter::new(
+                    output_dir,
+                    progress.clone(),
+                    *parallel_write_threads,
+                )?;
                 let decode_backlog_reporter = progress.clone().map(|progress| {
                     std::sync::Arc::new(move |bytes| {
                         progress.set_pending_output_backlog_bytes(Some(bytes));
@@ -3030,7 +3047,11 @@ impl Read for PDeflateArchiveReader {
 }
 
 impl PDeflateArchiveWriter {
-    fn new(output_dir: &Path, progress: Option<CoZipProgress>) -> Result<Self, CoZipError> {
+    fn new(
+        output_dir: &Path,
+        progress: Option<CoZipProgress>,
+        parallel_write_threads: usize,
+    ) -> Result<Self, CoZipError> {
         std::fs::create_dir_all(output_dir)?;
         Ok(Self {
             output_dir: output_dir.to_path_buf(),
@@ -3039,6 +3060,7 @@ impl PDeflateArchiveWriter {
             file_entries: 0,
             output_bytes: 0,
             progress,
+            parallel_write_threads: parallel_write_threads.max(1),
         })
     }
 
@@ -3058,7 +3080,8 @@ impl PDeflateArchiveWriter {
                 Err(CoZipError::InvalidZip("trailing bytes in pdeflate directory archive"))
             }
             PDeflateArchiveWriteState::RecordFileData { remaining, file, .. } => {
-                file.flush()?;
+                file.drain()
+                    .map_err(|err| CoZipError::Io(io::Error::other(err.to_string())))?;
                 if *remaining == 0 {
                     Err(CoZipError::InvalidZip("missing final end marker in directory archive"))
                 } else {
@@ -3151,10 +3174,20 @@ impl PDeflateArchiveWriter {
                         std::fs::create_dir_all(parent)?;
                     }
                     let progress = self.progress.clone();
-                    let file = BufWriter::new(ProgressWriter::new(
-                        StdFile::create(&*path)?,
-                        progress.clone(),
-                    ));
+                    let file = ParallelFileWriter::new(
+                        open_output_file_rw_truncate(&*path)?,
+                        ParallelFileWriterOptions {
+                            worker_threads: self.parallel_write_threads,
+                            max_backlog_bytes: 256 * 1024 * 1024,
+                            backlog_reporter: None,
+                            write_reporter: progress.clone().map(|progress| {
+                                std::sync::Arc::new(move |bytes| {
+                                    progress.advance_bytes(bytes);
+                                }) as cozip_util::WriteReporter
+                            }),
+                        },
+                    )
+                    .map_err(|err| CoZipError::Io(io::Error::other(err.to_string())))?;
                     self.file_entries = self.file_entries.saturating_add(1);
                     if let Some(progress) = &progress {
                         let entry_name = path
@@ -3168,14 +3201,20 @@ impl PDeflateArchiveWriter {
                             Some(file_len),
                         );
                     }
-                    self.state =
-                        PDeflateArchiveWriteState::RecordFileData { file, remaining: file_len };
+                    self.state = PDeflateArchiveWriteState::RecordFileData {
+                        file,
+                        file_offset: 0,
+                        remaining: file_len,
+                    };
                 }
                 PDeflateArchiveWriteState::RecordFileData {
-                    file, remaining, ..
+                    file,
+                    file_offset,
+                    remaining,
                 } => {
                     if *remaining == 0 {
-                        file.flush()?;
+                        file.drain()
+                            .map_err(|err| CoZipError::Io(io::Error::other(err.to_string())))?;
                         if let Some(progress) = &self.progress {
                             progress.finish_entry();
                         }
@@ -3187,12 +3226,15 @@ impl PDeflateArchiveWriter {
                     }
                     let take = usize::try_from((*remaining).min(self.buffer.len() as u64))
                         .map_err(|_| CoZipError::InvalidZip("file chunk size out of range"))?;
-                    file.write_all(&self.buffer[..take])?;
+                    file.submit(*file_offset, self.buffer[..take].to_vec())
+                        .map_err(|err| CoZipError::Io(io::Error::other(err.to_string())))?;
                     self.buffer.drain(..take);
+                    *file_offset = file_offset.saturating_add(take as u64);
                     *remaining = remaining.saturating_sub(take as u64);
                     self.output_bytes = self.output_bytes.saturating_add(take as u64);
                     if *remaining == 0 {
-                        file.flush()?;
+                        file.drain()
+                            .map_err(|err| CoZipError::Io(io::Error::other(err.to_string())))?;
                         if let Some(progress) = &self.progress {
                             progress.finish_entry();
                         }
@@ -3216,7 +3258,8 @@ impl Write for PDeflateArchiveWriter {
 
     fn flush(&mut self) -> Result<(), io::Error> {
         if let PDeflateArchiveWriteState::RecordFileData { file, .. } = &mut self.state {
-            file.flush()?;
+            file.drain()
+                .map_err(|err| io::Error::other(err.to_string()))?;
         }
         Ok(())
     }

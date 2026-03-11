@@ -196,6 +196,10 @@ impl CoZipDeflate {
         self.init_stats.gpu_context_init_ms
     }
 
+    pub fn parallel_write_threads(&self) -> usize {
+        self.options.parallel_write_threads
+    }
+
     pub fn compress_stream<R: Read + Send, W: Write>(
         &self,
         reader: &mut R,
