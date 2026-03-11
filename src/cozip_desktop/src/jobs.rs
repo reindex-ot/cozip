@@ -99,7 +99,7 @@ fn run_compress(plan: CompressPlan, shared: &SharedJobSnapshot) -> Result<String
             .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
     }
 
-    let cozip = init_cozip(plan.format, plan.hybrid)?;
+    let cozip = init_compress_cozip(&plan)?;
     let stats = match plan.mode {
         CompressMode::SingleFile => cozip
             .compress_file_from_name_with_progress(
@@ -142,22 +142,23 @@ fn run_compress(plan: CompressPlan, shared: &SharedJobSnapshot) -> Result<String
 fn run_extract(plan: ExtractPlan, shared: &SharedJobSnapshot) -> Result<String, String> {
     for (index, task) in plan.tasks.iter().enumerate() {
         let progress = CoZipProgress::new();
+        let output_path = plan.output_path_for(task);
         set_current_task(
             shared,
             display_path(Some(&task.archive_path)),
             progress.clone(),
         );
 
-        if let Some(parent) = task.output_path.parent() {
+        if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
         }
 
-        let cozip = init_cozip(task.archive_format, true)?;
+        let cozip = init_extract_cozip(task.archive_format, &plan.pdeflate_options)?;
         let result = cozip
             .decompress_auto_from_name_with_progress(
                 &task.archive_path,
-                &task.output_path,
+                &output_path,
                 Some(progress.clone()),
             )
             .map_err(|error| error.to_string());
@@ -179,26 +180,32 @@ fn run_extract(plan: ExtractPlan, shared: &SharedJobSnapshot) -> Result<String, 
     ))
 }
 
-fn init_cozip(format: ArchiveFormat, hybrid: bool) -> Result<CoZip, String> {
+fn init_compress_cozip(plan: &CompressPlan) -> Result<CoZip, String> {
+    let options = match plan.format {
+        ArchiveFormat::Zip => CoZipOptions::Zip {
+            options: plan.zip_options.clone(),
+        },
+        ArchiveFormat::Cozip => CoZipOptions::PDeflate {
+            options: plan.pdeflate_options.clone(),
+        },
+    };
+    CoZip::init(options).map_err(|error| error.to_string())
+}
+
+fn init_extract_cozip(
+    format: ArchiveFormat,
+    pdeflate_options: &PDeflateOptions,
+) -> Result<CoZip, String> {
     let options = match format {
         ArchiveFormat::Zip => CoZipOptions::Zip {
             options: ZipOptions {
-                deflate_mode: if hybrid {
-                    ZipDeflateMode::Hybrid
-                } else {
-                    ZipDeflateMode::Cpu
-                },
+                deflate_mode: ZipDeflateMode::Hybrid,
                 ..ZipOptions::default()
             },
         },
-        ArchiveFormat::Cozip => {
-            let mut options = PDeflateOptions::default();
-            if !hybrid {
-                options.gpu_compress_enabled = false;
-                options.gpu_decompress_enabled = false;
-            }
-            CoZipOptions::PDeflate { options }
-        }
+        ArchiveFormat::Cozip => CoZipOptions::PDeflate {
+            options: pdeflate_options.clone(),
+        },
     };
     CoZip::init(options).map_err(|error| error.to_string())
 }

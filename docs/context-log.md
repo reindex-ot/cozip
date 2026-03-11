@@ -1956,3 +1956,10 @@ mode別GPU品質パラメータ:
 - 実装方式は ZIP 互換ではなく、`cozip` 内部の streaming archive を先に作ってから PDeflate へ流す `archive -> compress` 方式
 - 解凍はその逆で、PDeflate を stream 解凍しつつ内部 archive を逐次展開する
 - これにより一時 spool file なしで directory mode を扱える
+
+## 2026-03-10 PDeflate single-file progress metadata
+
+- `PDS0` ストリームヘッダに、任意の `uncompressed_size: u64` metadata を追加した
+- 単一ファイル PDeflate 圧縮では入力ファイルサイズをこの metadata として埋め込む
+- 単一ファイル PDeflate 解凍では、この metadata が存在する場合に事前全走査なしで write 基準の進捗率を出せる
+- metadata が存在しない旧ストリームは引き続き解凍可能で、進捗率は不定扱いとする

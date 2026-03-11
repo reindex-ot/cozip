@@ -3,7 +3,11 @@ use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use cozip::{CoZipArchiveFormat, CoZipArchiveInfo, CoZipArchiveKind, inspect_archive_from_name};
+use cozip::{
+    CoZipArchiveFormat, CoZipArchiveInfo, CoZipArchiveKind, ZipDeflateMode, ZipOptions,
+    inspect_archive_from_name,
+};
+use cozip_pdeflate::PDeflateOptions;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InitialScreen {
@@ -36,10 +40,11 @@ pub struct LaunchRequest {
 #[derive(Clone, Debug)]
 pub struct CompressPlan {
     pub format: ArchiveFormat,
-    pub hybrid: bool,
     pub sources: Vec<PathBuf>,
     pub output_path: PathBuf,
     pub mode: CompressMode,
+    pub zip_options: ZipOptions,
+    pub pdeflate_options: PDeflateOptions,
 }
 
 #[derive(Clone, Debug)]
@@ -53,6 +58,8 @@ pub enum CompressMode {
 pub struct ExtractPlan {
     pub tasks: Vec<ExtractTask>,
     pub ignored_inputs: Vec<PathBuf>,
+    pub output_dir: PathBuf,
+    pub pdeflate_options: PDeflateOptions,
 }
 
 #[derive(Clone, Debug)]
@@ -60,7 +67,8 @@ pub struct ExtractTask {
     pub archive_path: PathBuf,
     pub archive_format: ArchiveFormat,
     pub archive_kind: ExtractArchiveKind,
-    pub output_path: PathBuf,
+    pub container_dir_name: PathBuf,
+    pub single_file_name: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +90,28 @@ impl LaunchRequest {
                 startup_error: Some(message),
             },
         }
+    }
+}
+
+impl CompressPlan {
+    pub fn default_output_path(&self, format: ArchiveFormat) -> PathBuf {
+        default_compress_output_path(&self.sources, &self.mode, format)
+    }
+}
+
+impl ExtractPlan {
+    pub fn output_path_for(&self, task: &ExtractTask) -> PathBuf {
+        let container_dir = unique_path(self.output_dir.join(&task.container_dir_name));
+        match (&task.archive_kind, &task.single_file_name) {
+            (ExtractArchiveKind::SingleFile, Some(file_name)) => container_dir.join(file_name),
+            _ => container_dir,
+        }
+    }
+
+    pub fn has_pdeflate_tasks(&self) -> bool {
+        self.tasks
+            .iter()
+            .any(|task| task.archive_format == ArchiveFormat::Cozip)
     }
 }
 
@@ -207,11 +237,6 @@ fn build_compress_plan(
     }
 
     sources.sort();
-    let extension = match format {
-        ArchiveFormat::Zip => "zip",
-        ArchiveFormat::Cozip => "pdz",
-    };
-
     let mode = if sources.len() == 1 {
         let path = &sources[0];
         if path.is_dir() {
@@ -225,7 +250,38 @@ fn build_compress_plan(
         CompressMode::MultiSelection
     };
 
-    let output_path = match mode {
+    let mut zip_options = ZipOptions::default();
+    zip_options.deflate_mode = if hybrid {
+        ZipDeflateMode::Hybrid
+    } else {
+        ZipOptions::default().deflate_mode
+    };
+
+    let pdeflate_options = PDeflateOptions::default();
+
+    let output_path = default_compress_output_path(&sources, &mode, format);
+
+    Ok(CompressPlan {
+        format,
+        sources,
+        output_path,
+        mode,
+        zip_options,
+        pdeflate_options,
+    })
+}
+
+fn default_compress_output_path(
+    sources: &[PathBuf],
+    mode: &CompressMode,
+    format: ArchiveFormat,
+) -> PathBuf {
+    let extension = match format {
+        ArchiveFormat::Zip => "zip",
+        ArchiveFormat::Cozip => "pdz",
+    };
+
+    match mode {
         CompressMode::SingleFile => {
             let source = &sources[0];
             let parent = source.parent().unwrap_or_else(|| Path::new("."));
@@ -247,20 +303,12 @@ fn build_compress_plan(
             unique_path(parent.join(format!("{name}.{extension}")))
         }
         CompressMode::MultiSelection => {
-            let parent = common_parent(&sources)
+            let parent = common_parent(sources)
                 .or_else(|| sources[0].parent().map(Path::to_path_buf))
                 .unwrap_or_else(|| PathBuf::from("."));
             unique_path(parent.join(format!("Archive.{extension}")))
         }
-    };
-
-    Ok(CompressPlan {
-        format,
-        hybrid,
-        sources,
-        output_path,
-        mode,
-    })
+    }
 }
 
 fn build_extract_plan(inputs: Vec<PathBuf>) -> Result<ExtractPlan, String> {
@@ -301,13 +349,10 @@ fn build_extract_plan(inputs: Vec<PathBuf>) -> Result<ExtractPlan, String> {
                 if !path.is_file() {
                     continue;
                 }
-                match inspect_archive_from_name(&path) {
-                    Ok(info) => {
-                        if seen.insert(path.clone()) {
-                            tasks.push(build_extract_task(path, info));
-                        }
+                if let Ok(info) = inspect_archive_from_name(&path) {
+                    if seen.insert(path.clone()) {
+                        tasks.push(build_extract_task(path, info));
                     }
-                    Err(_) => {}
                 }
             }
             continue;
@@ -320,9 +365,16 @@ fn build_extract_plan(inputs: Vec<PathBuf>) -> Result<ExtractPlan, String> {
         return Err("no supported archives were found in the selection".to_string());
     }
 
+    let output_dir = tasks
+        .first()
+        .and_then(|task| task.archive_path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+
     Ok(ExtractPlan {
         tasks,
         ignored_inputs: ignored,
+        output_dir,
+        pdeflate_options: PDeflateOptions::default(),
     })
 }
 
@@ -331,20 +383,21 @@ fn build_extract_task(path: PathBuf, info: CoZipArchiveInfo) -> ExtractTask {
         CoZipArchiveFormat::Zip => ArchiveFormat::Zip,
         CoZipArchiveFormat::PDeflate => ArchiveFormat::Cozip,
     };
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let stem = path
         .file_stem()
         .and_then(|value| value.to_str())
         .filter(|value| !value.is_empty())
         .unwrap_or("archive");
-    let (archive_kind, output_path) = match info.kind {
+    let (archive_kind, container_dir_name, single_file_name) = match info.kind {
         CoZipArchiveKind::SingleFile { suggested_name } => (
             ExtractArchiveKind::SingleFile,
-            unique_path(parent.join(suggested_name)),
+            PathBuf::from(stem),
+            Some(PathBuf::from(suggested_name)),
         ),
         CoZipArchiveKind::Directory => (
             ExtractArchiveKind::Directory,
-            unique_path(parent.join(stem)),
+            PathBuf::from(stem),
+            None,
         ),
     };
 
@@ -352,7 +405,8 @@ fn build_extract_task(path: PathBuf, info: CoZipArchiveInfo) -> ExtractTask {
         archive_path: path,
         archive_format,
         archive_kind,
-        output_path,
+        container_dir_name,
+        single_file_name,
     }
 }
 
@@ -375,7 +429,7 @@ fn common_parent(paths: &[PathBuf]) -> Option<PathBuf> {
     }
 }
 
-fn unique_path(candidate: PathBuf) -> PathBuf {
+pub fn unique_path(candidate: PathBuf) -> PathBuf {
     if !candidate.exists() {
         return candidate;
     }
@@ -403,4 +457,11 @@ fn unique_path(candidate: PathBuf) -> PathBuf {
     }
 
     candidate
+}
+
+pub fn cycle_archive_format(current: ArchiveFormat) -> ArchiveFormat {
+    match current {
+        ArchiveFormat::Zip => ArchiveFormat::Cozip,
+        ArchiveFormat::Cozip => ArchiveFormat::Zip,
+    }
 }

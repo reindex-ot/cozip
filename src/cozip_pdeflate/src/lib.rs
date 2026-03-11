@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::fs::File as StdFile;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use thiserror::Error;
@@ -15,7 +16,7 @@ pub use pdeflate::{
     pdeflate_compress, pdeflate_compress_with_stats, pdeflate_decompress,
     pdeflate_decompress_into, pdeflate_decompress_into_with_stats,
     pdeflate_decompress_into_with_stats_with_options, pdeflate_decompress_with_stats,
-    pdeflate_gpu_init,
+    pdeflate_gpu_init, pdeflate_stream_uncompressed_size,
 };
 
 pub type HybridOptions = PDeflateOptions;
@@ -27,16 +28,35 @@ const DEFAULT_STREAM_IO_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const DEFAULT_ASYNC_STREAM_BUFFER_CAPACITY: usize = 128 * 1024 * 1024;
 const DEFAULT_ASYNC_STREAM_LOW_WATERMARK: usize = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy)]
+pub type DecodeBacklogReporter = Arc<dyn Fn(u64) + Send + Sync + 'static>;
+
+#[derive(Clone)]
 pub struct StreamOptions {
     pub io_buffer_size: usize,
+    pub uncompressed_size_hint: Option<u64>,
+    pub decode_backlog_reporter: Option<DecodeBacklogReporter>,
 }
 
 impl Default for StreamOptions {
     fn default() -> Self {
         Self {
             io_buffer_size: DEFAULT_STREAM_IO_BUFFER_SIZE,
+            uncompressed_size_hint: None,
+            decode_backlog_reporter: None,
         }
+    }
+}
+
+impl std::fmt::Debug for StreamOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamOptions")
+            .field("io_buffer_size", &self.io_buffer_size)
+            .field("uncompressed_size_hint", &self.uncompressed_size_hint)
+            .field(
+                "decode_backlog_reporter",
+                &self.decode_backlog_reporter.as_ref().map(|_| "<reporter>"),
+            )
+            .finish()
     }
 }
 
@@ -200,6 +220,7 @@ impl CoZipDeflate {
             reader,
             writer,
             &self.options,
+            stream_options.uncompressed_size_hint,
             async_stream_options.buffer_capacity,
             async_stream_options.low_watermark,
         )
@@ -220,8 +241,12 @@ impl CoZipDeflate {
         writer: &mut W,
         stream_options: StreamOptions,
     ) -> Result<PDeflateStats, CozipDeflateError> {
-        let _ = stream_options;
-        pdeflate::pdeflate_decompress_reader_with_stats(reader, writer, &self.options)
+        pdeflate::pdeflate_decompress_reader_with_stats(
+            reader,
+            writer,
+            &self.options,
+            stream_options.decode_backlog_reporter,
+        )
             .map_err(map_pdeflate_error)
     }
 
@@ -237,8 +262,11 @@ impl CoZipDeflate {
         &self,
         input_file: StdFile,
         output_file: StdFile,
-        stream_options: StreamOptions,
+        mut stream_options: StreamOptions,
     ) -> Result<PDeflateStats, CozipDeflateError> {
+        if stream_options.uncompressed_size_hint.is_none() {
+            stream_options.uncompressed_size_hint = Some(input_file.metadata()?.len());
+        }
         let mut reader = BufReader::with_capacity(stream_options.io_buffer_size.max(1), input_file);
         let mut writer =
             BufWriter::with_capacity(stream_options.io_buffer_size.max(1), output_file);
@@ -289,9 +317,12 @@ impl CoZipDeflate {
         &self,
         input_file: tokio::fs::File,
         output_file: tokio::fs::File,
-        stream_options: StreamOptions,
+        mut stream_options: StreamOptions,
         _async_stream_options: AsyncStreamOptions,
     ) -> Result<PDeflateStats, CozipDeflateError> {
+        if stream_options.uncompressed_size_hint.is_none() {
+            stream_options.uncompressed_size_hint = Some(input_file.metadata().await?.len());
+        }
         let this = self.clone();
         let input_std = input_file.into_std().await;
         let output_std = output_file.into_std().await;
@@ -540,7 +571,7 @@ impl CoZipDeflate {
         let mut cpu_options = self.options.clone();
         cpu_options.gpu_decompress_enabled = false;
         cpu_options.gpu_decompress_force_gpu = false;
-        pdeflate::pdeflate_decompress_reader_with_stats(reader, writer, &cpu_options)
+        pdeflate::pdeflate_decompress_reader_with_stats(reader, writer, &cpu_options, None)
             .map_err(map_pdeflate_error)
     }
 
@@ -592,7 +623,7 @@ pub fn deflate_decompress_stream_indexed_on_cpu<R: Read + Send, W: Write>(
     let mut options = PDeflateOptions::default();
     options.gpu_decompress_enabled = false;
     options.gpu_decompress_force_gpu = false;
-    pdeflate::pdeflate_decompress_reader_with_stats(reader, writer, &options)
+    pdeflate::pdeflate_decompress_reader_with_stats(reader, writer, &options, None)
         .map_err(map_pdeflate_error)
 }
 
@@ -602,7 +633,7 @@ pub fn deflate_decompress_stream_hybrid_indexed<R: Read + Send, W: Write>(
     _index: &DeflateChunkIndex,
     options: &PDeflateOptions,
 ) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
-    pdeflate::pdeflate_decompress_reader_with_stats(reader, writer, options)
+    pdeflate::pdeflate_decompress_reader_with_stats(reader, writer, options, None)
         .map_err(map_pdeflate_error)
 }
 

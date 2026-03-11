@@ -37,15 +37,26 @@
 - ストリームヘッダ:
   - `magic[4] = "PDS0"`
   - `version: u16 = 1`
-  - `flags: u16`（v1 では 0 固定）
+  - `flags: u16`
+    - bit 0: `UNCOMPRESSED_SIZE_PRESENT`
+      - `1`: 直後に `uncompressed_size: u64` が続く
+      - `0`: 追加メタデータなし
   - `chunk_size: u32`
+  - `uncompressed_size: u64`（`flags.UNCOMPRESSED_SIZE_PRESENT == 1` のときのみ存在）
 - 本文:
   - `chunk_payload_len: u32`
   - `chunk_payload[chunk_payload_len]`
   - 上記 frame の繰り返し
-- ストリームヘッダには `original_len` と `chunk_count` を保持しない。
+- `chunk_count` はストリームヘッダに保持しない。
+- `uncompressed_size` は任意メタデータであり、存在しないストリームも正当とする。
+- 単一ファイル圧縮では、進捗計算や事前容量把握のため `uncompressed_size` を格納することを推奨する。
 - ストリーム終端は、最後のチャンクの `flags.FINAL_STREAM == 1` で示す。
 - 空ストリームは、チャンク frame を 1 つも持たないヘッダのみのストリームとして表現してよい。
+
+補足:
+- `uncompressed_size` はストリーム全体の展開後総バイト数である。
+- 本メタデータは解凍時の進捗率表示や事前出力見積りに使用できる。
+- 本メタデータが欠落している場合、解凍は通常どおり可能だが、進捗率は不定扱いとしてよい。
 
 ### 4.1 エンディアン
 - 整数はすべて Little Endian。

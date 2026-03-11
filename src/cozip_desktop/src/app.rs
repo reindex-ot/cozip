@@ -1,21 +1,20 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use cozip::ZipDeflateMode;
 use gpui::{
     AnyElement, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, Render,
     SharedString, StatefulInteractiveElement, Styled, Timer, Window, div, px, rgb,
 };
+use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 
 use crate::i18n::I18n;
 use crate::jobs::{JobSnapshot, JobStatus, SharedJobSnapshot, spawn_job};
 use crate::launch::{
     ArchiveFormat, CompressMode, CompressPlan, DesktopCommand, ExtractPlan, InitialScreen,
-    LaunchRequest,
+    LaunchRequest, cycle_archive_format,
 };
-use crate::screens::{
-    compress_settings::CompressSettingsScreen, decompress_settings::DecompressSettingsScreen,
-    widgets::{action_button, labeled_value, panel, progress_bar, separator},
-};
+use crate::screens::widgets::{action_button, labeled_value, panel, progress_bar, separator};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScreenKind {
@@ -28,6 +27,7 @@ pub enum ScreenKind {
 pub struct CozipDesktopApp {
     i18n: I18n,
     launch: LaunchRequest,
+    command: Option<DesktopCommand>,
     active_screen: ScreenKind,
     job: Option<SharedJobSnapshot>,
     job_snapshot: JobSnapshot,
@@ -35,8 +35,6 @@ pub struct CozipDesktopApp {
     displayed_throughput: f64,
     poll_started: bool,
     auto_start_consumed: bool,
-    compress_settings: CompressSettingsScreen,
-    decompress_settings: DecompressSettingsScreen,
 }
 
 impl CozipDesktopApp {
@@ -44,6 +42,7 @@ impl CozipDesktopApp {
         let i18n = I18n::load();
         Self {
             i18n,
+            command: launch.command.clone(),
             active_screen: match launch.initial_screen {
                 InitialScreen::Compress => ScreenKind::Compress,
                 InitialScreen::Decompress => ScreenKind::Decompress,
@@ -57,8 +56,6 @@ impl CozipDesktopApp {
             displayed_throughput: 0.0,
             poll_started: false,
             auto_start_consumed: false,
-            compress_settings: CompressSettingsScreen::mock(),
-            decompress_settings: DecompressSettingsScreen::mock(),
         }
     }
 
@@ -112,9 +109,12 @@ impl CozipDesktopApp {
             .as_ref()
             .map(|progress| progress.snapshot().throughput_bytes_per_sec)
             .unwrap_or(0.0);
-        let progress_complete = self.target_progress_fraction() >= 0.999;
+        let finished = matches!(
+            self.job_snapshot.status,
+            JobStatus::Succeeded | JobStatus::Failed
+        );
 
-        if matches!(self.job_snapshot.status, JobStatus::Running) && !progress_complete {
+        if matches!(self.job_snapshot.status, JobStatus::Running) && !finished {
             self.displayed_throughput = current;
         } else if self.displayed_throughput <= 0.0 {
             self.displayed_throughput = current;
@@ -123,8 +123,12 @@ impl CozipDesktopApp {
 
     fn step_displayed_progress(&mut self) {
         let target = self.target_progress_fraction();
-        if target >= 0.999 || matches!(self.job_snapshot.status, JobStatus::Succeeded) {
+        if matches!(self.job_snapshot.status, JobStatus::Succeeded) {
             self.displayed_progress = 1.0;
+            return;
+        }
+        if matches!(self.job_snapshot.status, JobStatus::Failed) {
+            self.displayed_progress = target;
             return;
         }
 
@@ -135,14 +139,14 @@ impl CozipDesktopApp {
 
         let delta = target - self.displayed_progress;
         let next = self.displayed_progress + delta * 0.22 + 0.002;
-        self.displayed_progress = next.min(target);
+        self.displayed_progress = next.min(target).min(0.999);
     }
 
     fn start_command(&mut self) {
         if matches!(self.job_snapshot.status, JobStatus::Running) {
             return;
         }
-        let Some(command) = self.launch.command.clone() else {
+        let Some(command) = self.command.clone() else {
             return;
         };
         self.displayed_progress = 0.0;
@@ -179,7 +183,7 @@ impl CozipDesktopApp {
     }
 
     fn shell(&self, content: AnyElement, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.launch.command.is_some() {
+        if self.command.is_some() {
             return div()
                 .size_full()
                 .bg(rgb(0xf3f4f6))
@@ -264,7 +268,7 @@ impl CozipDesktopApp {
     }
 
     fn command(&self) -> Option<&DesktopCommand> {
-        self.launch.command.as_ref()
+        self.command.as_ref()
     }
 
     fn compress_plan(&self) -> Option<&CompressPlan> {
@@ -279,6 +283,155 @@ impl CozipDesktopApp {
             Some(DesktopCommand::Extract(plan)) => Some(plan),
             _ => None,
         }
+    }
+
+    fn compress_plan_mut(&mut self) -> Option<&mut CompressPlan> {
+        match self.command.as_mut() {
+            Some(DesktopCommand::Compress(plan)) => Some(plan),
+            _ => None,
+        }
+    }
+
+    fn extract_plan_mut(&mut self) -> Option<&mut ExtractPlan> {
+        match self.command.as_mut() {
+            Some(DesktopCommand::Extract(plan)) => Some(plan),
+            _ => None,
+        }
+    }
+
+    fn compress_output_warning(&self) -> Option<String> {
+        let plan = self.compress_plan()?;
+        if plan.output_path.exists() {
+            Some(format!(
+                "{} {}",
+                self.i18n.text("warning.output_exists"),
+                plan.output_path.display()
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn extract_output_warning(&self) -> Option<String> {
+        let plan = self.extract_plan()?;
+        let conflicts = plan
+            .tasks
+            .iter()
+            .map(|task| plan.output_path_for(task))
+            .filter(|path| path.exists())
+            .collect::<Vec<_>>();
+
+        if conflicts.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "{} ({})",
+                self.i18n.text("warning.extract_exists"),
+                conflicts.len()
+            ))
+        }
+    }
+
+    fn browse_compress_output(&mut self) {
+        let (format, current_output, title) = match self.compress_plan() {
+            Some(plan) => (
+                plan.format,
+                plan.output_path.clone(),
+                self.i18n.text("dialog.compress_output").to_string(),
+            ),
+            None => return,
+        };
+        let extension = match format {
+            ArchiveFormat::Zip => "zip",
+            ArchiveFormat::Cozip => "pdz",
+        };
+        let file_name = current_output
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("archive");
+
+        let dialog = FileDialog::new()
+            .set_title(&title)
+            .set_file_name(file_name)
+            .add_filter(extension, &[extension]);
+
+        let selected = if let Some(parent) = current_output.parent() {
+            dialog.set_directory(parent).save_file()
+        } else {
+            dialog.save_file()
+        };
+        let Some(path) = selected else {
+            return;
+        };
+        if self.confirm_overwrite(&path) {
+            if let Some(plan) = self.compress_plan_mut() {
+                plan.output_path = path;
+            }
+        }
+    }
+
+    fn browse_extract_output(&mut self) {
+        let (current_output, title) = match self.extract_plan() {
+            Some(plan) => (
+                plan.output_dir.clone(),
+                self.i18n.text("dialog.extract_output").to_string(),
+            ),
+            None => return,
+        };
+        let dialog = FileDialog::new()
+            .set_title(&title)
+            .set_directory(&current_output);
+        if let Some(path) = dialog.pick_folder() {
+            if let Some(plan) = self.extract_plan_mut() {
+                plan.output_dir = path;
+            }
+        }
+    }
+
+    fn confirm_overwrite(&self, path: &Path) -> bool {
+        if !path.exists() {
+            return true;
+        }
+
+        MessageDialog::new()
+            .set_title(self.i18n.text("dialog.overwrite_title"))
+            .set_description(format!(
+                "{}\n{}",
+                self.i18n.text("dialog.overwrite_body"),
+                path.display()
+            ))
+            .set_level(MessageLevel::Warning)
+            .set_buttons(MessageButtons::OkCancel)
+            .show()
+            == MessageDialogResult::Ok
+    }
+
+    fn confirm_extract_conflicts(&self) -> bool {
+        let Some(plan) = self.extract_plan() else {
+            return true;
+        };
+
+        let conflicts = plan
+            .tasks
+            .iter()
+            .map(|task| plan.output_path_for(task))
+            .filter(|path| path.exists())
+            .collect::<Vec<_>>();
+        if conflicts.is_empty() {
+            return true;
+        }
+
+        MessageDialog::new()
+            .set_title(self.i18n.text("dialog.overwrite_title"))
+            .set_description(format!(
+                "{} ({})",
+                self.i18n.text("dialog.extract_overwrite_body"),
+                conflicts.len()
+            ))
+            .set_level(MessageLevel::Warning)
+            .set_buttons(MessageButtons::OkCancel)
+            .show()
+            == MessageDialogResult::Ok
     }
 
     fn banner_panel(&self, text: SharedString, error: bool) -> impl IntoElement {
@@ -296,7 +449,7 @@ impl CozipDesktopApp {
     }
 
     fn render_compress_screen(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.launch.command.is_some() {
+        if self.command.is_some() {
             let mut content = div().gap_4().flex().flex_col();
             if let Some(error) = &self.launch.startup_error {
                 content = content.child(self.banner_panel(error.clone().into(), true));
@@ -330,7 +483,7 @@ impl CozipDesktopApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        if self.launch.command.is_some() {
+        if self.command.is_some() {
             let mut content = div().gap_4().flex().flex_col();
             if let Some(error) = &self.launch.startup_error {
                 content = content.child(self.banner_panel(error.clone().into(), true));
@@ -372,13 +525,13 @@ impl CozipDesktopApp {
         &self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        if self.launch.command.is_some() {
+        if self.command.is_some() {
             let mut content = div().gap_4().flex().flex_col();
             if let Some(error) = &self.launch.startup_error {
                 content = content.child(self.banner_panel(error.clone().into(), true));
             }
             if self.compress_plan().is_some() {
-                content = content.child(self.compress_settings.render(&self.i18n));
+                content = content.child(self.compress_settings_form(cx));
                 content = content.child(self.settings_action_row(true, cx));
             } else {
                 content = content.child(self.empty_state_panel("compress.empty"));
@@ -394,7 +547,7 @@ impl CozipDesktopApp {
 
         if let Some(plan) = self.compress_plan() {
             content = content.child(self.compress_summary_panel(plan));
-            content = content.child(self.compress_settings.render(&self.i18n));
+            content = content.child(self.compress_settings_form(cx));
             content = content.child(self.settings_action_row(true, cx));
         } else {
             content = content.child(self.empty_state_panel("compress.empty"));
@@ -407,13 +560,13 @@ impl CozipDesktopApp {
         &self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        if self.launch.command.is_some() {
+        if self.command.is_some() {
             let mut content = div().gap_4().flex().flex_col();
             if let Some(error) = &self.launch.startup_error {
                 content = content.child(self.banner_panel(error.clone().into(), true));
             }
             if self.extract_plan().is_some() {
-                content = content.child(self.decompress_settings.render(&self.i18n));
+                content = content.child(self.decompress_settings_form(cx));
                 content = content.child(self.settings_action_row(false, cx));
             } else {
                 content = content.child(self.empty_state_panel("decompress.empty"));
@@ -429,13 +582,185 @@ impl CozipDesktopApp {
 
         if let Some(plan) = self.extract_plan() {
             content = content.child(self.extract_summary_panel(plan));
-            content = content.child(self.decompress_settings.render(&self.i18n));
+            content = content.child(self.decompress_settings_form(cx));
             content = content.child(self.settings_action_row(false, cx));
         } else {
             content = content.child(self.empty_state_panel("decompress.empty"));
         }
 
         content
+    }
+
+    fn compress_settings_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(plan) = self.compress_plan() else {
+            return div();
+        };
+
+        let format_label = match plan.format {
+            ArchiveFormat::Zip => "ZIP",
+            ArchiveFormat::Cozip => "PDeflate",
+        };
+
+        let mut form = div()
+            .gap_4()
+            .flex()
+            .flex_col()
+            .child(self.path_picker_row(
+                self.t("settings.output_file"),
+                &plan.output_path,
+                "browse-compress-output",
+                self.t("settings.browse"),
+                |this, _, _| {
+                    this.browse_compress_output();
+                },
+                self.compress_output_warning(),
+                cx,
+            ))
+            .child(self.settings_row(
+                self.t("settings.archive_format"),
+                self.control_button(
+                    "cycle-compress-format",
+                    format_label.into(),
+                    false,
+                    |this, _, _| {
+                        if let Some(plan) = this.compress_plan_mut() {
+                            plan.format = cycle_archive_format(plan.format);
+                            plan.output_path = plan.default_output_path(plan.format);
+                        }
+                    },
+                    cx,
+                ),
+            ));
+
+        match plan.format {
+            ArchiveFormat::Zip => {
+                form = form
+                    .child(self.settings_row(
+                        self.t("settings.compression_level"),
+                        self.stepper_control(
+                            "zip-level-dec",
+                            "zip-level-inc",
+                            plan.zip_options.compression_level.to_string(),
+                            |this, _, _| {
+                                if let Some(plan) = this.compress_plan_mut() {
+                                    plan.zip_options.compression_level =
+                                        plan.zip_options.compression_level.saturating_sub(1);
+                                }
+                            },
+                            |this, _, _| {
+                                if let Some(plan) = this.compress_plan_mut() {
+                                    plan.zip_options.compression_level =
+                                        (plan.zip_options.compression_level + 1).min(9);
+                                }
+                            },
+                            cx,
+                        ),
+                    ))
+                    .child(self.settings_row(
+                        self.t("settings.deflate_mode"),
+                        self.control_button(
+                            "cycle-zip-mode",
+                            match plan.zip_options.deflate_mode {
+                                ZipDeflateMode::Hybrid => "Hybrid(CPU + GPU)".into(),
+                                ZipDeflateMode::Cpu => "CPU".into(),
+                            },
+                            false,
+                            |this, _, _| {
+                                if let Some(plan) = this.compress_plan_mut() {
+                                    plan.zip_options.deflate_mode = match plan.zip_options.deflate_mode {
+                                        ZipDeflateMode::Hybrid => ZipDeflateMode::Cpu,
+                                        ZipDeflateMode::Cpu => ZipDeflateMode::Hybrid,
+                                    };
+                                }
+                            },
+                            cx,
+                        ),
+                    ));
+            }
+            ArchiveFormat::Cozip => {
+                let opts = &plan.pdeflate_options;
+                form = form
+                    .child(self.settings_row(
+                        self.t("settings.huffman"),
+                        self.toggle_control(
+                            "toggle-huffman",
+                            opts.huffman_encode_enabled,
+                            |this, _, _| {
+                                if let Some(plan) = this.compress_plan_mut() {
+                                    plan.pdeflate_options.huffman_encode_enabled =
+                                        !plan.pdeflate_options.huffman_encode_enabled;
+                                }
+                            },
+                            cx,
+                        ),
+                    ))
+                    .child(self.settings_row(
+                        self.t("settings.gpu_compress"),
+                        self.toggle_control(
+                            "toggle-gpu-compress",
+                            opts.gpu_compress_enabled,
+                            |this, _, _| {
+                                if let Some(plan) = this.compress_plan_mut() {
+                                    plan.pdeflate_options.gpu_compress_enabled =
+                                        !plan.pdeflate_options.gpu_compress_enabled;
+                                }
+                            },
+                            cx,
+                        ),
+                    ));
+            }
+        }
+
+        form
+    }
+
+    fn decompress_settings_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(plan) = self.extract_plan() else {
+            return div();
+        };
+
+        let mut form = div()
+            .gap_4()
+            .flex()
+            .flex_col()
+            .child(self.path_picker_row(
+                self.t("settings.output_dir"),
+                &plan.output_dir,
+                "browse-extract-output",
+                self.t("settings.browse"),
+                |this, _, _| {
+                    this.browse_extract_output();
+                },
+                self.extract_output_warning(),
+                cx,
+            ));
+
+        if !plan.has_pdeflate_tasks() {
+            return form.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0x475569))
+                    .child(self.t("settings.no_pdeflate_options")),
+            );
+        }
+
+        let opts = &plan.pdeflate_options;
+        form = form.child(self.settings_row(
+            self.t("settings.gpu_decode"),
+            self.toggle_control(
+                "toggle-gpu-decode",
+                opts.gpu_decompress_enabled,
+                |this, _, _| {
+                    if let Some(plan) = this.extract_plan_mut() {
+                        plan.pdeflate_options.gpu_decompress_enabled =
+                            !plan.pdeflate_options.gpu_decompress_enabled;
+                    }
+                },
+                cx,
+            ),
+        ));
+
+        form
     }
 
     fn compress_summary_panel(&self, plan: &CompressPlan) -> impl IntoElement {
@@ -473,7 +798,7 @@ impl CozipDesktopApp {
         let first_output = plan
             .tasks
             .first()
-            .map(|task| task.output_path.display().to_string())
+            .map(|task| plan.output_path_for(task).display().to_string())
             .unwrap_or_default();
         panel(
             self.t("summary.extract"),
@@ -486,11 +811,15 @@ impl CozipDesktopApp {
                     plan.tasks.len().to_string(),
                 ))
                 .child(labeled_value(self.t("summary.first_output"), first_output))
-                .child(labeled_value(
-                    self.t("summary.ignored"),
-                    plan.ignored_inputs.len().to_string(),
-                ))
-                .child(separator())
+            .child(labeled_value(
+                self.t("summary.ignored"),
+                plan.ignored_inputs.len().to_string(),
+            ))
+            .child(labeled_value(
+                self.t("summary.output"),
+                plan.output_dir.display().to_string(),
+            ))
+            .child(separator())
                 .child(self.path_list(plan.tasks.iter().map(|task| task.archive_path.as_path()))),
         )
     }
@@ -517,7 +846,21 @@ impl CozipDesktopApp {
         let status_text = self.status_line(compress);
         let current = self.current_item_line();
         let throughput = self.throughput_line();
+        let backlog_warning = self.backlog_warning_text();
         let runtime = self.runtime_line();
+        let mut throughput_row = div()
+            .text_sm()
+            .text_color(rgb(0x475569))
+            .flex()
+            .gap_2()
+            .child(throughput);
+        if let Some(backlog_warning) = backlog_warning {
+            throughput_row = throughput_row.child(
+                div()
+                    .text_color(rgb(0xb45309))
+                    .child(backlog_warning),
+            );
+        }
         let mut body = div()
             .gap_3()
             .flex()
@@ -537,10 +880,7 @@ impl CozipDesktopApp {
                     .child(current),
             )
             .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(0x475569))
-                    .child(throughput),
+                throughput_row,
             )
             .child(
                 div()
@@ -579,7 +919,7 @@ impl CozipDesktopApp {
             );
         }
 
-        if self.launch.command.is_some() {
+        if self.command.is_some() {
             body.into_any_element()
         } else {
             panel(
@@ -623,6 +963,18 @@ impl CozipDesktopApp {
                         },
                         true,
                         move |this, _, _| {
+                            let allowed = if compress {
+                                this.compress_output_warning().is_none()
+                                    || this
+                                        .compress_plan()
+                                        .map(|plan| this.confirm_overwrite(&plan.output_path))
+                                        .unwrap_or(true)
+                            } else {
+                                this.confirm_extract_conflicts()
+                            };
+                            if !allowed {
+                                return;
+                            }
                             this.active_screen = if compress {
                                 ScreenKind::Compress
                             } else {
@@ -634,7 +986,7 @@ impl CozipDesktopApp {
                     )),
             );
 
-        if self.launch.command.is_some() {
+        if self.command.is_some() {
             body.into_any_element()
         } else {
             panel(
@@ -643,6 +995,128 @@ impl CozipDesktopApp {
         )
             .into_any_element()
         }
+    }
+
+    fn control_button(
+        &self,
+        id: &'static str,
+        label: SharedString,
+        primary: bool,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                on_click(this, window, cx);
+            }))
+            .child(action_button(label, primary))
+    }
+
+    fn settings_row(
+        &self,
+        label: SharedString,
+        control: impl IntoElement,
+    ) -> impl IntoElement {
+        div()
+            .gap_3()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(0x111827))
+                    .child(label),
+            )
+            .child(control)
+    }
+
+    fn value_chip(&self, value: String) -> impl IntoElement {
+        div()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0xe5e7eb))
+            .bg(rgb(0xffffff))
+            .text_sm()
+            .text_color(rgb(0x111827))
+            .child(value)
+    }
+
+    fn toggle_control(
+        &self,
+        id: &'static str,
+        checked: bool,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        self.control_button(
+            id,
+            if checked {
+                self.t("common.enabled")
+            } else {
+                self.t("common.disabled")
+            },
+            checked,
+            on_click,
+            cx,
+        )
+    }
+
+    fn stepper_control(
+        &self,
+        dec_id: &'static str,
+        inc_id: &'static str,
+        value: String,
+        on_dec: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        on_inc: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .gap_2()
+            .flex()
+            .flex_row()
+            .items_center()
+            .child(self.control_button(dec_id, "-".into(), false, on_dec, cx))
+            .child(self.value_chip(value))
+            .child(self.control_button(inc_id, "+".into(), false, on_inc, cx))
+    }
+
+    fn path_picker_row(
+        &self,
+        label: SharedString,
+        path: &Path,
+        browse_id: &'static str,
+        browse_label: SharedString,
+        on_browse: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        warning: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let mut control = div()
+            .gap_2()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0x475569))
+                    .child(path.display().to_string()),
+            )
+            .child(self.control_button(browse_id, browse_label, false, on_browse, cx));
+
+        if let Some(warning) = warning {
+            control = control.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0x9a3412))
+                    .child(warning),
+            );
+        }
+
+        self.settings_row(label, control)
     }
 
     fn window_button(
@@ -713,7 +1187,11 @@ impl CozipDesktopApp {
         let snapshot = &self.job_snapshot;
         let total = snapshot.total_tasks;
         let done = snapshot.completed_tasks;
-        let progress_pct = (self.progress_fraction() * 100.0).round() as i32;
+        let progress_pct = match snapshot.status {
+            JobStatus::Succeeded => 100,
+            JobStatus::Running => (self.progress_fraction() * 100.0).floor() as i32,
+            _ => (self.progress_fraction() * 100.0).round() as i32,
+        };
 
         let action = match snapshot.status {
             JobStatus::Idle => {
@@ -762,6 +1240,25 @@ impl CozipDesktopApp {
         )
     }
 
+    fn backlog_warning_text(&self) -> Option<String> {
+        const BACKLOG_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
+        const WARN_THRESHOLD: u64 = BACKLOG_LIMIT * 9 / 10;
+
+        let backlog = self
+            .progress_snapshot()
+            .and_then(|progress| progress.pending_output_backlog_bytes)?;
+        if backlog < WARN_THRESHOLD {
+            return None;
+        }
+
+        Some(format!(
+            "{} {} / {}",
+            self.i18n.text("warning.decode_backlog_high"),
+            human_bytes(backlog as f64),
+            human_bytes(BACKLOG_LIMIT as f64)
+        ))
+    }
+
     fn runtime_line(&self) -> String {
         let cpu_enabled = self.t("common.enabled");
         let gpu_enabled = if self.gpu_enabled() {
@@ -774,8 +1271,13 @@ impl CozipDesktopApp {
 
     fn gpu_enabled(&self) -> bool {
         match self.command() {
-            Some(DesktopCommand::Compress(plan)) => plan.hybrid,
-            Some(DesktopCommand::Extract(_)) => true,
+            Some(DesktopCommand::Compress(plan)) => match plan.format {
+                ArchiveFormat::Zip => matches!(plan.zip_options.deflate_mode, ZipDeflateMode::Hybrid),
+                ArchiveFormat::Cozip => plan.pdeflate_options.gpu_compress_enabled,
+            },
+            Some(DesktopCommand::Extract(plan)) => {
+                plan.has_pdeflate_tasks() && plan.pdeflate_options.gpu_decompress_enabled
+            }
             None => false,
         }
     }

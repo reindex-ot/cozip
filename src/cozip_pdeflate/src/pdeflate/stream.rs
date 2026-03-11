@@ -32,6 +32,8 @@ struct StreamDecodeState {
     queue: VecDeque<StreamDecodeTask>,
     cpu_queue: VecDeque<StreamDecodeTask>,
     gpu_queue: VecDeque<StreamDecodeTask>,
+    buffered_result_bytes: usize,
+    next_write_index: usize,
     produced_count: usize,
     producer_eof: bool,
     stopped: bool,
@@ -39,10 +41,19 @@ struct StreamDecodeState {
     results: Vec<Option<(Vec<u8>, ChunkDecoded, bool)>>,
 }
 
+fn decode_result_limit_bytes(
+    _options: &PDeflateOptions,
+    _cpu_workers: usize,
+    _gpu_batch_limit: usize,
+) -> usize {
+    2 * 1024 * 1024 * 1024
+}
+
 pub(crate) fn compress_reader_with_stats<R: Read + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     options: &PDeflateOptions,
+    uncompressed_size_hint: Option<u64>,
     target_buffered_bytes: usize,
     low_watermark_bytes: usize,
 ) -> Result<PDeflateStats, PDeflateError> {
@@ -53,8 +64,9 @@ pub(crate) fn compress_reader_with_stats<R: Read + Send, W: Write>(
     let low_watermark_bytes = low_watermark_bytes.max(chunk_size).min(target_buffered_bytes);
 
     let mut input_bytes = 0u64;
+    let header = encode_stream_header(options.chunk_size, uncompressed_size_hint)?;
     let mut output_bytes =
-        u64::try_from(STREAM_HEADER_SIZE).map_err(|_| PDeflateError::NumericOverflow)?;
+        u64::try_from(header.len()).map_err(|_| PDeflateError::NumericOverflow)?;
     let mut chunk_count = 0usize;
     let mut table_entries_total = 0usize;
     let mut section_count_total = 0usize;
@@ -63,14 +75,6 @@ pub(crate) fn compress_reader_with_stats<R: Read + Send, W: Write>(
     let err_slot = Arc::new(Mutex::new(None::<PDeflateError>));
     let err_flag = Arc::new(AtomicBool::new(false));
 
-    let mut header = Vec::with_capacity(STREAM_HEADER_SIZE);
-    header.extend_from_slice(&STREAM_MAGIC);
-    write_u16_le(&mut header, STREAM_VERSION);
-    write_u16_le(&mut header, 0);
-    write_u32_le(
-        &mut header,
-        u32::try_from(options.chunk_size).map_err(|_| PDeflateError::NumericOverflow)?,
-    );
     writer.write_all(&header)?;
 
     thread::scope(|scope| -> Result<(), PDeflateError> {
@@ -342,27 +346,17 @@ pub(crate) fn decompress_reader_with_stats<R: Read + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     options: &PDeflateOptions,
+    decode_backlog_reporter: Option<crate::DecodeBacklogReporter>,
 ) -> Result<PDeflateStats, PDeflateError> {
     validate_options(options)?;
-
-    let mut header = [0u8; STREAM_HEADER_SIZE];
-    reader.read_exact(&mut header)?;
-    let mut cursor = 0usize;
-    let magic = read_exact(&header, &mut cursor, 4)?;
-    if magic != STREAM_MAGIC {
-        return Err(PDeflateError::InvalidStream("bad stream magic"));
-    }
-    let version = read_u16_le(&header, &mut cursor)?;
-    if version != STREAM_VERSION {
-        return Err(PDeflateError::InvalidStream("unsupported stream version"));
-    }
-    let _flags = read_u16_le(&header, &mut cursor)?;
-    let _chunk_size = read_u32_le(&header, &mut cursor)? as usize;
+    let header = read_stream_header(reader)?;
 
     let state = Arc::new((Mutex::new(StreamDecodeState {
-        input_bytes: u64::try_from(header.len()).map_err(|_| PDeflateError::NumericOverflow)?,
+        input_bytes: u64::try_from(header.encoded_len)
+            .map_err(|_| PDeflateError::NumericOverflow)?,
         ..StreamDecodeState::default()
     }), Condvar::new()));
+    report_decode_backlog(&decode_backlog_reporter, 0);
     let err_slot = Arc::new(Mutex::new(None::<PDeflateError>));
     let err_flag = Arc::new(AtomicBool::new(false));
 
@@ -515,11 +509,14 @@ pub(crate) fn decompress_reader_with_stats<R: Read + Send, W: Write>(
                 .max(1)
         };
         let gpu_batch_limit = gpu_decode_batch_limit(options, usize::MAX / 2);
+        let result_limit_bytes =
+            decode_result_limit_bytes(options, cpu_workers, gpu_batch_limit);
 
         for _ in 0..cpu_workers {
             let state_ref = Arc::clone(&state);
             let err_slot_ref = Arc::clone(&err_slot);
             let err_flag_ref = Arc::clone(&err_flag);
+            let decode_backlog_reporter = decode_backlog_reporter.clone();
             scope.spawn(move || loop {
                 if err_flag_ref.load(Ordering::Relaxed) {
                     return;
@@ -530,6 +527,7 @@ pub(crate) fn decompress_reader_with_stats<R: Read + Send, W: Write>(
                     &err_flag_ref,
                     options,
                     false,
+                    result_limit_bytes,
                 );
                 let Some(task) = task else {
                     return;
@@ -552,6 +550,10 @@ pub(crate) fn decompress_reader_with_stats<R: Read + Send, W: Write>(
                     Ok(guard) => guard,
                     Err(_) => return,
                 };
+                state.buffered_result_bytes = state
+                    .buffered_result_bytes
+                    .saturating_add(restored.len());
+                report_decode_backlog(&decode_backlog_reporter, state.buffered_result_bytes);
                 if let Some(slot) = state.results.get_mut(task.index) {
                     *slot = Some((restored, decoded, false));
                 }
@@ -563,6 +565,7 @@ pub(crate) fn decompress_reader_with_stats<R: Read + Send, W: Write>(
             let state_ref = Arc::clone(&state);
             let err_slot_ref = Arc::clone(&err_slot);
             let err_flag_ref = Arc::clone(&err_flag);
+            let decode_backlog_reporter = decode_backlog_reporter.clone();
             scope.spawn(move || loop {
                 if err_flag_ref.load(Ordering::Relaxed) {
                     return;
@@ -573,6 +576,7 @@ pub(crate) fn decompress_reader_with_stats<R: Read + Send, W: Write>(
                     &err_flag_ref,
                     options,
                     gpu_batch_limit,
+                    result_limit_bytes,
                 );
                 let Some(tasks) = tasks else {
                     return;
@@ -647,6 +651,10 @@ pub(crate) fn decompress_reader_with_stats<R: Read + Send, W: Write>(
                     Err(_) => return,
                 };
                 for (index, restored, decoded, from_gpu) in completed {
+                    state.buffered_result_bytes = state
+                        .buffered_result_bytes
+                        .saturating_add(restored.len());
+                    report_decode_backlog(&decode_backlog_reporter, state.buffered_result_bytes);
                     if let Some(slot) = state.results.get_mut(index) {
                         *slot = Some((restored, decoded, from_gpu));
                     }
@@ -674,6 +682,14 @@ pub(crate) fn decompress_reader_with_stats<R: Read + Send, W: Write>(
                     }
                     if next_index < state.results.len() {
                         if let Some(item) = state.results[next_index].take() {
+                            state.buffered_result_bytes =
+                                state.buffered_result_bytes.saturating_sub(item.0.len());
+                            report_decode_backlog(
+                                &decode_backlog_reporter,
+                                state.buffered_result_bytes,
+                            );
+                            state.next_write_index = next_index.saturating_add(1);
+                            cv.notify_all();
                             break Some(item);
                         }
                     }
@@ -710,6 +726,7 @@ pub(crate) fn decompress_reader_with_stats<R: Read + Send, W: Write>(
             .lock()
             .map_err(|_| PDeflateError::InvalidStream("stream decode state poisoned"))?;
         take_worker_error(&err_slot)?;
+        report_decode_backlog(&decode_backlog_reporter, 0);
         Ok(PDeflateStats {
             input_bytes: state.input_bytes,
             output_bytes,
@@ -718,6 +735,12 @@ pub(crate) fn decompress_reader_with_stats<R: Read + Send, W: Write>(
             section_count_total,
         })
     })
+}
+
+fn report_decode_backlog(reporter: &Option<crate::DecodeBacklogReporter>, bytes: usize) {
+    if let Some(reporter) = reporter {
+        reporter(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
 }
 
 fn pop_stream_compress_task(
@@ -889,6 +912,7 @@ fn pop_stream_decode_task(
     err_flag: &Arc<AtomicBool>,
     options: &PDeflateOptions,
     gpu_only: bool,
+    result_limit_bytes: usize,
 ) -> Option<StreamDecodeTask> {
     let (lock, cv) = &**state_ref;
     let mut state = match lock.lock() {
@@ -903,19 +927,43 @@ fn pop_stream_decode_task(
         }
     };
     loop {
+        let throttle = state.buffered_result_bytes >= result_limit_bytes;
         let task = match options.hybrid_scheduler_policy {
             PDeflateHybridSchedulerPolicy::GlobalQueue => {
                 if gpu_only {
                     None
+                } else if throttle {
+                    match state.queue.front() {
+                        Some(task) if task.index == state.next_write_index => state.queue.pop_front(),
+                        _ => None,
+                    }
                 } else {
                     state.queue.pop_front()
                 }
             }
             PDeflateHybridSchedulerPolicy::GpuLedSplitQueue => {
                 if gpu_only {
-                    state.gpu_queue.pop_front()
+                    if throttle {
+                        match state.gpu_queue.front() {
+                            Some(task) if task.index == state.next_write_index => {
+                                state.gpu_queue.pop_front()
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        state.gpu_queue.pop_front()
+                    }
                 } else {
-                    state.cpu_queue.pop_front()
+                    if throttle {
+                        match state.cpu_queue.front() {
+                            Some(task) if task.index == state.next_write_index => {
+                                state.cpu_queue.pop_front()
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        state.cpu_queue.pop_front()
+                    }
                 }
             }
         };
@@ -951,6 +999,7 @@ fn pop_stream_decode_gpu_batch(
     err_flag: &Arc<AtomicBool>,
     options: &PDeflateOptions,
     batch_limit: usize,
+    result_limit_bytes: usize,
 ) -> Option<Vec<StreamDecodeTask>> {
     let (lock, cv) = &**state_ref;
     let mut state = match lock.lock() {
@@ -966,27 +1015,49 @@ fn pop_stream_decode_gpu_batch(
     };
     loop {
         let mut tasks = Vec::with_capacity(batch_limit);
+        let throttle = state.buffered_result_bytes >= result_limit_bytes;
         match options.hybrid_scheduler_policy {
             PDeflateHybridSchedulerPolicy::GlobalQueue => {
-                while tasks.len() < batch_limit {
-                    let pos = state
-                        .queue
-                        .iter()
-                        .position(|task| task.chunk_uncompressed_len >= options.gpu_min_chunk_size);
-                    let Some(pos) = pos else {
-                        break;
-                    };
-                    if let Some(task) = state.queue.remove(pos) {
-                        tasks.push(task);
+                if throttle {
+                    let pos = state.queue.iter().position(|task| {
+                        task.index == state.next_write_index
+                            && task.chunk_uncompressed_len >= options.gpu_min_chunk_size
+                    });
+                    if let Some(pos) = pos {
+                        if let Some(task) = state.queue.remove(pos) {
+                            tasks.push(task);
+                        }
+                    }
+                } else {
+                    while tasks.len() < batch_limit {
+                        let pos = state
+                            .queue
+                            .iter()
+                            .position(|task| task.chunk_uncompressed_len >= options.gpu_min_chunk_size);
+                        let Some(pos) = pos else {
+                            break;
+                        };
+                        if let Some(task) = state.queue.remove(pos) {
+                            tasks.push(task);
+                        }
                     }
                 }
             }
             PDeflateHybridSchedulerPolicy::GpuLedSplitQueue => {
-                while tasks.len() < batch_limit {
-                    let Some(task) = state.gpu_queue.pop_front() else {
-                        break;
-                    };
-                    tasks.push(task);
+                if throttle {
+                    if matches!(state.gpu_queue.front(), Some(task) if task.index == state.next_write_index)
+                    {
+                        if let Some(task) = state.gpu_queue.pop_front() {
+                            tasks.push(task);
+                        }
+                    }
+                } else {
+                    while tasks.len() < batch_limit {
+                        let Some(task) = state.gpu_queue.pop_front() else {
+                            break;
+                        };
+                        tasks.push(task);
+                    }
                 }
             }
         }

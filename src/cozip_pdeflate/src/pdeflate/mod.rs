@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::ptr;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,6 +18,7 @@ mod stream;
 const STREAM_MAGIC: [u8; 4] = *b"PDS0";
 const CHUNK_MAGIC: [u8; 4] = *b"PDF0";
 const STREAM_VERSION: u16 = 1;
+const STREAM_FLAG_UNCOMPRESSED_SIZE: u16 = 1 << 0;
 const CHUNK_VERSION: u16 = 0;
 const CHUNK_FLAG_HUFFMAN: u16 = 1 << 0;
 const CHUNK_FLAG_FINAL_STREAM: u16 = 1 << 1;
@@ -25,6 +26,7 @@ const LITERAL_TAG: u16 = 0x0fff;
 const MAX_TABLE_ID: usize = (LITERAL_TAG as usize) - 1;
 const CHUNK_HEADER_SIZE: usize = 36;
 const STREAM_HEADER_SIZE: usize = 12;
+const STREAM_HEADER_UNCOMPRESSED_SIZE_BYTES: usize = 8;
 const MAX_INLINE_LEN: usize = 14;
 const EXT_LEN_BASE: usize = 15;
 const EXT_LEN_MAX: usize = 255;
@@ -286,6 +288,14 @@ struct ChunkDecodePreprocess {
     table_count: usize,
     chunk_uncompressed_len: usize,
     section_meta: Vec<gpu::GpuDecodeSectionMeta>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StreamHeader {
+    flags: u16,
+    chunk_size: usize,
+    uncompressed_size: Option<u64>,
+    encoded_len: usize,
 }
 
 struct GpuPreparedChunk<'a> {
@@ -638,6 +648,7 @@ pub(crate) fn pdeflate_compress_reader_with_stats<R: Read + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     options: &PDeflateOptions,
+    uncompressed_size_hint: Option<u64>,
     target_buffered_bytes: usize,
     low_watermark_bytes: usize,
 ) -> Result<PDeflateStats, PDeflateError> {
@@ -645,6 +656,7 @@ pub(crate) fn pdeflate_compress_reader_with_stats<R: Read + Send, W: Write>(
         reader,
         writer,
         options,
+        uncompressed_size_hint,
         target_buffered_bytes,
         low_watermark_bytes,
     )
@@ -677,12 +689,88 @@ pub(crate) fn pdeflate_decompress_reader_with_stats<R: Read + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     options: &PDeflateOptions,
+    decode_backlog_reporter: Option<crate::DecodeBacklogReporter>,
 ) -> Result<PDeflateStats, PDeflateError> {
-    stream::decompress_reader_with_stats(reader, writer, options)
+    stream::decompress_reader_with_stats(reader, writer, options, decode_backlog_reporter)
 }
 
 pub fn pdeflate_decompress(stream: &[u8]) -> Result<Vec<u8>, PDeflateError> {
     pdeflate_decompress_with_stats(stream).map(|(out, _)| out)
+}
+
+fn encode_stream_header(
+    chunk_size: usize,
+    uncompressed_size: Option<u64>,
+) -> Result<Vec<u8>, PDeflateError> {
+    let mut flags = 0u16;
+    let mut header = Vec::with_capacity(
+        STREAM_HEADER_SIZE
+            + if uncompressed_size.is_some() {
+                STREAM_HEADER_UNCOMPRESSED_SIZE_BYTES
+            } else {
+                0
+            },
+    );
+    header.extend_from_slice(&STREAM_MAGIC);
+    write_u16_le(&mut header, STREAM_VERSION);
+    if uncompressed_size.is_some() {
+        flags |= STREAM_FLAG_UNCOMPRESSED_SIZE;
+    }
+    write_u16_le(&mut header, flags);
+    write_u32_le(
+        &mut header,
+        u32::try_from(chunk_size).map_err(|_| PDeflateError::NumericOverflow)?,
+    );
+    if let Some(uncompressed_size) = uncompressed_size {
+        header.extend_from_slice(&uncompressed_size.to_le_bytes());
+    }
+    Ok(header)
+}
+
+fn read_stream_header<R: Read>(reader: &mut R) -> Result<StreamHeader, PDeflateError> {
+    let mut stream_header = [0u8; STREAM_HEADER_SIZE];
+    reader.read_exact(&mut stream_header)?;
+    let mut cursor = 0usize;
+    let magic = read_exact(&stream_header, &mut cursor, 4)?;
+    if magic != STREAM_MAGIC {
+        return Err(PDeflateError::InvalidStream("bad stream magic"));
+    }
+
+    let version = read_u16_le(&stream_header, &mut cursor)?;
+    if version != STREAM_VERSION {
+        return Err(PDeflateError::InvalidStream("unsupported stream version"));
+    }
+    let flags = read_u16_le(&stream_header, &mut cursor)?;
+    let chunk_size = read_u32_le(&stream_header, &mut cursor)? as usize;
+
+    let uncompressed_size = if (flags & STREAM_FLAG_UNCOMPRESSED_SIZE) != 0 {
+        let mut size_bytes = [0u8; STREAM_HEADER_UNCOMPRESSED_SIZE_BYTES];
+        reader.read_exact(&mut size_bytes)?;
+        Some(u64::from_le_bytes(size_bytes))
+    } else {
+        None
+    };
+
+    Ok(StreamHeader {
+        flags,
+        chunk_size,
+        uncompressed_size,
+        encoded_len: STREAM_HEADER_SIZE
+            + if uncompressed_size.is_some() {
+                STREAM_HEADER_UNCOMPRESSED_SIZE_BYTES
+            } else {
+                0
+            },
+    })
+}
+
+pub fn pdeflate_stream_uncompressed_size<R: Read + Seek>(
+    reader: &mut R,
+) -> Result<Option<u64>, PDeflateError> {
+    let start = reader.stream_position()?;
+    let result = read_stream_header(reader).map(|header| header.uncompressed_size);
+    reader.seek(SeekFrom::Start(start))?;
+    result
 }
 
 pub fn pdeflate_decompress_into(stream: &[u8], output: &mut Vec<u8>) -> Result<(), PDeflateError> {
