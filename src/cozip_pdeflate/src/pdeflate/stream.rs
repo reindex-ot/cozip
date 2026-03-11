@@ -1,4 +1,6 @@
 use super::*;
+use std::fs::File as StdFile;
+use cozip_util::{ParallelFileWriter, ParallelFileWriterOptions};
 
 #[derive(Debug)]
 struct StreamCompressTask {
@@ -21,6 +23,7 @@ struct StreamCompressState {
 #[derive(Debug)]
 struct StreamDecodeTask {
     index: usize,
+    output_offset: usize,
     payload: Vec<u8>,
     table_count: usize,
     chunk_uncompressed_len: usize,
@@ -41,6 +44,13 @@ struct StreamDecodeState {
     results: Vec<Option<(Vec<u8>, ChunkDecoded, bool)>>,
 }
 
+#[derive(Debug, Default)]
+struct ParallelDecodeMetrics {
+    chunk_count: usize,
+    table_entries_total: usize,
+    section_count_total: usize,
+}
+
 fn decode_result_limit_bytes(
     _options: &PDeflateOptions,
     _cpu_workers: usize,
@@ -54,6 +64,7 @@ pub(crate) fn compress_reader_with_stats<R: Read + Send, W: Write>(
     writer: &mut W,
     options: &PDeflateOptions,
     uncompressed_size_hint: Option<u64>,
+    file_name_hint: Option<&str>,
     target_buffered_bytes: usize,
     low_watermark_bytes: usize,
 ) -> Result<PDeflateStats, PDeflateError> {
@@ -64,7 +75,7 @@ pub(crate) fn compress_reader_with_stats<R: Read + Send, W: Write>(
     let low_watermark_bytes = low_watermark_bytes.max(chunk_size).min(target_buffered_bytes);
 
     let mut input_bytes = 0u64;
-    let header = encode_stream_header(options.chunk_size, uncompressed_size_hint)?;
+    let header = encode_stream_header(options.chunk_size, uncompressed_size_hint, file_name_hint)?;
     let mut output_bytes =
         u64::try_from(header.len()).map_err(|_| PDeflateError::NumericOverflow)?;
     let mut chunk_count = 0usize;
@@ -347,6 +358,7 @@ pub(crate) fn decompress_reader_with_stats<R: Read + Send, W: Write>(
     writer: &mut W,
     options: &PDeflateOptions,
     decode_backlog_reporter: Option<crate::DecodeBacklogReporter>,
+    output_write_reporter: Option<crate::OutputWriteReporter>,
 ) -> Result<PDeflateStats, PDeflateError> {
     validate_options(options)?;
     let header = read_stream_header(reader)?;
@@ -366,6 +378,7 @@ pub(crate) fn decompress_reader_with_stats<R: Read + Send, W: Write>(
         let err_flag_ref = Arc::clone(&err_flag);
         scope.spawn(move || {
             let mut chunk_index = 0usize;
+            let mut output_offset = 0usize;
             loop {
                 let mut len_buf = [0u8; 4];
                 match reader.read_exact(&mut len_buf) {
@@ -437,11 +450,13 @@ pub(crate) fn decompress_reader_with_stats<R: Read + Send, W: Write>(
 
                 let task = StreamDecodeTask {
                     index: chunk_index,
+                    output_offset,
                     payload,
                     table_count: preprocess.table_count,
                     chunk_uncompressed_len: preprocess.chunk_uncompressed_len,
                     section_meta: preprocess.section_meta,
                 };
+                output_offset = output_offset.saturating_add(task.chunk_uncompressed_len);
                 chunk_index = chunk_index.saturating_add(1);
 
                 let (lock, cv) = &*state_ref;
@@ -710,6 +725,7 @@ pub(crate) fn decompress_reader_with_stats<R: Read + Send, W: Write>(
                 break;
             };
             writer.write_all(&restored)?;
+            report_output_write(&output_write_reporter, restored.len());
             next_index = next_index.saturating_add(1);
             chunk_count = chunk_count.saturating_add(1);
             output_bytes = output_bytes
@@ -737,9 +753,541 @@ pub(crate) fn decompress_reader_with_stats<R: Read + Send, W: Write>(
     })
 }
 
+pub(crate) fn decompress_file_parallel_write_with_stats(
+    input_file: StdFile,
+    output_file: StdFile,
+    options: &PDeflateOptions,
+    decode_backlog_reporter: Option<crate::DecodeBacklogReporter>,
+    output_write_reporter: Option<crate::OutputWriteReporter>,
+) -> Result<PDeflateStats, PDeflateError> {
+    validate_options(options)?;
+
+    let mut reader = std::io::BufReader::new(input_file);
+    let header = read_stream_header(&mut reader)?;
+    let total_output_bytes = header.uncompressed_size.ok_or(PDeflateError::InvalidStream(
+        "parallel file write requires stream uncompressed size metadata",
+    ))?;
+    output_file.set_len(total_output_bytes)?;
+
+    let decode_state = Arc::new((
+        Mutex::new(StreamDecodeState {
+            input_bytes: u64::try_from(header.encoded_len)
+                .map_err(|_| PDeflateError::NumericOverflow)?,
+            ..StreamDecodeState::default()
+        }),
+        Condvar::new(),
+    ));
+    let gpu_enabled = (options.gpu_decompress_enabled || options.gpu_decompress_force_gpu)
+        && gpu::is_runtime_available();
+    let cpu_workers = if options.gpu_decompress_force_gpu {
+        0
+    } else {
+        thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1)
+    };
+    let gpu_batch_limit = gpu_decode_batch_limit(options, usize::MAX / 2);
+    let result_limit_bytes = decode_result_limit_bytes(options, cpu_workers, gpu_batch_limit);
+    let writer = Arc::new(
+        ParallelFileWriter::new(
+            output_file,
+            ParallelFileWriterOptions {
+                worker_threads: options.parallel_write_threads,
+                max_backlog_bytes: result_limit_bytes,
+                backlog_reporter: decode_backlog_reporter.clone(),
+                write_reporter: output_write_reporter.clone(),
+            },
+        )
+        .map_err(map_parallel_file_writer_error)?,
+    );
+    let metrics = Arc::new(Mutex::new(ParallelDecodeMetrics::default()));
+    let err_slot = Arc::new(Mutex::new(None::<PDeflateError>));
+    let err_flag = Arc::new(AtomicBool::new(false));
+    report_decode_backlog(&decode_backlog_reporter, 0);
+
+    thread::scope(|scope| -> Result<(), PDeflateError> {
+        let decode_state_ref = Arc::clone(&decode_state);
+        let err_slot_ref = Arc::clone(&err_slot);
+        let err_flag_ref = Arc::clone(&err_flag);
+        scope.spawn(move || {
+            let mut chunk_index = 0usize;
+            let mut output_offset = 0usize;
+            loop {
+                let mut len_buf = [0u8; 4];
+                match reader.read_exact(&mut len_buf) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        let (lock, cv) = &*decode_state_ref;
+                        if let Ok(mut state) = lock.lock() {
+                            if chunk_index == 0 {
+                                state.producer_eof = true;
+                            } else {
+                                set_worker_error_once(
+                                    &err_slot_ref,
+                                    &err_flag_ref,
+                                    PDeflateError::InvalidStream("missing final chunk"),
+                                );
+                                state.stopped = true;
+                            }
+                            cv.notify_all();
+                        }
+                        return;
+                    }
+                    Err(err) => {
+                        set_worker_error_once(&err_slot_ref, &err_flag_ref, err.into());
+                        let (lock, cv) = &*decode_state_ref;
+                        if let Ok(mut state) = lock.lock() {
+                            state.stopped = true;
+                            cv.notify_all();
+                        }
+                        return;
+                    }
+                }
+                let mut len_cursor = 0usize;
+                let payload_len = match read_u32_le(&len_buf, &mut len_cursor) {
+                    Ok(v) => v as usize,
+                    Err(err) => {
+                        set_worker_error_once(&err_slot_ref, &err_flag_ref, err);
+                        return;
+                    }
+                };
+                let mut payload = vec![0u8; payload_len];
+                if let Err(err) = reader.read_exact(&mut payload) {
+                    set_worker_error_once(&err_slot_ref, &err_flag_ref, err.into());
+                    let (lock, cv) = &*decode_state_ref;
+                    if let Ok(mut state) = lock.lock() {
+                        state.stopped = true;
+                        cv.notify_all();
+                    }
+                    return;
+                }
+                let preprocess = match preprocess_chunk_for_gpu_decode(&payload) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        set_worker_error_once(&err_slot_ref, &err_flag_ref, err);
+                        let (lock, cv) = &*decode_state_ref;
+                        if let Ok(mut state) = lock.lock() {
+                            state.stopped = true;
+                            cv.notify_all();
+                        }
+                        return;
+                    }
+                };
+                let final_chunk = match read_chunk_flags(&payload) {
+                    Ok(flags) => chunk_final_stream_enabled(flags),
+                    Err(err) => {
+                        set_worker_error_once(&err_slot_ref, &err_flag_ref, err);
+                        return;
+                    }
+                };
+                let task = StreamDecodeTask {
+                    index: chunk_index,
+                    output_offset,
+                    payload,
+                    table_count: preprocess.table_count,
+                    chunk_uncompressed_len: preprocess.chunk_uncompressed_len,
+                    section_meta: preprocess.section_meta,
+                };
+                output_offset = output_offset.saturating_add(task.chunk_uncompressed_len);
+                chunk_index = chunk_index.saturating_add(1);
+
+                let (lock, cv) = &*decode_state_ref;
+                let mut state = match lock.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+                state.input_bytes = state
+                    .input_bytes
+                    .saturating_add(4)
+                    .saturating_add(u64::try_from(task.payload.len()).unwrap_or(u64::MAX));
+                state.produced_count = state.produced_count.saturating_add(1);
+                let gpu_eligible = (options.gpu_decompress_enabled || options.gpu_decompress_force_gpu)
+                    && gpu::is_runtime_available()
+                    && task.chunk_uncompressed_len >= options.gpu_min_chunk_size;
+                match options.hybrid_scheduler_policy {
+                    PDeflateHybridSchedulerPolicy::GlobalQueue => state.queue.push_back(task),
+                    PDeflateHybridSchedulerPolicy::GpuLedSplitQueue => {
+                        if gpu_eligible {
+                            state.gpu_queue.push_back(task);
+                        } else {
+                            state.cpu_queue.push_back(task);
+                        }
+                    }
+                }
+                if final_chunk {
+                    let mut trailing = [0u8; 1];
+                    match reader.read(&mut trailing) {
+                        Ok(0) => {
+                            state.producer_eof = true;
+                            cv.notify_all();
+                            return;
+                        }
+                        Ok(_) => {
+                            set_worker_error_once(
+                                &err_slot_ref,
+                                &err_flag_ref,
+                                PDeflateError::InvalidStream("trailing bytes in stream"),
+                            );
+                            state.stopped = true;
+                            cv.notify_all();
+                            return;
+                        }
+                        Err(err) => {
+                            set_worker_error_once(&err_slot_ref, &err_flag_ref, err.into());
+                            state.stopped = true;
+                            cv.notify_all();
+                            return;
+                        }
+                    }
+                }
+                cv.notify_all();
+            }
+        });
+
+        for _ in 0..cpu_workers {
+            let decode_state_ref = Arc::clone(&decode_state);
+            let writer_ref = Arc::clone(&writer);
+            let metrics_ref = Arc::clone(&metrics);
+            let err_slot_ref = Arc::clone(&err_slot);
+            let err_flag_ref = Arc::clone(&err_flag);
+            scope.spawn(move || {
+                loop {
+                    if err_flag_ref.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let task = pop_parallel_decode_task(
+                        &decode_state_ref,
+                        &err_slot_ref,
+                        &err_flag_ref,
+                        options,
+                        false,
+                    );
+                    let Some(task) = task else {
+                        return;
+                    };
+                    let mut restored = vec![0u8; task.chunk_uncompressed_len];
+                    let decoded = match decompress_chunk_into(&task.payload, &mut restored) {
+                        Ok(decoded) => decoded,
+                        Err(err) => {
+                            set_worker_error_once(&err_slot_ref, &err_flag_ref, err);
+                            stop_decode_state(&decode_state_ref);
+                            return;
+                        }
+                    };
+                    {
+                        let mut stats = match metrics_ref.lock() {
+                            Ok(guard) => guard,
+                            Err(_) => {
+                                stop_decode_state(&decode_state_ref);
+                                return;
+                            }
+                        };
+                        stats.chunk_count = stats.chunk_count.saturating_add(1);
+                        stats.table_entries_total =
+                            stats.table_entries_total.saturating_add(decoded.table_entries);
+                        stats.section_count_total =
+                            stats.section_count_total.saturating_add(decoded.section_count);
+                    }
+                    if let Err(err) = writer_ref
+                        .submit(u64::try_from(task.output_offset).unwrap_or(u64::MAX), restored)
+                        .map_err(map_parallel_file_writer_error)
+                    {
+                        set_worker_error_once(&err_slot_ref, &err_flag_ref, err);
+                        stop_decode_state(&decode_state_ref);
+                        return;
+                    }
+                }
+            });
+        }
+
+        if gpu_enabled {
+            let decode_state_ref = Arc::clone(&decode_state);
+            let writer_ref = Arc::clone(&writer);
+            let metrics_ref = Arc::clone(&metrics);
+            let err_slot_ref = Arc::clone(&err_slot);
+            let err_flag_ref = Arc::clone(&err_flag);
+            scope.spawn(move || {
+                loop {
+                    if err_flag_ref.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let tasks = pop_parallel_decode_gpu_batch(
+                        &decode_state_ref,
+                        &err_slot_ref,
+                        &err_flag_ref,
+                        options,
+                        gpu_batch_limit,
+                    );
+                    let Some(tasks) = tasks else {
+                        return;
+                    };
+                    let jobs: Vec<_> = tasks
+                        .iter()
+                        .map(|task| gpu::GpuDecodeJob {
+                            chunk_index: task.index,
+                            payload: task.payload.as_slice(),
+                            table_count: task.table_count,
+                            chunk_uncompressed_len: task.chunk_uncompressed_len,
+                            out_offset: 0,
+                            out_len: task.chunk_uncompressed_len,
+                            section_meta: task.section_meta.clone(),
+                            preferred_slot: None,
+                        })
+                        .collect();
+                    let gpu_results = match gpu::decode_chunks_gpu_v2(&jobs, options) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            set_worker_error_once(&err_slot_ref, &err_flag_ref, err);
+                            stop_decode_state(&decode_state_ref);
+                            return;
+                        }
+                    };
+                    for (task, result) in tasks.into_iter().zip(gpu_results.into_iter()) {
+                        let (restored, decoded) = match result.disposition {
+                            gpu::GpuDecodeDisposition::SubmittedGpu => {
+                                let Some(decoded_chunk) = result.decoded_chunk else {
+                                    set_worker_error_once(
+                                        &err_slot_ref,
+                                        &err_flag_ref,
+                                        PDeflateError::Gpu(
+                                            "gpu decode result missing payload".to_string(),
+                                        ),
+                                    );
+                                    stop_decode_state(&decode_state_ref);
+                                    return;
+                                };
+                                (
+                                    decoded_chunk,
+                                    ChunkDecoded {
+                                        table_entries: task.table_count,
+                                        section_count: task.section_meta.len(),
+                                        profile: ChunkDecodeProfile::default(),
+                                    },
+                                )
+                            }
+                            gpu::GpuDecodeDisposition::CpuFallback => {
+                                let mut restored = vec![0u8; task.chunk_uncompressed_len];
+                                let decoded = match decompress_chunk_into(&task.payload, &mut restored)
+                                {
+                                    Ok(decoded) => decoded,
+                                    Err(err) => {
+                                        set_worker_error_once(&err_slot_ref, &err_flag_ref, err);
+                                        stop_decode_state(&decode_state_ref);
+                                        return;
+                                    }
+                                };
+                                (restored, decoded)
+                            }
+                        };
+                        {
+                            let mut stats = match metrics_ref.lock() {
+                                Ok(guard) => guard,
+                                Err(_) => {
+                                    stop_decode_state(&decode_state_ref);
+                                    return;
+                                }
+                            };
+                            stats.chunk_count = stats.chunk_count.saturating_add(1);
+                            stats.table_entries_total =
+                                stats.table_entries_total.saturating_add(decoded.table_entries);
+                            stats.section_count_total =
+                                stats.section_count_total.saturating_add(decoded.section_count);
+                        }
+                        if let Err(err) = writer_ref
+                            .submit(u64::try_from(task.output_offset).unwrap_or(u64::MAX), restored)
+                            .map_err(map_parallel_file_writer_error)
+                        {
+                            set_worker_error_once(&err_slot_ref, &err_flag_ref, err);
+                            stop_decode_state(&decode_state_ref);
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+
+        Ok(())
+    })?;
+
+    writer.drain().map_err(map_parallel_file_writer_error)?;
+    take_worker_error(&err_slot)?;
+    report_decode_backlog(&decode_backlog_reporter, 0);
+    let input_bytes = {
+        let (lock, _) = &*decode_state;
+        lock.lock()
+            .map_err(|_| PDeflateError::InvalidStream("stream decode state poisoned"))?
+            .input_bytes
+    };
+    let metrics = metrics
+        .lock()
+        .map_err(|_| PDeflateError::InvalidStream("parallel decode metrics poisoned"))?;
+    Ok(PDeflateStats {
+        input_bytes,
+        output_bytes: total_output_bytes,
+        chunk_count: metrics.chunk_count,
+        table_entries_total: metrics.table_entries_total,
+        section_count_total: metrics.section_count_total,
+    })
+}
+
 fn report_decode_backlog(reporter: &Option<crate::DecodeBacklogReporter>, bytes: usize) {
     if let Some(reporter) = reporter {
         reporter(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+}
+
+fn report_output_write(reporter: &Option<crate::OutputWriteReporter>, bytes: usize) {
+    if let Some(reporter) = reporter {
+        reporter(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+}
+
+fn stop_decode_state(decode_state_ref: &Arc<(Mutex<StreamDecodeState>, Condvar)>) {
+    let (decode_lock, decode_cv) = &**decode_state_ref;
+    if let Ok(mut state) = decode_lock.lock() {
+        state.stopped = true;
+        decode_cv.notify_all();
+    }
+}
+
+fn map_parallel_file_writer_error(err: cozip_util::ParallelFileWriterError) -> PDeflateError {
+    match err {
+        cozip_util::ParallelFileWriterError::Io(err) => PDeflateError::Io(err),
+        cozip_util::ParallelFileWriterError::NumericOverflow => PDeflateError::NumericOverflow,
+        cozip_util::ParallelFileWriterError::Closed => {
+            PDeflateError::InvalidStream("parallel writer closed")
+        }
+    }
+}
+
+fn pop_parallel_decode_task(
+    state_ref: &Arc<(Mutex<StreamDecodeState>, Condvar)>,
+    err_slot: &Arc<Mutex<Option<PDeflateError>>>,
+    err_flag: &Arc<AtomicBool>,
+    options: &PDeflateOptions,
+    gpu_only: bool,
+) -> Option<StreamDecodeTask> {
+    let (lock, cv) = &**state_ref;
+    let mut state = match lock.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            set_worker_error_once(
+                err_slot,
+                err_flag,
+                PDeflateError::Gpu("stream decode state mutex poisoned".to_string()),
+            );
+            return None;
+        }
+    };
+    loop {
+        let task = match options.hybrid_scheduler_policy {
+            PDeflateHybridSchedulerPolicy::GlobalQueue => {
+                if gpu_only {
+                    None
+                } else {
+                    state.queue.pop_front()
+                }
+            }
+            PDeflateHybridSchedulerPolicy::GpuLedSplitQueue => {
+                if gpu_only {
+                    state.gpu_queue.pop_front()
+                } else {
+                    state.cpu_queue.pop_front()
+                }
+            }
+        };
+        if let Some(task) = task {
+            return Some(task);
+        }
+        let queue_empty = match options.hybrid_scheduler_policy {
+            PDeflateHybridSchedulerPolicy::GlobalQueue => state.queue.is_empty(),
+            PDeflateHybridSchedulerPolicy::GpuLedSplitQueue => {
+                if gpu_only {
+                    state.gpu_queue.is_empty()
+                } else {
+                    state.cpu_queue.is_empty()
+                }
+            }
+        };
+        if state.producer_eof && queue_empty {
+            return None;
+        }
+        if state.stopped || err_flag.load(Ordering::Relaxed) {
+            return None;
+        }
+        state = match cv.wait(state) {
+            Ok(guard) => guard,
+            Err(_) => return None,
+        };
+    }
+}
+
+fn pop_parallel_decode_gpu_batch(
+    state_ref: &Arc<(Mutex<StreamDecodeState>, Condvar)>,
+    err_slot: &Arc<Mutex<Option<PDeflateError>>>,
+    err_flag: &Arc<AtomicBool>,
+    options: &PDeflateOptions,
+    batch_limit: usize,
+) -> Option<Vec<StreamDecodeTask>> {
+    let (lock, cv) = &**state_ref;
+    let mut state = match lock.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            set_worker_error_once(
+                err_slot,
+                err_flag,
+                PDeflateError::Gpu("stream decode state mutex poisoned".to_string()),
+            );
+            return None;
+        }
+    };
+    loop {
+        let mut tasks = Vec::with_capacity(batch_limit);
+        match options.hybrid_scheduler_policy {
+            PDeflateHybridSchedulerPolicy::GlobalQueue => {
+                while tasks.len() < batch_limit {
+                    let pos = state
+                        .queue
+                        .iter()
+                        .position(|task| task.chunk_uncompressed_len >= options.gpu_min_chunk_size);
+                    let Some(pos) = pos else {
+                        break;
+                    };
+                    if let Some(task) = state.queue.remove(pos) {
+                        tasks.push(task);
+                    }
+                }
+            }
+            PDeflateHybridSchedulerPolicy::GpuLedSplitQueue => {
+                while tasks.len() < batch_limit {
+                    let Some(task) = state.gpu_queue.pop_front() else {
+                        break;
+                    };
+                    tasks.push(task);
+                }
+            }
+        }
+        if !tasks.is_empty() {
+            return Some(tasks);
+        }
+        let queue_empty = match options.hybrid_scheduler_policy {
+            PDeflateHybridSchedulerPolicy::GlobalQueue => state
+                .queue
+                .iter()
+                .all(|task| task.chunk_uncompressed_len < options.gpu_min_chunk_size),
+            PDeflateHybridSchedulerPolicy::GpuLedSplitQueue => state.gpu_queue.is_empty(),
+        };
+        if state.producer_eof && queue_empty {
+            return None;
+        }
+        if state.stopped || err_flag.load(Ordering::Relaxed) {
+            return None;
+        }
+        state = match cv.wait(state) {
+            Ok(guard) => guard,
+            Err(_) => return None,
+        };
     }
 }
 

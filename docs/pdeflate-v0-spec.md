@@ -41,8 +41,13 @@
     - bit 0: `UNCOMPRESSED_SIZE_PRESENT`
       - `1`: 直後に `uncompressed_size: u64` が続く
       - `0`: 追加メタデータなし
+    - bit 1: `FILE_NAME_PRESENT`
+      - `1`: `file_name_len: u16` と UTF-8 の `file_name[file_name_len]` が続く
+      - `0`: ファイル名 metadata なし
   - `chunk_size: u32`
   - `uncompressed_size: u64`（`flags.UNCOMPRESSED_SIZE_PRESENT == 1` のときのみ存在）
+  - `file_name_len: u16`（`flags.FILE_NAME_PRESENT == 1` のときのみ存在）
+  - `file_name[file_name_len]`（UTF-8、`flags.FILE_NAME_PRESENT == 1` のときのみ存在）
 - 本文:
   - `chunk_payload_len: u32`
   - `chunk_payload[chunk_payload_len]`
@@ -50,6 +55,10 @@
 - `chunk_count` はストリームヘッダに保持しない。
 - `uncompressed_size` は任意メタデータであり、存在しないストリームも正当とする。
 - 単一ファイル圧縮では、進捗計算や事前容量把握のため `uncompressed_size` を格納することを推奨する。
+- 単一ファイル圧縮では、解凍時の復元ファイル名保持のため `file_name` を格納することを推奨する。
+- 単一ファイル解凍で固定長出力領域へ直接並列書き込みする場合、各チャンクの出力先頭位置は
+  `chunk_output_offset(i) = sum(chunk_uncompressed_len(0..i))`
+  で決定できる。追加の per-chunk offset メタデータは不要。
 - ストリーム終端は、最後のチャンクの `flags.FINAL_STREAM == 1` で示す。
 - 空ストリームは、チャンク frame を 1 つも持たないヘッダのみのストリームとして表現してよい。
 

@@ -143,6 +143,7 @@ settings.gpu_slot_count = "GPU slot 数"
 settings.gpu_submit_chunks = "GPU submit chunks"
 settings.gpu_min_chunk_kib = "GPU 最小チャンク"
 settings.gpu_decode = "GPU 解凍"
+settings.parallel_write_threads = "並列書き込みスレッド数"
 settings.force_gpu = "GPU 強制"
 settings.no_pdeflate_options = "選択されたアーカイブは ZIP のみなので、追加の GPU 解凍設定はありません。"
 

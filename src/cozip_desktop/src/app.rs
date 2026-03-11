@@ -759,6 +759,27 @@ impl CozipDesktopApp {
                 cx,
             ),
         ));
+        form = form.child(self.settings_row(
+            self.t("settings.parallel_write_threads"),
+            self.stepper_control(
+                "dec-parallel-write-threads",
+                "inc-parallel-write-threads",
+                opts.parallel_write_threads.to_string(),
+                |this, _, _| {
+                    if let Some(plan) = this.extract_plan_mut() {
+                        plan.pdeflate_options.parallel_write_threads =
+                            plan.pdeflate_options.parallel_write_threads.saturating_sub(1).max(1);
+                    }
+                },
+                |this, _, _| {
+                    if let Some(plan) = this.extract_plan_mut() {
+                        plan.pdeflate_options.parallel_write_threads =
+                            plan.pdeflate_options.parallel_write_threads.saturating_add(1).min(128);
+                    }
+                },
+                cx,
+            ),
+        ));
 
         form
     }

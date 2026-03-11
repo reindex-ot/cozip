@@ -7,7 +7,7 @@ use cozip::{
     CoZipArchiveFormat, CoZipArchiveInfo, CoZipArchiveKind, ZipDeflateMode, ZipOptions,
     inspect_archive_from_name,
 };
-use cozip_pdeflate::PDeflateOptions;
+use cozip_pdeflate::{PDeflateOptions, pdeflate_stream_suggested_name};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InitialScreen {
@@ -333,7 +333,21 @@ fn build_extract_plan(inputs: Vec<PathBuf>) -> Result<ExtractPlan, String> {
                         tasks.push(build_extract_task(input, info));
                     }
                 }
-                Err(_) => ignored.push(input),
+                Err(_) => {
+                    if is_probable_pdeflate_archive_path(&input) && seen.insert(input.clone()) {
+                        tasks.push(build_extract_task(
+                            input.clone(),
+                            CoZipArchiveInfo {
+                                format: CoZipArchiveFormat::PDeflate,
+                                kind: CoZipArchiveKind::SingleFile {
+                                    suggested_name: suggested_name_from_pdeflate_path(&input),
+                                },
+                            },
+                        ));
+                    } else {
+                        ignored.push(input);
+                    }
+                }
             }
             continue;
         }
@@ -353,6 +367,16 @@ fn build_extract_plan(inputs: Vec<PathBuf>) -> Result<ExtractPlan, String> {
                     if seen.insert(path.clone()) {
                         tasks.push(build_extract_task(path, info));
                     }
+                } else if is_probable_pdeflate_archive_path(&path) && seen.insert(path.clone()) {
+                    tasks.push(build_extract_task(
+                        path.clone(),
+                        CoZipArchiveInfo {
+                            format: CoZipArchiveFormat::PDeflate,
+                            kind: CoZipArchiveKind::SingleFile {
+                                suggested_name: suggested_name_from_pdeflate_path(&path),
+                            },
+                        },
+                    ));
                 }
             }
             continue;
@@ -408,6 +432,26 @@ fn build_extract_task(path: PathBuf, info: CoZipArchiveInfo) -> ExtractTask {
         container_dir_name,
         single_file_name,
     }
+}
+
+fn is_probable_pdeflate_archive_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("pdz"))
+        .unwrap_or(false)
+}
+
+fn suggested_name_from_pdeflate_path(path: &Path) -> String {
+    std::fs::File::open(path)
+        .ok()
+        .and_then(|mut file| pdeflate_stream_suggested_name(&mut file).ok().flatten())
+        .or_else(|| {
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "file".to_string())
 }
 
 fn os_to_string(value: &OsString) -> Result<String, String> {

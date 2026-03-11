@@ -3,6 +3,7 @@ members = [
     "src/cozip_deflate",
     "src/cozip",
     "src/cozip_pdeflate",
+    "src/cozip_util",
     "src/cozip_desktop",
     "src/cozip_win_installer"
 ]

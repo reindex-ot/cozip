@@ -1963,3 +1963,30 @@ mode別GPU品質パラメータ:
 - 単一ファイル PDeflate 圧縮では入力ファイルサイズをこの metadata として埋め込む
 - 単一ファイル PDeflate 解凍では、この metadata が存在する場合に事前全走査なしで write 基準の進捗率を出せる
 - metadata が存在しない旧ストリームは引き続き解凍可能で、進捗率は不定扱いとする
+
+## 2026-03-11 PDeflate single-file mmap parallel write
+
+- 単一ファイル PDeflate 解凍に `decompress_file_parallel_write` 系 API を追加した
+- 出力先ファイルを `memmap2` で map し、各チャンクの `chunk_uncompressed_len` 累積から算出した出力 offset へ直接並列書き込みする
+- 解凍 worker と書き込み worker を分離し、復元済みチャンクは write queue 経由で SSD へ並列反映する
+- 書き込み queue backlog の上限は固定 `2 GiB` とし、Desktop 側へ backlog 警告を出せるようにした
+- `cozip_desktop` の単一ファイル PDeflate 解凍はこの経路を優先使用し、書き込みスレッド数は `PDeflateOptions.parallel_write_threads` で調整できる
+
+## 2026-03-11 cozip_util ParallelFileWriter
+
+- `src/cozip_util` クレートを追加し、`ParallelFileWriter` を OS ごとの positional write backend として切り出した
+- Windows は `seek_write`、Unix は `write_all_at`、その他 OS は mutex + seek/write のフォールバック実装
+- PDeflate 単一ファイル解凍の parallel write は `memmap2` 直書きから `cozip_util::ParallelFileWriter` ベースへ置き換えた
+
+## 2026-03-11 cozip_util async file backends
+
+- `cozip_util::ParallelFileWriter` の backend を submit/completion 型に整理した
+- Windows backend は `ReOpenFile(..., FILE_FLAG_OVERLAPPED)` + `CreateIoCompletionPort` + `WriteFile(OVERLAPPED)` に変更した
+- Linux backend は `io_uring` crate を使う専用 thread backend を追加した
+- 非 Windows / 非 Linux は従来どおり mutex + positional write のフォールバックを維持する
+
+## 2026-03-11 PDeflate single-file filename metadata
+
+- PDeflate 単一ファイル stream header に任意の UTF-8 `file_name` metadata を追加した
+- 単一ファイル圧縮では元ファイル名を埋め込み、解凍時はその名前を優先して復元する
+- 旧ストリームで metadata がない場合は、従来どおりアーカイブ名 stem から復元名を推定する

@@ -19,6 +19,7 @@ const STREAM_MAGIC: [u8; 4] = *b"PDS0";
 const CHUNK_MAGIC: [u8; 4] = *b"PDF0";
 const STREAM_VERSION: u16 = 1;
 const STREAM_FLAG_UNCOMPRESSED_SIZE: u16 = 1 << 0;
+const STREAM_FLAG_FILE_NAME_PRESENT: u16 = 1 << 1;
 const CHUNK_VERSION: u16 = 0;
 const CHUNK_FLAG_HUFFMAN: u16 = 1 << 0;
 const CHUNK_FLAG_FINAL_STREAM: u16 = 1 << 1;
@@ -203,6 +204,7 @@ pub struct PDeflateOptions {
     pub gpu_pipelined_submit_chunks: usize,
     pub gpu_min_chunk_size: usize,
     pub gpu_tail_stop_ratio: f32,
+    pub parallel_write_threads: usize,
     pub huffman_encode_enabled: bool,
     pub compression_mode: PDeflateCompressionMode,
     pub hybrid_scheduler_policy: PDeflateHybridSchedulerPolicy,
@@ -210,6 +212,11 @@ pub struct PDeflateOptions {
 
 impl Default for PDeflateOptions {
     fn default() -> Self {
+        let parallel_write_threads = thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(1)
+            .max(1)
+            .div_ceil(2);
         Self {
             chunk_size: 4 * 1024 * 1024,
             section_count: 128,
@@ -230,6 +237,7 @@ impl Default for PDeflateOptions {
             gpu_pipelined_submit_chunks: 4,
             gpu_min_chunk_size: 64 * 1024,
             gpu_tail_stop_ratio: 1.0,
+            parallel_write_threads,
             huffman_encode_enabled: false,
             compression_mode: PDeflateCompressionMode::Speed,
             hybrid_scheduler_policy: PDeflateHybridSchedulerPolicy::GlobalQueue,
@@ -290,11 +298,12 @@ struct ChunkDecodePreprocess {
     section_meta: Vec<gpu::GpuDecodeSectionMeta>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct StreamHeader {
     flags: u16,
     chunk_size: usize,
     uncompressed_size: Option<u64>,
+    file_name: Option<String>,
     encoded_len: usize,
 }
 
@@ -649,6 +658,7 @@ pub(crate) fn pdeflate_compress_reader_with_stats<R: Read + Send, W: Write>(
     writer: &mut W,
     options: &PDeflateOptions,
     uncompressed_size_hint: Option<u64>,
+    file_name_hint: Option<&str>,
     target_buffered_bytes: usize,
     low_watermark_bytes: usize,
 ) -> Result<PDeflateStats, PDeflateError> {
@@ -657,6 +667,7 @@ pub(crate) fn pdeflate_compress_reader_with_stats<R: Read + Send, W: Write>(
         writer,
         options,
         uncompressed_size_hint,
+        file_name_hint,
         target_buffered_bytes,
         low_watermark_bytes,
     )
@@ -690,8 +701,31 @@ pub(crate) fn pdeflate_decompress_reader_with_stats<R: Read + Send, W: Write>(
     writer: &mut W,
     options: &PDeflateOptions,
     decode_backlog_reporter: Option<crate::DecodeBacklogReporter>,
+    output_write_reporter: Option<crate::OutputWriteReporter>,
 ) -> Result<PDeflateStats, PDeflateError> {
-    stream::decompress_reader_with_stats(reader, writer, options, decode_backlog_reporter)
+    stream::decompress_reader_with_stats(
+        reader,
+        writer,
+        options,
+        decode_backlog_reporter,
+        output_write_reporter,
+    )
+}
+
+pub(crate) fn pdeflate_decompress_file_parallel_write_with_stats(
+    input_file: std::fs::File,
+    output_file: std::fs::File,
+    options: &PDeflateOptions,
+    decode_backlog_reporter: Option<crate::DecodeBacklogReporter>,
+    output_write_reporter: Option<crate::OutputWriteReporter>,
+) -> Result<PDeflateStats, PDeflateError> {
+    stream::decompress_file_parallel_write_with_stats(
+        input_file,
+        output_file,
+        options,
+        decode_backlog_reporter,
+        output_write_reporter,
+    )
 }
 
 pub fn pdeflate_decompress(stream: &[u8]) -> Result<Vec<u8>, PDeflateError> {
@@ -701,20 +735,26 @@ pub fn pdeflate_decompress(stream: &[u8]) -> Result<Vec<u8>, PDeflateError> {
 fn encode_stream_header(
     chunk_size: usize,
     uncompressed_size: Option<u64>,
+    file_name: Option<&str>,
 ) -> Result<Vec<u8>, PDeflateError> {
     let mut flags = 0u16;
+    let file_name_bytes = file_name.map(str::as_bytes);
     let mut header = Vec::with_capacity(
         STREAM_HEADER_SIZE
             + if uncompressed_size.is_some() {
                 STREAM_HEADER_UNCOMPRESSED_SIZE_BYTES
             } else {
                 0
-            },
+            }
+            + file_name_bytes.map(|bytes| 2 + bytes.len()).unwrap_or(0),
     );
     header.extend_from_slice(&STREAM_MAGIC);
     write_u16_le(&mut header, STREAM_VERSION);
     if uncompressed_size.is_some() {
         flags |= STREAM_FLAG_UNCOMPRESSED_SIZE;
+    }
+    if file_name_bytes.is_some() {
+        flags |= STREAM_FLAG_FILE_NAME_PRESENT;
     }
     write_u16_le(&mut header, flags);
     write_u32_le(
@@ -723,6 +763,13 @@ fn encode_stream_header(
     );
     if let Some(uncompressed_size) = uncompressed_size {
         header.extend_from_slice(&uncompressed_size.to_le_bytes());
+    }
+    if let Some(file_name_bytes) = file_name_bytes {
+        write_u16_le(
+            &mut header,
+            u16::try_from(file_name_bytes.len()).map_err(|_| PDeflateError::NumericOverflow)?,
+        );
+        header.extend_from_slice(file_name_bytes);
     }
     Ok(header)
 }
@@ -750,17 +797,36 @@ fn read_stream_header<R: Read>(reader: &mut R) -> Result<StreamHeader, PDeflateE
     } else {
         None
     };
+    let file_name = if (flags & STREAM_FLAG_FILE_NAME_PRESENT) != 0 {
+        let mut len_bytes = [0u8; 2];
+        reader.read_exact(&mut len_bytes)?;
+        let len = u16::from_le_bytes(len_bytes) as usize;
+        let mut name_bytes = vec![0u8; len];
+        reader.read_exact(&mut name_bytes)?;
+        Some(
+            String::from_utf8(name_bytes)
+                .map_err(|_| PDeflateError::InvalidStream("stream filename is not utf-8"))?,
+        )
+    } else {
+        None
+    };
+    let file_name_encoded_len = file_name
+        .as_ref()
+        .map(|name| 2 + name.len())
+        .unwrap_or(0);
 
     Ok(StreamHeader {
         flags,
         chunk_size,
         uncompressed_size,
+        file_name,
         encoded_len: STREAM_HEADER_SIZE
             + if uncompressed_size.is_some() {
                 STREAM_HEADER_UNCOMPRESSED_SIZE_BYTES
             } else {
                 0
-            },
+            }
+            + file_name_encoded_len,
     })
 }
 
@@ -769,6 +835,15 @@ pub fn pdeflate_stream_uncompressed_size<R: Read + Seek>(
 ) -> Result<Option<u64>, PDeflateError> {
     let start = reader.stream_position()?;
     let result = read_stream_header(reader).map(|header| header.uncompressed_size);
+    reader.seek(SeekFrom::Start(start))?;
+    result
+}
+
+pub fn pdeflate_stream_suggested_name<R: Read + Seek>(
+    reader: &mut R,
+) -> Result<Option<String>, PDeflateError> {
+    let start = reader.stream_position()?;
+    let result = read_stream_header(reader).map(|header| header.file_name);
     reader.seek(SeekFrom::Start(start))?;
     result
 }
@@ -1663,6 +1738,11 @@ fn validate_options(options: &PDeflateOptions) -> Result<(), PDeflateError> {
     if options.gpu_table_sample_stride == 0 {
         return Err(PDeflateError::InvalidOptions(
             "gpu_table_sample_stride must be > 0",
+        ));
+    }
+    if options.parallel_write_threads == 0 {
+        return Err(PDeflateError::InvalidOptions(
+            "parallel_write_threads must be > 0",
         ));
     }
     if options.gpu_submit_chunks == 0 {

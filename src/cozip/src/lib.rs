@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::fs::File as StdFile;
+use std::fs::{File as StdFile, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -11,7 +11,7 @@ use cozip_deflate::{
 };
 use cozip_pdeflate::{
     CoZipPDeflate, CoZipPDeflateError, StreamOptions as PDeflateStreamOptions,
-    pdeflate_stream_uncompressed_size,
+    pdeflate_stream_suggested_name, pdeflate_stream_uncompressed_size,
 };
 use thiserror::Error;
 
@@ -780,7 +780,6 @@ impl CoZip {
                 Ok(stats)
             }
             CoZipBackend::PDeflate { pdeflate } => {
-                let _ = entry_name;
                 let input_len = input_file.metadata()?.len();
                 if let Some(progress) = &progress {
                     progress.start(
@@ -801,6 +800,7 @@ impl CoZip {
                     &mut writer,
                     PDeflateStreamOptions {
                         uncompressed_size_hint: Some(input_len),
+                        file_name_hint: Some(entry_name.to_string()),
                         ..PDeflateStreamOptions::default()
                     },
                 )?;
@@ -1141,20 +1141,62 @@ impl CoZip {
                         progress.set_pending_output_backlog_bytes(Some(bytes));
                     }) as cozip_pdeflate::DecodeBacklogReporter
                 });
-                let mut reader = BufReader::new(input_file);
-                let mut writer = BufWriter::new(ProgressWriter::new(
-                    output_file,
-                    progress.clone(),
-                ));
-                let stats = pdeflate.decompress_stream_with_options(
-                    &mut reader,
-                    &mut writer,
-                    PDeflateStreamOptions {
-                        decode_backlog_reporter,
-                        ..PDeflateStreamOptions::default()
-                    },
-                )?;
-                writer.flush()?;
+                let output_write_reporter = progress.clone().map(|progress| {
+                    std::sync::Arc::new(move |bytes| {
+                        progress.advance_bytes(bytes);
+                    }) as cozip_pdeflate::OutputWriteReporter
+                });
+                let stats = if expected_output_bytes.is_some() {
+                    let parallel_input = input_file.try_clone()?;
+                    let parallel_output = output_file.try_clone()?;
+                    match pdeflate.decompress_file_parallel_write_with_options(
+                        parallel_input,
+                        parallel_output,
+                        PDeflateStreamOptions {
+                            decode_backlog_reporter: decode_backlog_reporter.clone(),
+                            output_write_reporter,
+                            ..PDeflateStreamOptions::default()
+                        },
+                    ) {
+                        Ok(stats) => stats,
+                        Err(CoZipPDeflateError::Io(err))
+                            if err.kind() == io::ErrorKind::PermissionDenied =>
+                        {
+                            let mut reader = BufReader::new(input_file);
+                            let mut writer = BufWriter::new(ProgressWriter::new(
+                                output_file,
+                                progress.clone(),
+                            ));
+                            let stats = pdeflate.decompress_stream_with_options(
+                                &mut reader,
+                                &mut writer,
+                                PDeflateStreamOptions {
+                                    decode_backlog_reporter,
+                                    ..PDeflateStreamOptions::default()
+                                },
+                            )?;
+                            writer.flush()?;
+                            stats
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                } else {
+                    let mut reader = BufReader::new(input_file);
+                    let mut writer = BufWriter::new(ProgressWriter::new(
+                        output_file,
+                        progress.clone(),
+                    ));
+                    let stats = pdeflate.decompress_stream_with_options(
+                        &mut reader,
+                        &mut writer,
+                        PDeflateStreamOptions {
+                            decode_backlog_reporter,
+                            ..PDeflateStreamOptions::default()
+                        },
+                    )?;
+                    writer.flush()?;
+                    stats
+                };
                 if let Some(progress) = &progress {
                     progress.set_pending_output_backlog_bytes(None);
                     progress.finish_entry();
@@ -1202,7 +1244,7 @@ impl CoZip {
         progress: impl Into<Option<CoZipProgress>>,
     ) -> Result<CoZipStats, CoZipError> {
         let input = StdFile::open(input_path)?;
-        let output = StdFile::create(output_path)?;
+        let output = open_output_file_rw_truncate(output_path)?;
         self.decompress_file_with_progress_and_expected_output_bytes(
             input,
             output,
@@ -1292,7 +1334,13 @@ impl CoZip {
         progress: impl Into<Option<CoZipProgress>>,
     ) -> Result<CoZipStats, CoZipError> {
         let input = tokio::fs::File::open(input_path).await?;
-        let output = tokio::fs::File::create(output_path).await?;
+        let output = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(output_path)
+            .await?;
         self.decompress_file_async_with_progress_and_expected_output_bytes(
             input,
             output,
@@ -1329,7 +1377,7 @@ impl CoZip {
                     ZipArchiveKind::SingleFile { entry_name } => {
                         let output_path =
                             resolve_single_file_output_path(output_path.as_ref(), &entry_name);
-                        let output_file = StdFile::create(output_path)?;
+                        let output_file = open_output_file_rw_truncate(output_path)?;
                         self.decompress_file_with_progress(input_file, output_file, progress)
                     }
                     ZipArchiveKind::Directory => {
@@ -1349,7 +1397,7 @@ impl CoZip {
                 if is_directory {
                     self.decompress_directory_with_progress(input_file, output_path, progress)
                 } else {
-                    let output_file = StdFile::create(output_path)?;
+                    let output_file = open_output_file_rw_truncate(output_path)?;
                     self.decompress_file_with_progress(input_file, output_file, progress)
                 }
             }
@@ -2104,15 +2152,22 @@ pub fn inspect_archive_from_name<P: AsRef<Path>>(
     }
 
     if read_len == 4 && (magic == *b"PDS0" || magic == PDEFLATE_DIR_FILE_MAGIC) {
-        let kind = if inspect_pdeflate_directory_header(&input)?.is_some() {
+        let is_directory = inspect_pdeflate_directory_header(&input)?.is_some();
+        input.seek(SeekFrom::Start(0))?;
+        let kind = if is_directory {
             CoZipArchiveKind::Directory
         } else {
-            let suggested_name = input_path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .filter(|stem| !stem.is_empty())
-                .unwrap_or(DEFAULT_ENTRY_NAME)
-                .to_string();
+            let suggested_name = pdeflate_stream_suggested_name(&mut input)
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    input_path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .filter(|stem| !stem.is_empty())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| DEFAULT_ENTRY_NAME.to_string());
             CoZipArchiveKind::SingleFile { suggested_name }
         };
         return Ok(CoZipArchiveInfo {
@@ -3427,6 +3482,15 @@ fn resolve_single_file_output_path(output_path: &Path, entry_name: &str) -> Path
     } else {
         output_path.to_path_buf()
     }
+}
+
+fn open_output_file_rw_truncate(path: impl AsRef<Path>) -> io::Result<StdFile> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(path)
 }
 
 fn find_eocd(bytes: &[u8]) -> Option<usize> {
