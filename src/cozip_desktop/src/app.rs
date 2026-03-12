@@ -16,6 +16,8 @@ use crate::launch::{
 };
 use crate::screens::widgets::{action_button, labeled_value, panel, progress_bar, separator};
 
+const DEFAULT_COZIP_EXTENSION: &str = "cozip";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScreenKind {
     Compress,
@@ -343,7 +345,7 @@ impl CozipDesktopApp {
         };
         let extension = match format {
             ArchiveFormat::Zip => "zip",
-            ArchiveFormat::Cozip => "pdz",
+            ArchiveFormat::Cozip => DEFAULT_COZIP_EXTENSION,
         };
         let file_name = current_output
             .file_name()

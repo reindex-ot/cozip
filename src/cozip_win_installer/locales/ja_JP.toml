@@ -24,10 +24,9 @@ explorer_menu = "エクスプローラのコンテキストメニューに追加
 title = "インストール中"
 description = "セットアップはファイルのコピーとシステム設定を行っています。"
 status_preparing = "インストールを準備しています..."
+status_downloading = "最新リリースをダウンロードしています..."
 status_extracting = "アプリケーション ファイルをコピーしています..."
-status_shortcuts = "ショートカットを作成しています..."
-status_explorer = "エクスプローラメニューを更新しています..."
-status_finalizing = "最終処理を実行しています..."
+status_registering = "レジストリとエクスプローラ設定を更新しています..."
 status_completed = "インストールが完了しました。"
 
 [complete]

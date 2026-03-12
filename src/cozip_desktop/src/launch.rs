@@ -9,6 +9,8 @@ use cozip::{
 };
 use cozip_pdeflate::{PDeflateOptions, pdeflate_stream_suggested_name};
 
+const DEFAULT_COZIP_EXTENSION: &str = "cozip";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InitialScreen {
     Compress,
@@ -292,7 +294,7 @@ fn default_compress_output_path(
 ) -> PathBuf {
     let extension = match format {
         ArchiveFormat::Zip => "zip",
-        ArchiveFormat::Cozip => "pdz",
+        ArchiveFormat::Cozip => DEFAULT_COZIP_EXTENSION,
     };
 
     match mode {
@@ -474,7 +476,9 @@ fn extract_decode_hint_for_path(path: &Path) -> ExtractDecodeHint {
 fn is_probable_pdeflate_archive_path(path: &Path) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
-        .map(|value| value.eq_ignore_ascii_case("pdz"))
+        .map(|value| {
+            value.eq_ignore_ascii_case(DEFAULT_COZIP_EXTENSION) || value.eq_ignore_ascii_case("pdz")
+        })
         .unwrap_or(false)
 }
 

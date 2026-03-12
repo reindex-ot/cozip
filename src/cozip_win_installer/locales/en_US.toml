@@ -24,10 +24,9 @@ explorer_menu = "Add to Explorer context menu"
 title = "Installing"
 description = "Setup is copying files and applying system settings."
 status_preparing = "Preparing installation..."
+status_downloading = "Downloading the latest release..."
 status_extracting = "Copying application files..."
-status_shortcuts = "Creating shortcuts..."
-status_explorer = "Updating Explorer menu..."
-status_finalizing = "Finalizing installation..."
+status_registering = "Updating registry and Explorer settings..."
 status_completed = "Installation completed."
 
 [complete]
