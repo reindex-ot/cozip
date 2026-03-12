@@ -17,8 +17,11 @@ fn main() {
             Some(InitialScreen::Compress) | Some(InitialScreen::Decompress) => {
                 size(px(620.0), px(300.0))
             }
-            Some(InitialScreen::CompressSettings) | Some(InitialScreen::DecompressSettings) => {
+            Some(InitialScreen::DecompressSettings) => {
                 size(px(760.0), px(520.0))
+            }
+            Some(InitialScreen::CompressSettings) => {
+                size(px(760.0), px(620.0))
             }
             None => size(px(1360.0), px(920.0)),
         };

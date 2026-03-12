@@ -3,6 +3,7 @@ use std::io;
 use std::mem::zeroed;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::{null_mut};
+use std::sync::mpsc::{self, Sender};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -12,17 +13,30 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
-    WriteFile,
+    ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED, PostQueuedCompletionStatus,
 };
 
+use super::FileReaderBackend;
 use super::FileWriterBackend;
+use crate::error::ParallelFileReaderError;
+use crate::file_reader::ParallelReadHandle;
 use crate::error::ParallelFileWriterError;
-use crate::options::{BacklogReporter, ParallelFileWriterOptions, WriteReporter};
+use crate::options::{
+    BacklogReporter, ParallelFileReaderOptions, ParallelFileWriterOptions, ReadReporter,
+    WriteReporter,
+};
 
 struct SharedState {
+    pending_bytes: usize,
+    inflight_ops: usize,
+    closed: bool,
+    stopped: bool,
+}
+
+struct ReadSharedState {
     pending_bytes: usize,
     inflight_ops: usize,
     closed: bool,
@@ -48,12 +62,32 @@ struct WriteOp {
     data: Vec<u8>,
 }
 
+#[repr(C)]
+struct ReadOp {
+    overlapped: OVERLAPPED,
+    data: Vec<u8>,
+    response: Sender<Result<Vec<u8>, ParallelFileReaderError>>,
+}
+
 pub(crate) struct WindowsFileWriter {
     _file: File,
     io_file: File,
     port: Arc<CompletionPort>,
     state: Arc<(Mutex<SharedState>, Condvar)>,
     error: Arc<Mutex<Option<ParallelFileWriterError>>>,
+    backlog_bytes: Arc<AtomicU64>,
+    backlog_limit: usize,
+    max_inflight: usize,
+    backlog_reporter: Option<BacklogReporter>,
+    completion_thread: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+pub(crate) struct WindowsFileReader {
+    _file: File,
+    io_file: File,
+    port: Arc<CompletionPort>,
+    state: Arc<(Mutex<ReadSharedState>, Condvar)>,
+    error: Arc<Mutex<Option<ParallelFileReaderError>>>,
     backlog_bytes: Arc<AtomicU64>,
     backlog_limit: usize,
     max_inflight: usize,
@@ -126,6 +160,91 @@ impl WindowsFileWriter {
             .error
             .lock()
             .map_err(|_| io::Error::other("windows writer error slot poisoned"))?;
+        if let Some(error) = slot.take() {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn update_backlog(&self, bytes: usize) {
+        let bytes64 = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.backlog_bytes.store(bytes64, Ordering::Relaxed);
+        if let Some(reporter) = &self.backlog_reporter {
+            reporter(bytes64);
+        }
+    }
+}
+
+impl WindowsFileReader {
+    pub(crate) fn new(
+        file: File,
+        options: ParallelFileReaderOptions,
+    ) -> Result<Self, ParallelFileReaderError> {
+        let max_inflight = if options.max_inflight_ops > 0 {
+            options.max_inflight_ops
+        } else {
+            options.worker_threads.max(1).saturating_mul(32).clamp(64, 4096)
+        };
+        let io_file = reopen_overlapped_read(&file)?;
+        let port_handle = unsafe {
+            CreateIoCompletionPort(
+                io_file.as_raw_handle() as HANDLE,
+                null_mut(),
+                0,
+                options.worker_threads.max(1) as u32,
+            )
+        };
+        if port_handle.is_null() {
+            return Err(io::Error::last_os_error().into());
+        }
+        let port = Arc::new(CompletionPort(port_handle));
+        let state = Arc::new((
+            Mutex::new(ReadSharedState {
+                pending_bytes: 0,
+                inflight_ops: 0,
+                closed: false,
+                stopped: false,
+            }),
+            Condvar::new(),
+        ));
+        let error = Arc::new(Mutex::new(None));
+        let backlog_bytes = Arc::new(AtomicU64::new(0));
+        let backlog_reporter = options.backlog_reporter.clone();
+        let read_reporter = options.read_reporter.clone();
+        let state_ref = Arc::clone(&state);
+        let error_ref = Arc::clone(&error);
+        let backlog_ref = Arc::clone(&backlog_bytes);
+        let port_ref = Arc::clone(&port);
+        let completion_thread = thread::spawn(move || {
+            read_completion_loop(
+                port_ref,
+                state_ref,
+                error_ref,
+                backlog_ref,
+                backlog_reporter,
+                read_reporter,
+            );
+        });
+
+        Ok(Self {
+            _file: file,
+            io_file,
+            port,
+            state,
+            error,
+            backlog_bytes,
+            backlog_limit: options.max_backlog_bytes.max(1),
+            max_inflight,
+            backlog_reporter: options.backlog_reporter,
+            completion_thread: Mutex::new(Some(completion_thread)),
+        })
+    }
+
+    fn check_error(&self) -> Result<(), ParallelFileReaderError> {
+        let mut slot = self
+            .error
+            .lock()
+            .map_err(|_| io::Error::other("windows reader error slot poisoned"))?;
         if let Some(error) = slot.take() {
             return Err(error);
         }
@@ -235,6 +354,102 @@ impl FileWriterBackend for WindowsFileWriter {
     }
 }
 
+impl FileReaderBackend for WindowsFileReader {
+    fn submit(&self, offset: u64, len: usize) -> Result<ParallelReadHandle, ParallelFileReaderError> {
+        self.check_error()?;
+        let (lock, cv) = &*self.state;
+        let mut state = lock
+            .lock()
+            .map_err(|_| io::Error::other("windows reader state poisoned"))?;
+        while (state.pending_bytes >= self.backlog_limit || state.inflight_ops >= self.max_inflight)
+            && !state.stopped
+            && !state.closed
+        {
+            state = cv
+                .wait(state)
+                .map_err(|_| io::Error::other("windows reader state poisoned"))?;
+            self.check_error()?;
+        }
+        if state.stopped || state.closed {
+            self.check_error()?;
+            return Err(ParallelFileReaderError::Closed);
+        }
+        state.pending_bytes = state.pending_bytes.saturating_add(len);
+        state.inflight_ops = state.inflight_ops.saturating_add(1);
+        self.update_backlog(state.pending_bytes);
+        drop(state);
+
+        let (tx, rx) = mpsc::channel();
+        let mut op = Box::new(ReadOp {
+            overlapped: unsafe { zeroed() },
+            data: vec![0_u8; len],
+            response: tx,
+        });
+        op.overlapped.Anonymous.Anonymous.Offset = offset as u32;
+        op.overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+        let len_u32 =
+            u32::try_from(op.data.len()).map_err(|_| ParallelFileReaderError::NumericOverflow)?;
+        let op_ptr = Box::into_raw(op);
+        let read_ok = unsafe {
+            ReadFile(
+                self.io_file.as_raw_handle() as HANDLE,
+                (*op_ptr).data.as_mut_ptr(),
+                len_u32,
+                null_mut(),
+                &mut (*op_ptr).overlapped,
+            )
+        };
+        if read_ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err != ERROR_IO_PENDING {
+                unsafe {
+                    drop(Box::from_raw(op_ptr));
+                }
+                let mut state = lock
+                    .lock()
+                    .map_err(|_| io::Error::other("windows reader state poisoned"))?;
+                state.pending_bytes = state.pending_bytes.saturating_sub(len_u32 as usize);
+                state.inflight_ops = state.inflight_ops.saturating_sub(1);
+                self.update_backlog(state.pending_bytes);
+                cv.notify_all();
+                return Err(io::Error::from_raw_os_error(err as i32).into());
+            }
+        }
+        Ok(ParallelReadHandle::new(rx))
+    }
+
+    fn backlog_bytes(&self) -> u64 {
+        self.backlog_bytes.load(Ordering::Relaxed)
+    }
+
+    fn drain(&self) -> Result<(), ParallelFileReaderError> {
+        {
+            let (lock, cv) = &*self.state;
+            let mut state = lock
+                .lock()
+                .map_err(|_| io::Error::other("windows reader state poisoned"))?;
+            state.closed = true;
+            unsafe {
+                PostQueuedCompletionStatus(self.port.0, 0, 0, null_mut());
+            }
+            while state.inflight_ops > 0 && !state.stopped {
+                state = cv
+                    .wait(state)
+                    .map_err(|_| io::Error::other("windows reader state poisoned"))?;
+            }
+        }
+        unsafe {
+            PostQueuedCompletionStatus(self.port.0, 0, 0, null_mut());
+        }
+        if let Ok(mut handle) = self.completion_thread.lock() {
+            if let Some(handle) = handle.take() {
+                let _ = handle.join();
+            }
+        }
+        self.check_error()
+    }
+}
+
 fn completion_loop(
     port: Arc<CompletionPort>,
     state_ref: Arc<(Mutex<SharedState>, Condvar)>,
@@ -305,11 +520,107 @@ fn completion_loop(
     }
 }
 
+fn read_completion_loop(
+    port: Arc<CompletionPort>,
+    state_ref: Arc<(Mutex<ReadSharedState>, Condvar)>,
+    error_ref: Arc<Mutex<Option<ParallelFileReaderError>>>,
+    backlog_bytes: Arc<AtomicU64>,
+    backlog_reporter: Option<BacklogReporter>,
+    read_reporter: Option<ReadReporter>,
+) {
+    loop {
+        let mut transferred = 0u32;
+        let mut completion_key = 0usize;
+        let mut overlapped = null_mut();
+        let ok = unsafe {
+            GetQueuedCompletionStatus(
+                port.0,
+                &mut transferred,
+                &mut completion_key,
+                &mut overlapped,
+                u32::MAX,
+            )
+        };
+        if overlapped.is_null() {
+            let (lock, cv) = &*state_ref;
+            let state = match lock.lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+            if state.closed && state.inflight_ops == 0 {
+                cv.notify_all();
+                return;
+            }
+            continue;
+        }
+
+        let mut op = unsafe { Box::from_raw(overlapped as *mut ReadOp) };
+        let requested_len = op.data.len();
+        let mut completion_error = None;
+        if ok == 0 {
+            completion_error = Some(ParallelFileReaderError::Io(io::Error::last_os_error()));
+            let _ = op
+                .response
+                .send(Err(ParallelFileReaderError::Io(io::Error::last_os_error())));
+        } else if transferred as usize != requested_len {
+            let error = ParallelFileReaderError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "windows overlapped read completed partially",
+            ));
+            let _ = op.response.send(Err(ParallelFileReaderError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "windows overlapped read completed partially",
+            ))));
+            completion_error = Some(error);
+        } else {
+            let _ = op.response.send(Ok(std::mem::take(&mut op.data)));
+        }
+
+        let (lock, cv) = &*state_ref;
+        if let Ok(mut state) = lock.lock() {
+            state.pending_bytes = state.pending_bytes.saturating_sub(requested_len);
+            state.inflight_ops = state.inflight_ops.saturating_sub(1);
+            let bytes64 = u64::try_from(state.pending_bytes).unwrap_or(u64::MAX);
+            backlog_bytes.store(bytes64, Ordering::Relaxed);
+            if let Some(reporter) = &backlog_reporter {
+                reporter(bytes64);
+            }
+            if let Some(error) = completion_error {
+                state.stopped = true;
+                if let Ok(mut slot) = error_ref.lock() {
+                    if slot.is_none() {
+                        *slot = Some(error);
+                    }
+                }
+            } else if let Some(reporter) = &read_reporter {
+                reporter(u64::try_from(requested_len).unwrap_or(u64::MAX));
+            }
+            cv.notify_all();
+        }
+    }
+}
+
 fn reopen_overlapped(file: &File) -> Result<File, ParallelFileWriterError> {
     let handle = unsafe {
         ReOpenFile(
             file.as_raw_handle() as HANDLE,
             0x8000_0000u32 | 0x4000_0000u32,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_OVERLAPPED,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error().into());
+    }
+    let owned = unsafe { OwnedHandle::from_raw_handle(handle as _) };
+    Ok(File::from(owned))
+}
+
+fn reopen_overlapped_read(file: &File) -> Result<File, ParallelFileReaderError> {
+    let handle = unsafe {
+        ReOpenFile(
+            file.as_raw_handle() as HANDLE,
+            0x8000_0000u32,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             FILE_FLAG_OVERLAPPED,
         )

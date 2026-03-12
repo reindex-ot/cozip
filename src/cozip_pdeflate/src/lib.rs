@@ -1,10 +1,11 @@
 use std::collections::VecDeque;
 use std::fs::{File as StdFile, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use cozip_util::{ParallelFileReader, ParallelFileReaderOptions, ParallelReadHandle};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -137,6 +138,124 @@ impl<R: AsyncRead + Unpin> AsyncStream<R> {
     }
 }
 
+struct ParallelPrefetchReader {
+    reader: ParallelFileReader,
+    file_len: u64,
+    next_submit_offset: u64,
+    request_size: usize,
+    max_inflight_ops: usize,
+    max_inflight_bytes: usize,
+    inflight_bytes: usize,
+    inflight: VecDeque<(ParallelReadHandle, usize)>,
+    current: Vec<u8>,
+    current_pos: usize,
+}
+
+impl ParallelPrefetchReader {
+    fn new(
+        file: StdFile,
+        chunk_size: usize,
+        options: ParallelFileReaderOptions,
+    ) -> Result<Self, CozipDeflateError> {
+        let file_len = file.metadata()?.len();
+        let request_size = chunk_size.max(1);
+        let max_inflight_ops = if options.max_inflight_ops > 0 {
+            options.max_inflight_ops
+        } else {
+            let by_bytes = options.max_backlog_bytes.max(request_size) / request_size;
+            by_bytes.clamp(64, 4096)
+        };
+        let max_inflight_bytes = options.max_backlog_bytes.max(request_size);
+        let reader =
+            ParallelFileReader::new(file, options).map_err(|error| io::Error::other(error.to_string()))?;
+        let mut this = Self {
+            reader,
+            file_len,
+            next_submit_offset: 0,
+            request_size,
+            max_inflight_ops,
+            max_inflight_bytes,
+            inflight_bytes: 0,
+            inflight: VecDeque::new(),
+            current: Vec::new(),
+            current_pos: 0,
+        };
+        this.fill_prefetch()?;
+        Ok(this)
+    }
+
+    fn fill_prefetch(&mut self) -> io::Result<()> {
+        while self.inflight.len() < self.max_inflight_ops
+            && self.inflight_bytes < self.max_inflight_bytes
+            && self.next_submit_offset < self.file_len
+        {
+            let remaining = self.file_len.saturating_sub(self.next_submit_offset);
+            let mut len =
+                usize::try_from(remaining.min(self.request_size as u64)).unwrap_or(self.request_size);
+            let available_budget = self.max_inflight_bytes.saturating_sub(self.inflight_bytes);
+            if len > available_budget && available_budget > 0 {
+                len = available_budget.min(len);
+            }
+            if len == 0 {
+                break;
+            }
+            let handle = self
+                .reader
+                .submit(self.next_submit_offset, len)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            self.inflight.push_back((handle, len));
+            self.inflight_bytes = self.inflight_bytes.saturating_add(len);
+            self.next_submit_offset = self.next_submit_offset.saturating_add(len as u64);
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(), CozipDeflateError> {
+        self.reader
+            .drain()
+            .map_err(|error| io::Error::other(error.to_string()).into())
+    }
+}
+
+impl Read for ParallelPrefetchReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let mut written = 0usize;
+        loop {
+            if self.current_pos >= self.current.len() {
+                let Some((handle, len)) = self.inflight.pop_front() else {
+                    return Ok(written);
+                };
+                self.inflight_bytes = self.inflight_bytes.saturating_sub(len);
+                self.current = handle
+                    .recv()
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                self.current_pos = 0;
+                self.fill_prefetch()?;
+                if self.current.is_empty() {
+                    if written > 0 {
+                        return Ok(written);
+                    }
+                    continue;
+                }
+            }
+
+            let available = self.current.len().saturating_sub(self.current_pos);
+            let take = available.min(buf.len().saturating_sub(written));
+            buf[written..written + take]
+                .copy_from_slice(&self.current[self.current_pos..self.current_pos + take]);
+            self.current_pos = self.current_pos.saturating_add(take);
+            written = written.saturating_add(take);
+            if written == buf.len() {
+                return Ok(written);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CoZipDeflateInitStats {
     pub gpu_context_init_ms: f64,
@@ -198,6 +317,10 @@ impl CoZipDeflate {
 
     pub fn parallel_write_threads(&self) -> usize {
         self.options.parallel_write_threads
+    }
+
+    pub fn parallel_read_threads(&self) -> usize {
+        self.options.parallel_read_threads
     }
 
     pub fn compress_stream<R: Read + Send, W: Write>(
@@ -429,6 +552,22 @@ impl CoZipDeflate {
             stream_options.output_write_reporter,
         )
         .map_err(map_pdeflate_error)
+    }
+
+    pub fn compress_file_parallel_read_with_options(
+        &self,
+        input_file: StdFile,
+        output_file: StdFile,
+        stream_options: StreamOptions,
+        reader_options: ParallelFileReaderOptions,
+    ) -> Result<PDeflateStats, CozipDeflateError> {
+        let chunk_size = self.options.chunk_size.max(1);
+        let mut reader = ParallelPrefetchReader::new(input_file, chunk_size, reader_options)?;
+        let mut writer = BufWriter::new(output_file);
+        let stats = self.compress_stream_with_options(&mut reader, &mut writer, stream_options)?;
+        writer.flush()?;
+        reader.finish()?;
+        Ok(stats)
     }
 
     pub fn decompress_file_from_name<PIn: AsRef<Path>, POut: AsRef<Path>>(

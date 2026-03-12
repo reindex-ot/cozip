@@ -636,6 +636,27 @@ impl CozipDesktopApp {
             ArchiveFormat::Zip => {
                 form = form
                     .child(self.settings_row(
+                        self.t("settings.parallel_read_threads"),
+                        self.stepper_control(
+                            "zip-read-threads-dec",
+                            "zip-read-threads-inc",
+                            plan.zip_options.parallel_read_threads.to_string(),
+                            |this, _, _| {
+                                if let Some(plan) = this.compress_plan_mut() {
+                                    plan.zip_options.parallel_read_threads =
+                                        plan.zip_options.parallel_read_threads.saturating_sub(1).max(1);
+                                }
+                            },
+                            |this, _, _| {
+                                if let Some(plan) = this.compress_plan_mut() {
+                                    plan.zip_options.parallel_read_threads =
+                                        plan.zip_options.parallel_read_threads.saturating_add(1).min(128);
+                                }
+                            },
+                            cx,
+                        ),
+                    ))
+                    .child(self.settings_row(
                         self.t("settings.compression_level"),
                         self.stepper_control(
                             "zip-level-dec",
@@ -680,6 +701,27 @@ impl CozipDesktopApp {
             ArchiveFormat::Cozip => {
                 let opts = &plan.pdeflate_options;
                 form = form
+                    .child(self.settings_row(
+                        self.t("settings.parallel_read_threads"),
+                        self.stepper_control(
+                            "pdeflate-read-threads-dec",
+                            "pdeflate-read-threads-inc",
+                            opts.parallel_read_threads.to_string(),
+                            |this, _, _| {
+                                if let Some(plan) = this.compress_plan_mut() {
+                                    plan.pdeflate_options.parallel_read_threads =
+                                        plan.pdeflate_options.parallel_read_threads.saturating_sub(1).max(1);
+                                }
+                            },
+                            |this, _, _| {
+                                if let Some(plan) = this.compress_plan_mut() {
+                                    plan.pdeflate_options.parallel_read_threads =
+                                        plan.pdeflate_options.parallel_read_threads.saturating_add(1).min(128);
+                                }
+                            },
+                            cx,
+                        ),
+                    ))
                     .child(self.settings_row(
                         self.t("settings.huffman"),
                         self.toggle_control(

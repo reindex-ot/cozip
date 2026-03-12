@@ -204,6 +204,7 @@ pub struct PDeflateOptions {
     pub gpu_pipelined_submit_chunks: usize,
     pub gpu_min_chunk_size: usize,
     pub gpu_tail_stop_ratio: f32,
+    pub parallel_read_threads: usize,
     pub parallel_write_threads: usize,
     pub huffman_encode_enabled: bool,
     pub compression_mode: PDeflateCompressionMode,
@@ -212,7 +213,7 @@ pub struct PDeflateOptions {
 
 impl Default for PDeflateOptions {
     fn default() -> Self {
-        let parallel_write_threads = thread::available_parallelism()
+        let parallel_threads = thread::available_parallelism()
             .map(|value| value.get())
             .unwrap_or(1)
             .max(1);
@@ -236,7 +237,8 @@ impl Default for PDeflateOptions {
             gpu_pipelined_submit_chunks: 4,
             gpu_min_chunk_size: 64 * 1024,
             gpu_tail_stop_ratio: 1.0,
-            parallel_write_threads,
+            parallel_read_threads: parallel_threads,
+            parallel_write_threads: parallel_threads,
             huffman_encode_enabled: false,
             compression_mode: PDeflateCompressionMode::Speed,
             hybrid_scheduler_policy: PDeflateHybridSchedulerPolicy::GlobalQueue,
@@ -1739,6 +1741,12 @@ fn validate_options(options: &PDeflateOptions) -> Result<(), PDeflateError> {
             "gpu_table_sample_stride must be > 0",
         ));
     }
+    if options.parallel_read_threads == 0 {
+        return Err(PDeflateError::InvalidOptions(
+            "parallel_read_threads must be > 0",
+        ));
+    }
+
     if options.parallel_write_threads == 0 {
         return Err(PDeflateError::InvalidOptions(
             "parallel_write_threads must be > 0",

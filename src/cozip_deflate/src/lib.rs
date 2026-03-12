@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File as StdFile;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 use flate2::Compression;
 use thiserror::Error;
 
-use cozip_util::{ParallelFileWriter, ParallelFileWriterOptions};
+use cozip_util::{
+    ParallelFileReader, ParallelFileReaderOptions, ParallelFileWriter, ParallelFileWriterOptions,
+    ParallelReadHandle,
+};
 
 const LITLEN_SYMBOL_COUNT: usize = 286;
 const DIST_SYMBOL_COUNT: usize = 30;
@@ -192,6 +195,19 @@ impl CoZipDeflate {
         )
     }
 
+    pub fn deflate_compress_file_zip_compatible_with_index_parallel_read<W: Write>(
+        &self,
+        input_file: StdFile,
+        writer: &mut W,
+        reader_options: ParallelFileReaderOptions,
+    ) -> Result<DeflateHybridCompressResult, CozipDeflateError> {
+        let chunk_size = self.options.chunk_size.max(1);
+        let mut reader = ParallelPrefetchReader::new(input_file, chunk_size, reader_options)?;
+        let result = self.deflate_compress_stream_zip_compatible_with_index(&mut reader, writer)?;
+        reader.finish()?;
+        Ok(result)
+    }
+
     pub fn deflate_decompress_stream_zip_compatible_with_index<R: Read + Send, W: Write>(
         &self,
         reader: &mut R,
@@ -274,6 +290,123 @@ fn accumulate_write_stage_metrics(
 struct ChunkTask {
     index: usize,
     raw: Vec<u8>,
+}
+
+struct ParallelPrefetchReader {
+    reader: ParallelFileReader,
+    file_len: u64,
+    next_submit_offset: u64,
+    request_size: usize,
+    max_inflight_ops: usize,
+    max_inflight_bytes: usize,
+    inflight_bytes: usize,
+    inflight: VecDeque<(ParallelReadHandle, usize)>,
+    current: Vec<u8>,
+    current_pos: usize,
+}
+
+impl ParallelPrefetchReader {
+    fn new(
+        file: StdFile,
+        chunk_size: usize,
+        options: ParallelFileReaderOptions,
+    ) -> Result<Self, CozipDeflateError> {
+        let file_len = file.metadata()?.len();
+        let request_size = chunk_size.max(1);
+        let max_inflight_ops = if options.max_inflight_ops > 0 {
+            options.max_inflight_ops
+        } else {
+            let by_bytes = options.max_backlog_bytes.max(request_size) / request_size;
+            by_bytes.clamp(64, 4096)
+        };
+        let max_inflight_bytes = options.max_backlog_bytes.max(request_size);
+        let reader =
+            ParallelFileReader::new(file, options).map_err(|error| io::Error::other(error.to_string()))?;
+        let mut this = Self {
+            reader,
+            file_len,
+            next_submit_offset: 0,
+            request_size,
+            max_inflight_ops,
+            max_inflight_bytes,
+            inflight_bytes: 0,
+            inflight: VecDeque::new(),
+            current: Vec::new(),
+            current_pos: 0,
+        };
+        this.fill_prefetch()?;
+        Ok(this)
+    }
+
+    fn fill_prefetch(&mut self) -> io::Result<()> {
+        while self.inflight.len() < self.max_inflight_ops
+            && self.inflight_bytes < self.max_inflight_bytes
+            && self.next_submit_offset < self.file_len
+        {
+            let remaining = self.file_len.saturating_sub(self.next_submit_offset);
+            let mut len =
+                usize::try_from(remaining.min(self.request_size as u64)).unwrap_or(self.request_size);
+            let available_budget = self.max_inflight_bytes.saturating_sub(self.inflight_bytes);
+            if len > available_budget && available_budget > 0 {
+                len = available_budget.min(len);
+            }
+            if len == 0 {
+                break;
+            }
+            let handle = self
+                .reader
+                .submit(self.next_submit_offset, len)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            self.inflight.push_back((handle, len));
+            self.inflight_bytes = self.inflight_bytes.saturating_add(len);
+            self.next_submit_offset = self.next_submit_offset.saturating_add(len as u64);
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(), CozipDeflateError> {
+        self.reader
+            .drain()
+            .map_err(|error| io::Error::other(error.to_string()).into())
+    }
+}
+
+impl Read for ParallelPrefetchReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut written = 0usize;
+        loop {
+            if self.current_pos >= self.current.len() {
+                let Some((handle, len)) = self.inflight.pop_front() else {
+                    return Ok(written);
+                };
+                self.inflight_bytes = self.inflight_bytes.saturating_sub(len);
+                self.current = handle
+                    .recv()
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                self.current_pos = 0;
+                self.fill_prefetch()?;
+                if self.current.is_empty() {
+                    if written > 0 {
+                        return Ok(written);
+                    }
+                    continue;
+                }
+            }
+
+            let available = self.current.len().saturating_sub(self.current_pos);
+            let take = available.min(buf.len().saturating_sub(written));
+            buf[written..written + take]
+                .copy_from_slice(&self.current[self.current_pos..self.current_pos + take]);
+            self.current_pos = self.current_pos.saturating_add(take);
+            written = written.saturating_add(take);
+            if written == buf.len() {
+                return Ok(written);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2276,6 +2409,12 @@ struct StreamReadyChunk {
     prepared_non_final_end_bit: Option<usize>,
 }
 
+#[derive(Default)]
+struct StreamReadyState {
+    chunks: BTreeMap<usize, StreamReadyChunk>,
+    ready_bytes: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DecodeTask {
     index: usize,
@@ -3067,19 +3206,25 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
     let mut bit_writer = DeflateBitWriter::new(&mut output);
 
     let queue_state = Arc::new((Mutex::new(StreamTaskQueueState::default()), Condvar::new()));
-    let ready_state = Arc::new((
-        Mutex::new(BTreeMap::<usize, StreamReadyChunk>::new()),
-        Condvar::new(),
-    ));
+    let ready_state = Arc::new((Mutex::new(StreamReadyState::default()), Condvar::new()));
     let error = Arc::new(Mutex::new(None::<CozipDeflateError>));
     let counters = Arc::new(WorkerCounters::default());
     let total_tasks = Arc::new(AtomicUsize::new(0));
     let written_tasks = Arc::new(AtomicUsize::new(0));
     let inflight_raw_bytes = Arc::new(AtomicUsize::new(0));
-    let producer_stats = Arc::new(Mutex::new((0_u64, 0_u32)));
-
     let gpu_enabled = gpu_context.is_some() && is_gpu_requested(options);
     let cpu_workers = cpu_worker_count(gpu_enabled);
+    let ready_byte_cap = if options.stream_max_inflight_bytes > 0 {
+        options.stream_max_inflight_bytes.max(options.chunk_size.max(1))
+    } else if options.stream_max_inflight_chunks > 0 {
+        options
+            .chunk_size
+            .max(1)
+            .saturating_mul(options.stream_max_inflight_chunks.max(1))
+    } else {
+        options.chunk_size.max(1).saturating_mul(cpu_workers.max(1)).saturating_mul(4)
+    };
+    let producer_stats = Arc::new(Mutex::new((0_u64, 0_u32)));
     let mut handles = Vec::new();
 
     for _ in 0..cpu_workers {
@@ -3094,6 +3239,7 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
                 ready_ref,
                 err_ref,
                 &opts,
+                ready_byte_cap,
                 Some(counters_ref),
             )
         }));
@@ -3114,6 +3260,7 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
                 &opts,
                 gpu,
                 total_tasks_ref,
+                ready_byte_cap,
                 Some(counters_ref),
             )
         }));
@@ -3224,8 +3371,14 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
                 let (next_ready, ready_len) = {
                     let (ready_lock, _) = &*ready_state;
                     let mut ready = lock(ready_lock)?;
-                    let ready_len = ready.len();
-                    (ready.remove(&next_write_index), ready_len)
+                    let ready_len = ready.chunks.len();
+                    let next = ready.chunks.remove(&next_write_index);
+                    if let Some(chunk) = &next {
+                        ready.ready_bytes = ready
+                            .ready_bytes
+                            .saturating_sub(chunk.chunk.compressed.len());
+                    }
+                    (next, ready_len)
                 };
                 stats.ready_chunks_max = stats.ready_chunks_max.max(ready_len);
                 let Some(ready) = next_ready else {
@@ -3298,6 +3451,11 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
                 inflight_raw_bytes.fetch_sub(ready.chunk.raw_len as usize, Ordering::Relaxed);
                 written_tasks.store(next_write_index + 1, Ordering::Relaxed);
                 {
+                    let (ready_lock, ready_cv) = &*ready_state;
+                    drop(lock(ready_lock)?);
+                    ready_cv.notify_all();
+                }
+                {
                     let (queue_lock, queue_cv) = &*queue_state;
                     drop(lock(queue_lock)?);
                     queue_cv.notify_all();
@@ -3320,7 +3478,7 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
                 let wait_start = Instant::now();
                 let (ready_lock, ready_cv) = &*ready_state;
                 let guard = lock(ready_lock)?;
-                let ready_len = guard.len();
+                let ready_len = guard.chunks.len();
                 stats.ready_chunks_max = stats.ready_chunks_max.max(ready_len);
                 let hol_wait = ready_len > 0;
                 drop(wait_timeout_on_condvar(
@@ -3426,14 +3584,34 @@ fn stream_task_is_gpu_eligible(task: &ChunkTask, options: &HybridOptions) -> boo
 
 fn compress_cpu_stream_worker_continuous(
     queue_state: Arc<(Mutex<StreamTaskQueueState>, Condvar)>,
-    ready_state: Arc<(Mutex<BTreeMap<usize, StreamReadyChunk>>, Condvar)>,
+    ready_state: Arc<(Mutex<StreamReadyState>, Condvar)>,
     error: Arc<Mutex<Option<CozipDeflateError>>>,
     options: &HybridOptions,
+    ready_byte_cap: usize,
     counters: Option<Arc<WorkerCounters>>,
 ) {
     loop {
         if has_error(&error) {
             break;
+        }
+        {
+            let (ready_lock, ready_cv) = &*ready_state;
+            let mut ready = match lock(ready_lock) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    set_error(&error, err);
+                    break;
+                }
+            };
+            while ready.ready_bytes >= ready_byte_cap && !has_error(&error) {
+                ready = match wait_on_condvar(ready_cv, ready) {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        set_error(&error, err);
+                        return;
+                    }
+                };
+            }
         }
         let task = {
             let (queue_lock, queue_cv) = &*queue_state;
@@ -3509,15 +3687,24 @@ fn compress_cpu_stream_worker_continuous(
                 break;
             }
         };
+        while ready.ready_bytes >= ready_byte_cap && !has_error(&error) {
+            ready = match wait_on_condvar(ready_cv, ready) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    set_error(&error, err);
+                    return;
+                }
+            };
+        }
+        let ready_chunk = StreamReadyChunk {
+            chunk: encoded,
+            layout,
+            prepared_non_final_end_bit: None,
+        };
+        let compressed_len = ready_chunk.chunk.compressed.len();
         if ready
-            .insert(
-                encoded.index,
-                StreamReadyChunk {
-                    chunk: encoded,
-                    layout,
-                    prepared_non_final_end_bit: None,
-                },
-            )
+            .chunks
+            .insert(ready_chunk.chunk.index, ready_chunk)
             .is_some()
         {
             set_error(
@@ -3526,23 +3713,44 @@ fn compress_cpu_stream_worker_continuous(
             );
             break;
         }
+        ready.ready_bytes = ready.ready_bytes.saturating_add(compressed_len);
         ready_cv.notify_all();
     }
 }
 
 fn compress_gpu_stream_worker_continuous(
     queue_state: Arc<(Mutex<StreamTaskQueueState>, Condvar)>,
-    ready_state: Arc<(Mutex<BTreeMap<usize, StreamReadyChunk>>, Condvar)>,
+    ready_state: Arc<(Mutex<StreamReadyState>, Condvar)>,
     error: Arc<Mutex<Option<CozipDeflateError>>>,
     options: &HybridOptions,
     gpu: Arc<GpuAssist>,
     total_tasks: Arc<AtomicUsize>,
+    ready_byte_cap: usize,
     counters: Option<Arc<WorkerCounters>>,
 ) {
     let batch_limit = options.gpu_batch_chunks.clamp(1, MAX_GPU_BATCH_CHUNKS);
     loop {
         if has_error(&error) {
             break;
+        }
+        {
+            let (ready_lock, ready_cv) = &*ready_state;
+            let mut ready = match lock(ready_lock) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    set_error(&error, err);
+                    break;
+                }
+            };
+            while ready.ready_bytes >= ready_byte_cap && !has_error(&error) {
+                ready = match wait_on_condvar(ready_cv, ready) {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        set_error(&error, err);
+                        return;
+                    }
+                };
+            }
         }
         let tasks = {
             let (queue_lock, queue_cv) = &*queue_state;
@@ -3668,6 +3876,19 @@ fn compress_gpu_stream_worker_continuous(
                 break;
             }
         };
+        let batch_bytes: usize = encoded_batch
+            .iter()
+            .map(|chunk| chunk.compressed.len())
+            .sum();
+        while ready.ready_bytes.saturating_add(batch_bytes) > ready_byte_cap && !has_error(&error) {
+            ready = match wait_on_condvar(ready_cv, ready) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    set_error(&error, err);
+                    return;
+                }
+            };
+        }
         for (mut encoded, layout) in encoded_batch.into_iter().zip(layouts.into_iter()) {
             let prepared_non_final_end_bit = if encoded.backend == ChunkBackend::GpuAssisted {
                 match prepare_chunk_bits_for_non_final_stream(&mut encoded.compressed, layout) {
@@ -3680,15 +3901,15 @@ fn compress_gpu_stream_worker_continuous(
             } else {
                 None
             };
+            let ready_chunk = StreamReadyChunk {
+                chunk: encoded,
+                layout,
+                prepared_non_final_end_bit,
+            };
+            let compressed_len = ready_chunk.chunk.compressed.len();
             if ready
-                .insert(
-                    encoded.index,
-                    StreamReadyChunk {
-                        chunk: encoded,
-                        layout,
-                        prepared_non_final_end_bit,
-                    },
-                )
+                .chunks
+                .insert(ready_chunk.chunk.index, ready_chunk)
                 .is_some()
             {
                 set_error(
@@ -3697,6 +3918,7 @@ fn compress_gpu_stream_worker_continuous(
                 );
                 return;
             }
+            ready.ready_bytes = ready.ready_bytes.saturating_add(compressed_len);
         }
         ready_cv.notify_all();
     }
